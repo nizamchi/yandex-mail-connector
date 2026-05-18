@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build artifacts (committed bundle in dist/ is the distribution unit — see ROADMAP Phase 1)
+# dist/  ← intentionally NOT ignored; we ship a built bundle to enable `npx -y github:user/repo`
+
+# Secrets — NEVER commit
+token.json
+yandex-mail-mcp-desktop/token.json
+**/token.json
+.env
+.env.*
+*.pem
+*.key
+
+# Audit logs (created at runtime by Phase 5)
+audit.jsonl
+*.audit.log
+.planning/audit/
+
+# Local allowlist (Phase 5)
+allowlist.json
+**/allowlist.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# GSD runtime state
+.planning/STATE.local.md
+.planning/HANDOFF.json
