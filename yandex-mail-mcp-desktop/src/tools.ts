@@ -26,6 +26,7 @@ import { generateCode, verifyCode, actionFingerprint, type VerifyResult } from '
 import type { AuthLevel, Capability } from './auth.js';
 import * as allowlist from './allowlist.js';
 import { getStateDir } from './state-dir.js';
+import { auditLog } from './audit.js';
 
 // ── Formatters ─────────────────────────────────────────────
 
@@ -627,11 +628,16 @@ Args:
             const trusted = recipients.filter(a => allowlist.isAllowed(a));
             const trustedStr   = trusted.length   ? trusted.map(sanitizeForDisplay).join(', ')   : '(none)';
             const untrustedStr = untrusted.map(sanitizeForDisplay).join(', ');
-            allowlist.auditEmit({
+            // D-RECIP-DOMAINS: log DOMAINS only, never raw untrusted addresses
+            // (those are the exfil targets — logging them verbatim would
+            // defeat the gate's purpose).
+            auditLog({
               action: 'untrusted_block',
-              untrusted,
-              trusted,
-              level: ctx.authLevel,
+              status: 'denied',
+              level: 'warn',
+              ts: new Date().toISOString(),
+              recipients: untrusted.map(a => a.split('@')[1] ?? a),
+              reason: 'trusted_count=' + trusted.length + ',level=' + ctx.authLevel,
             });
             return {
               content: [{

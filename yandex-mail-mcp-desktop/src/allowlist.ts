@@ -15,10 +15,7 @@
 //   - addTrusted() called from the yandex_trust_address MCP tool after the
 //     CLI hands over a single-use trust_token via pending-trust.json.
 //
-// Per D-PHASE6-AUDIT-HOOK: auditEmit() is a module-local sink that writes one
-// JSON line to stderr today. Phase 6 will replace this sink by importing
-// auditLog from audit.ts. Search-and-replace target: the literal string
-// 'auditEmit('.
+// Phase 6 (06-01) replaced auditEmit() with audit.ts:auditLog().
 //
 // Per D-HMAC-SECRET-SOURCE: secret is auto-generated, persisted to secret.bin
 // (NOT reused from YANDEX_CONFIRMATION_PASSWORD — that env is L2-only).
@@ -31,6 +28,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { ImapFlow } from 'imapflow';
 
 import { getStateDir } from './state-dir.js';
+import { auditLog } from './audit.js';
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -133,13 +131,6 @@ function atomicWrite(target: string, data: Buffer | string, mode: number): void 
     try { fs.unlinkSync(tmp); } catch { /* ignore */ }
     throw new Error(`atomicWrite to ${target} failed: ${err.message ?? String(e)}`);
   }
-}
-
-// ── Audit hook (D-PHASE6-AUDIT-HOOK) ──────────────────────
-
-export function auditEmit(record: Record<string, unknown>): void {
-  const line = JSON.stringify({ ts: new Date().toISOString(), ...record });
-  process.stderr.write('[yandex-mail-audit] ' + line + '\n');
 }
 
 // ── Address normalisation ─────────────────────────────────
@@ -256,7 +247,14 @@ export function addTrusted(address: string, scope: AllowlistScope, source: Allow
   const secret = loadSecret();
   file.signature = computeSignature(file, secret);
   persist(file);
-  auditEmit({ action: 'allowlist_add', address: target, scope, source });
+  auditLog({
+    action: 'allowlist_add',
+    status: 'success',
+    level: 'info',
+    ts: new Date().toISOString(),
+    from_domain: target.split('@')[1] ?? '(none)',
+    reason: 'scope=' + scope + ',source=' + source,
+  });
 }
 
 // bootstrap(client, limit, sentPath): one-shot Sent-folder mining of the
@@ -287,7 +285,13 @@ export async function bootstrap(
     const secret = loadSecret();
     file.signature = computeSignature(file, secret);
     persist(file);
-    auditEmit({ action: 'allowlist_bootstrap', count: 0, source: 'sent_history' });
+    auditLog({
+      action: 'allowlist_bootstrap',
+      status: 'success',
+      level: 'info',
+      ts: new Date().toISOString(),
+      reason: 'count=0,source=sent_history',
+    });
     return 0;
   }
 
@@ -332,7 +336,13 @@ export async function bootstrap(
   const secret = loadSecret();
   file.signature = computeSignature(file, secret);
   persist(file);
-  auditEmit({ action: 'allowlist_bootstrap', count: added, source: 'sent_history' });
+  auditLog({
+    action: 'allowlist_bootstrap',
+    status: 'success',
+    level: 'info',
+    ts: new Date().toISOString(),
+    reason: 'count=' + added + ',source=sent_history',
+  });
   return added;
 }
 
@@ -348,7 +358,13 @@ export function sweepPendingTrust(): boolean {
     const ageMs = Date.now() - st.mtimeMs;
     if (ageMs > PENDING_TTL_MS) {
       fs.unlinkSync(p);
-      auditEmit({ action: 'pending_trust_swept', age_ms: Math.round(ageMs) });
+      auditLog({
+        action: 'pending_trust_swept',
+        status: 'success',
+        level: 'info',
+        ts: new Date().toISOString(),
+        reason: 'age_ms=' + Math.round(ageMs),
+      });
       return true;
     }
   } catch { /* ignore — best-effort */ }
