@@ -1,0 +1,151 @@
+# Установка Yandex Mail MCP
+
+## Шаг 1: пароль приложения Яндекс
+
+1. Зайти на https://passport.yandex.ru.
+2. "Управление аккаунтом" -> "Пароли и авторизация" -> "Пароли приложений".
+3. Создать пароль для "Почта" (IMAP/SMTP). Сохранить — Яндекс показывает
+   пароль только один раз.
+4. Использовать этот пароль как `access_token` в `token.json` ниже.
+
+Альтернативу через OAuth см. в разделе "OAuth alternative (advanced)".
+
+## Шаг 2: token.json
+
+Создать файл `token.json` рядом с бандлом (или в `cwd` при запуске):
+
+```json
+{
+  "access_token": "PASSWORD_OR_OAUTH_TOKEN",
+  "email": "you@yandex.ru"
+}
+```
+
+На Unix обязательно:
+
+```sh
+chmod 600 token.json
+```
+
+Сервер на старте проверяет mode `token.json` и пишет stderr-warning, если
+он group/other-readable. С `YANDEX_STRICT_FILE_PERMS=true` сервер
+завершится с кодом 1 при mode != 600. На Windows эта проверка
+пропускается (mode lies on win32).
+
+Альтернатива файлу — environment variables:
+`YANDEX_OAUTH_TOKEN` + `YANDEX_EMAIL`.
+
+## Шаг 3: настройка MCP-клиента
+
+Все четыре клиента используют один и тот же snippet с разным путём к
+config-файлу.
+
+### Claude Desktop
+
+Файл config:
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+Вставить:
+
+```json
+{
+  "mcpServers": {
+    "yandex-mail": {
+      "command": "npx",
+      "args": ["-y", "github:user/repo#v2.0.0"],
+      "env": { "YANDEX_AUTH_LEVEL": "readonly" }
+    }
+  }
+}
+```
+
+Перезапустить Claude Desktop полностью (Quit, не закрытие окна). Пути в
+config — строго ASCII, без пробелов с кириллицей, чтобы не было сюрпризов
+с экранированием.
+
+### Claude Code
+
+Файл config: `~/.claude/mcp.json` (глобально) или `.mcp.json` в корне
+проекта (локально). Snippet тот же. Перезапустить терминал / переоткрыть
+Claude Code.
+
+### Codex CLI
+
+Файл config: `~/.codex/mcp_servers.json` (или соответствующий config dir
+по docs Codex). Snippet тот же. Перезапустить CLI.
+
+### Cursor
+
+Settings -> "Cursor Settings" -> найти `mcp.servers` (или `mcpServers` в
+JSON-режиме). Вставить тот же блок. Перезапустить Cursor.
+
+## Шаг 4: выбор YANDEX_AUTH_LEVEL
+
+### Choosing YANDEX_AUTH_LEVEL
+
+| Сценарий                                            | Уровень        | Значение                |
+|-----------------------------------------------------|----------------|--------------------------|
+| Только читать почту, классификация                  | L0             | `readonly` (по умолчанию) |
+| Перемещать / удалять / помечать письма, не отправлять | L1             | `safe`                    |
+| Отправлять письма с подтверждением                   | L2             | `destructive`             |
+| Полностью автономный агент в доверенной среде        | L3             | `auto` (предупреждение)   |
+
+L3 пропускает интерактивное подтверждение для send. Использовать только
+в полностью доверенном окружении (например, личный VPS под вашим
+контролем). В Claude Desktop / Cursor — НЕ ставить L3.
+
+## OAuth alternative (advanced)
+
+Если у вас есть OAuth-приложение Яндекса с собственным `access_token` —
+использовать его вместо пароля приложения. Положить в `token.json` /
+env как обычно.
+
+> **ВАЖНО (DOC-01):** В oauth.yandex.ru -> ваше приложение -> "Доступы"
+> должна стоять галочка "IMAP/SMTP-доступ" (или аналогичный scope). Без
+> неё IMAP отказывает с misleading "Invalid login" / "AUTH failed" message —
+> будет потеряно несколько часов на дебаг.
+
+## Operator overrides
+
+Все environment variables, которыми оператор тюнит сервер.
+
+### Phase 7 — operational guards
+
+| Var                            | Default                                   | Назначение                                                | Когда менять                                                  |
+|--------------------------------|-------------------------------------------|------------------------------------------------------------|---------------------------------------------------------------|
+| `YANDEX_DAILY_SEND_LIMIT`      | `50`                                      | Дневной лимит отправок                                     | Поднять до 200-300 на доверенной автоматике; Яндекс cap ~500/d |
+| `YANDEX_PER_RECIPIENT_HOURLY`  | `5`                                       | Лимит писем одному получателю в час                        | Поднять для bulk-уведомлений одному и тому же адресу          |
+| `YANDEX_PROTECTED_FOLDERS`     | `INBOX,Sent,Drafts,Important`             | Список папок, на которых move/delete блокируется           | Дополнить кириллическими именами вашего ящика                 |
+| `YANDEX_BLOCK_2FA_SENDERS`     | список 2FA-доменов по умолчанию           | **Полная замена** списка (НЕ additive — T-07-11)           | Сменить только если знаете полный набор; иначе оставить       |
+| `YANDEX_DEDUP_WINDOW_SEC`      | `60`                                      | Окно дедупликации для одинаковых send (actionFingerprint)  | Уменьшить для частых легитимных повторных отправок            |
+
+### Phase 1-6 + Phase 8 — earlier knobs
+
+| Var                                  | Default                                | Назначение                                                  |
+|--------------------------------------|----------------------------------------|-------------------------------------------------------------|
+| `YANDEX_AUTH_LEVEL`                  | `readonly`                             | L0/L1/L2/L3 — см. Шаг 4                                      |
+| `YANDEX_ALLOW_CUSTOM_HOSTS`          | `false`                                | Пропустить host allowlist — не для production               |
+| `YANDEX_STATE_DIR`                   | platform default                       | Переопределить путь к state-каталогу                         |
+| `YANDEX_ALLOWLIST_PATH`              | `<state-dir>/allowlist.json`            | Переопределить путь к TOFU allowlist                         |
+| `YANDEX_AUDIT_LOG`                   | `<state-dir>/audit.jsonl`               | Переопределить путь к JSONL audit log                        |
+| `YANDEX_AUDIT_LOG_MAX_MB`            | `25`                                   | Размер ротации audit log (МБ)                                |
+| `YANDEX_STRIP_HTML`                  | `true`                                 | Стрипать HTML из email body перед отдачей в LLM context       |
+| `YANDEX_ALLOWLIST_BOOTSTRAP_LIMIT`   | `200`                                  | Сколько Sent адресов прочитать при первом bootstrap allowlist  |
+| `YANDEX_STRICT_FILE_PERMS`           | unset                                  | `=true` — process.exit(1) на token.json mode != 600 (Unix)    |
+
+## Troubleshooting
+
+- **"Invalid login" / "AUTH failed"** — проверьте пароль приложения. Если
+  используете OAuth — проверьте галочку IMAP/SMTP-доступ (см. DOC-01 выше).
+- **"ECONNREFUSED imap.yandex.com"** — сеть / TLS / корпоративный
+  фаервол. Проверьте, что 993 и 465 не блокируются.
+- **"Refused imapHost ..."** — пытаетесь подменить host вне allowlist.
+  Не подменяйте без `YANDEX_ALLOW_CUSTOM_HOSTS=true` — это снимает защиту
+  от env-poisoning.
+- **stderr "token.json at ... has mode 644; expected 600"** — `chmod 600 token.json`.
+- **`yandex_send_email` не виден в списке tools** — вы на L0. Поднимите
+  `YANDEX_AUTH_LEVEL` до `destructive` или `auto`.
+- **`yandex_move_email` отказывает с `protected_folder`** — папка
+  назначения в `YANDEX_PROTECTED_FOLDERS`. Уберите её из списка или
+  выберите другую.
