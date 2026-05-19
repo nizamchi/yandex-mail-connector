@@ -62,6 +62,26 @@ test('tool names are unique', () => {
   assert.equal(unique.size, names.length, 'duplicate tool names detected');
 });
 
+test('yandex_send_email schema accepts confirmation_token and dry_run as optional', () => {
+  const byName = new Map(TOOLS.map(t => [t.name, t]));
+  const def = byName.get('yandex_send_email');
+  assert.ok(def, 'send_email must exist');
+  const schema = def.inputSchema;
+
+  // Minimal valid params — must parse.
+  assert.doesNotThrow(() => schema.parse({ to: ['a@x'], subject: 's', text: 't' }));
+  // With 6-digit token — must parse.
+  assert.doesNotThrow(() => schema.parse({ to: ['a@x'], subject: 's', text: 't', confirmation_token: '123456' }));
+  // With dry_run=true — must parse.
+  assert.doesNotThrow(() => schema.parse({ to: ['a@x'], subject: 's', text: 't', dry_run: true }));
+  // Non-6-digit token — must reject.
+  assert.throws(() => schema.parse({ to: ['a@x'], subject: 's', text: 't', confirmation_token: 'abc' }));
+  // Token with wrong digit count — must reject.
+  assert.throws(() => schema.parse({ to: ['a@x'], subject: 's', text: 't', confirmation_token: '12345' }));
+  // dry_run as string — must reject.
+  assert.throws(() => schema.parse({ to: ['a@x'], subject: 's', text: 't', dry_run: 'yes' }));
+});
+
 test('authLevel matrix: send_email=2; mark/move/delete=1; rest=0', () => {
   const byName = new Map(TOOLS.map(t => [t.name, t]));
   assert.equal(byName.get('yandex_send_email')?.requires.authLevel, 2);
