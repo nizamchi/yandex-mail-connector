@@ -180,7 +180,11 @@ const markEmailBaseSchema = z.object({
 // be promoted later when SDK accepts ZodEffects).
 void sendEmailSchema; void markEmailSchema;
 
-export const TOOLS: ToolDef[] = [
+// readonly array + Object.freeze at module bottom keeps the declarative
+// invariant enforceable: runtime mutation of TOOLS would throw in strict
+// mode (which esbuild emits by default). Defence-in-depth against any
+// future code that might try to push extra entries after import.
+export const TOOLS: readonly ToolDef[] = [
   // 1. List folders (L0)
   {
     name: 'yandex_list_folders',
@@ -191,7 +195,7 @@ export const TOOLS: ToolDef[] = [
     requires: { authLevel: 0 },
     handler: async (_params, _ctx) => {
       try {
-        const folders = await imap.listFolders(creds());
+        const folders = await imap.listFolders();
         return { content: [{ type: 'text', text: JSON.stringify(folders, null, 2) }], structuredContent: { folders } };
       } catch (e) { return errorResult(e); }
     },
@@ -208,7 +212,7 @@ export const TOOLS: ToolDef[] = [
     handler: async (params, _ctx) => {
       try {
         const { folder } = folderStatusSchema.parse(params);
-        const s = await imap.folderStatus(creds(), folder);
+        const s = await imap.folderStatus(folder);
         return { content: [{ type: 'text', text: JSON.stringify(s, null, 2) }], structuredContent: s };
       } catch (e) { return errorResult(e); }
     },
@@ -227,7 +231,7 @@ Args: folder (default "INBOX"), page (default 1), page_size (1-100, default 20).
     handler: async (params, _ctx) => {
       try {
         const { folder, page, page_size } = listEmailsSchema.parse(params);
-        const r = await imap.listEmails(creds(), folder, page, page_size);
+        const r = await imap.listEmails(folder, page, page_size);
         const text = `${r.folder}  |  всего: ${r.total}  |  стр. ${r.page}  |  ещё есть: ${r.hasMore}\n\n${fmtHeaders(r.emails)}`;
         return { content: [{ type: 'text', text }], structuredContent: r };
       } catch (e) { return errorResult(e); }
@@ -247,7 +251,7 @@ Args: folder (default "INBOX"), uid (integer UID письма).
     handler: async (params, _ctx) => {
       try {
         const { folder, uid } = getEmailSchema.parse(params);
-        const email = await imap.getEmail(creds(), folder, uid);
+        const email = await imap.getEmail(folder, uid);
         if (!email) return { content: [{ type: 'text', text: `Письмо UID ${uid} не найдено в ${folder}.` }] };
         const body = email.textBody ?? email.htmlBody ?? '(пусто)';
         const attachLine = email.attachments.length
@@ -307,7 +311,7 @@ Args:
         if (seen === false) query['unseen']    = true;
         if (flagged === true)  query['flagged']   = true;
         if (flagged === false) query['unflagged'] = true;
-        const emails = await imap.searchEmails(creds(), folder, query, max_results);
+        const emails = await imap.searchEmails(folder, query, max_results);
         const text = emails.length
           ? `Найдено: ${emails.length}\n\n${fmtHeaders(emails)}`
           : 'Ничего не найдено.';
@@ -326,7 +330,7 @@ Args:
     requires: { authLevel: 0 },
     handler: async (_params, _ctx) => {
       try {
-        const folders = await imap.getSpecialFolders(creds());
+        const folders = await imap.getSpecialFolders();
         const text = [
           `Входящие:    ${folders.inbox}`,
           `Отправленные: ${folders.sent}`,
@@ -355,7 +359,7 @@ Args: folder, uid, seen (bool?), flagged (bool?). Хотя бы один из se
           throw new Error('Укажите хотя бы одно из полей: seen или flagged');
         }
         const { folder, uid, seen, flagged } = p;
-        await imap.markEmail(creds(), folder, uid, seen, flagged);
+        await imap.markEmail(folder, uid, seen, flagged);
         const changes = [
           seen !== undefined ? (seen ? 'прочитано' : 'непрочитано') : '',
           flagged !== undefined ? (flagged ? 'отмечено ★' : 'снята звёздочка') : '',
@@ -377,7 +381,7 @@ Args: folder (откуда), uid (UID письма), target_folder (куда, н
     handler: async (params, _ctx) => {
       try {
         const { folder, uid, target_folder } = moveEmailSchema.parse(params);
-        await imap.moveEmail(creds(), folder, uid, target_folder);
+        await imap.moveEmail(folder, uid, target_folder);
         const text = `UID ${uid}: перемещено из ${folder} в ${target_folder}.`;
         return { content: [{ type: 'text', text }], structuredContent: { success: true } };
       } catch (e) { return errorResult(e); }
@@ -399,7 +403,7 @@ Args: folder, uid, permanent (bool, default false). permanent=true — безв�
     handler: async (params, _ctx) => {
       try {
         const { folder, uid, permanent } = deleteEmailSchema.parse(params);
-        await imap.deleteEmail(creds(), folder, uid, permanent);
+        await imap.deleteEmail(folder, uid, permanent);
         const text = permanent ? `UID ${uid} безвозвратно удалено.` : `UID ${uid} перемещено в Корзину.`;
         return { content: [{ type: 'text', text }], structuredContent: { success: true, permanent } };
       } catch (e) { return errorResult(e); }
@@ -442,6 +446,8 @@ Args:
     },
   },
 ];
+
+Object.freeze(TOOLS);
 
 // ── Registration ───────────────────────────────────────────
 

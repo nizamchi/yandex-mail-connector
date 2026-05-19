@@ -34,6 +34,18 @@ export function getAuthLevel(env: NodeJS.ProcessEnv = process.env): AuthLevel {
   return level ?? 0;
 }
 
+// True if YANDEX_AUTH_LEVEL was set but did not match any known token.
+// Lets index.ts distinguish "user typo silently fell back to L0" from
+// "user explicitly set L0" — both yield authLevel=0 but the typo case
+// deserves a loud stderr warning so it does not become a debug hell.
+export function isInvalidAuthLevel(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.YANDEX_AUTH_LEVEL;
+  if (raw === undefined || raw === null) return false;
+  const normalized = String(raw).trim().toLowerCase();
+  if (normalized === '') return false;
+  return !LEVEL_MAP.has(normalized);
+}
+
 // Layer 1 stub — returns empty Set regardless of level.
 // WHY: Capabilities-based gating is a Hook 3 forward-compat surface. In v2 (Layer 1)
 // no tool requires a capability; in L2+ tools like "index_search" will list

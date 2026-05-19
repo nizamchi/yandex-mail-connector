@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { registerTools, TOOLS } from './tools.js';
-import { getAuthLevel, detectCapabilities, describeAuthLevel } from './auth.js';
+import { getAuthLevel, detectCapabilities, describeAuthLevel, isInvalidAuthLevel } from './auth.js';
 
 // Resolve auth level ONCE at startup. After this point the value never changes
 // for the life of the process — re-reading env mid-run would be a TOCTOU
@@ -13,7 +13,10 @@ const capabilities = detectCapabilities(authLevel);
 // Only the "implicit L0" case (no env set at all) prints the verbose warning.
 // If the user explicitly set YANDEX_AUTH_LEVEL=readonly that's a deliberate
 // choice — we acknowledge with the standard info line.
-if (authLevel === 0 && process.env.YANDEX_AUTH_LEVEL === undefined) {
+if (isInvalidAuthLevel()) {
+  process.stderr.write(`[yandex-mail] WARNING: YANDEX_AUTH_LEVEL="${process.env.YANDEX_AUTH_LEVEL}" is not recognised — falling back to READ-ONLY (L0).\n`);
+  process.stderr.write('[yandex-mail] Valid values: readonly | safe | destructive | auto (or 0..3).\n');
+} else if (authLevel === 0 && process.env.YANDEX_AUTH_LEVEL === undefined) {
   process.stderr.write('[yandex-mail] AUTH_LEVEL not set — running in READ-ONLY mode (L0).\n');
   process.stderr.write('[yandex-mail] To enable writes: set YANDEX_AUTH_LEVEL=safe | destructive | auto.\n');
   process.stderr.write('[yandex-mail] See: AUTH-DESIGN.md §3 for level semantics.\n');
