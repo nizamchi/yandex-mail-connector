@@ -5,6 +5,7 @@ import { getAuthLevel, detectCapabilities, describeAuthLevel, isInvalidAuthLevel
 import * as allowlist from './allowlist.js';
 import * as imap from './imap.js';
 import { auditLog } from './audit.js';
+import { resolveProtectedFolders } from './guards.js';
 
 // Resolve auth level ONCE at startup. After this point the value never changes
 // for the life of the process -- re-reading env mid-run would be a TOCTOU
@@ -89,8 +90,6 @@ server.server.oninitialized = (): void => {
 
 serverContext.elicit = (params) => server.server.elicitInput(params) as Promise<{ action: 'accept' | 'cancel' | 'decline'; content?: Record<string, unknown> }>;
 
-registerTools(server, { authLevel, capabilities, serverContext });
-
 async function main(): Promise<void> {
   // ── Phase 5: first-L1+-start bootstrap ───────────────────────────────
   // If we are at L1+ AND the allowlist has never been bootstrapped (no
@@ -134,6 +133,30 @@ async function main(): Promise<void> {
       ',capabilities=' + Array.from(capabilities).join(',') +
       ',bootstrap_state=' + bootstrapState,
   });
+
+  // Phase 7: resolve protected-folder set ONCE at startup. Combines literal
+  // defaults (INBOX/Sent/Drafts/Important) with cyrillic-aware special-use
+  // IMAP paths from getSpecialFolders. May block on IMAP for ~1-3s; cold-start
+  // latency cost is accepted because lazy resolution on first move/delete
+  // would race against the LLM's first action. Always resolved regardless of
+  // authLevel (cheap insurance; only the move/delete gates actually consume
+  // the set). resolveProtectedFolders catches IMAP failure internally and
+  // returns literal defaults -- this outer try is paranoia for a thrown
+  // synchronous error before that catch runs. On total failure we log an
+  // EXPLICIT empty-set warning so the operator notices destructive ops are
+  // unprotected this session.
+  let protectedFolders: ReadonlySet<string>;
+  try {
+    protectedFolders = await resolveProtectedFolders();
+  } catch (e) {
+    process.stderr.write('[yandex-mail] resolveProtectedFolders fatal: ' + (e instanceof Error ? e.message : String(e)) + '\n');
+    protectedFolders = new Set<string>();
+    process.stderr.write('[yandex-mail] WARNING: protected-folder set is EMPTY due to startup error. Destructive operations are NOT folder-gated this session. Restart to retry.\n');
+  }
+
+  // Register tools AFTER protected-folder resolution -- ctx carries the set
+  // into move_email / delete_email handlers.
+  registerTools(server, { authLevel, capabilities, serverContext, protectedFolders });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
