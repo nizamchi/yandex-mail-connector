@@ -26,7 +26,7 @@ import { generateCode, verifyCode, actionFingerprint, type VerifyResult } from '
 import type { AuthLevel, Capability } from './auth.js';
 import * as allowlist from './allowlist.js';
 import { getStateDir } from './state-dir.js';
-import { auditLog } from './audit.js';
+import { auditLog, auditLogAction, EMAIL_ACTIONS, subjectHash } from './audit.js';
 
 // ── Formatters ─────────────────────────────────────────────
 
@@ -87,6 +87,26 @@ export interface ToolCtx {
   };
 }
 
+// Internal handler return shape — extends the SDK-visible shape with an
+// _audit channel used by wrapWithAudit (Phase 6 Hook-2). The wrapper strips
+// _audit BEFORE returning to the SDK so the channel never reaches MCP clients.
+export interface HandlerAuditExtras {
+  message_id?: string;
+  folder?: string;
+  uid?: number;
+  recipients?: string[];
+  subject_hash?: string;
+  body_length?: number;
+  from_domain?: string;
+}
+
+export interface HandlerResult {
+  content: Array<{ type: 'text'; text: string }>;
+  structuredContent?: unknown;
+  isError?: boolean;
+  _audit?: HandlerAuditExtras;
+}
+
 export interface ToolDef {
   name: string;
   title: string;
@@ -102,11 +122,7 @@ export interface ToolDef {
   handler: (
     params: unknown,
     ctx: ToolCtx,
-  ) => Promise<{
-    content: Array<{ type: 'text'; text: string }>;
-    structuredContent?: unknown;
-    isError?: boolean;
-  }>;
+  ) => Promise<HandlerResult>;
 }
 
 // creds() is a lazy loader — used by every handler. Module scope is safe because
@@ -116,10 +132,55 @@ export interface ToolDef {
 const creds = (): ReturnType<typeof loadCredentials> => loadCredentials();
 
 // Narrow helper to format the error path consistently across handlers.
-function errorResult(e: unknown): { content: Array<{ type: 'text'; text: string }>; isError: true } {
+function errorResult(e: unknown): HandlerResult {
   return {
     content: [{ type: 'text', text: `Ошибка: ${e instanceof Error ? e.message : String(e)}` }],
     isError: true,
+  };
+}
+
+// wrapWithAudit (Phase 6) — wraps every handler so each tool call emits an
+// 'attempt' audit record on entry and a 'success' | 'denied' | 'error' record
+// on exit. Reads handler-returned _audit extras and forwards them (incl. the
+// mandatory message_id for EMAIL_ACTIONS — enforced by audit.ts on the
+// receiving side). Strips _audit from the SDK return shape so the channel
+// never leaks to MCP clients.
+//
+// Declarative invariant: wrapping happens at the TOOLS export site
+// (TOOLS = [...].map(wrapWithAudit) BEFORE Object.freeze) — registerTools()
+// continues to iterate TOOLS and call exactly ONE server.registerTool per
+// visible def. Greppable.
+function wrapWithAudit(def: ToolDef): ToolDef {
+  return {
+    ...def,
+    handler: async (params, ctx) => {
+      const action = def.name;
+      void EMAIL_ACTIONS; // referenced by audit.ts; kept here for readability
+      auditLogAction(action, 'attempt', { reason: 'level=' + ctx.authLevel });
+      try {
+        const r = await def.handler(params, ctx);
+        const status: 'success' | 'denied' = r.isError ? 'denied' : 'success';
+        const extras = r._audit ?? {};
+        auditLogAction(action, status, {
+          folder: extras.folder,
+          uid: extras.uid,
+          message_id: extras.message_id,
+          recipients: extras.recipients,
+          subject_hash: extras.subject_hash,
+          body_length: extras.body_length,
+          from_domain: extras.from_domain,
+        });
+        // Strip _audit before returning to SDK.
+        const { _audit: _drop, ...sdkResult } = r;
+        void _drop;
+        return sdkResult;
+      } catch (e) {
+        auditLogAction(action, 'error', {
+          reason: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200),
+        });
+        throw e;
+      }
+    },
   };
 }
 
@@ -331,7 +392,7 @@ async function tryNotify(title: string, message: string): Promise<void> {
 // invariant enforceable: runtime mutation of TOOLS would throw in strict
 // mode (which esbuild emits by default). Defence-in-depth against any
 // future code that might try to push extra entries after import.
-export const TOOLS: readonly ToolDef[] = [
+const TOOLS_RAW: ToolDef[] = [
   // 1. List folders (L0)
   {
     name: 'yandex_list_folders',
@@ -831,6 +892,10 @@ Args:
   },
 ];
 
+// Apply wrapWithAudit to every entry BEFORE Object.freeze — preserves the
+// declarative invariant (registerTools still iterates a single readonly array
+// and emits exactly one server.registerTool per visible def).
+export const TOOLS: readonly ToolDef[] = TOOLS_RAW.map(wrapWithAudit);
 Object.freeze(TOOLS);
 
 // ── Registration ───────────────────────────────────────────
