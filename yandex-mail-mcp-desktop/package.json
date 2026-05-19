@@ -16,6 +16,7 @@
   "scripts": {
     "build": "esbuild src/index.ts --bundle --minify --platform=node --target=node18 --outfile=dist/yandex-mail-mcp.js --format=cjs --banner:js=\"#!/usr/bin/env node\"",
     "start": "node dist/yandex-mail-mcp.js",
+    "test": "esbuild src/__tests__/sanitize.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/sanitize.test.js --external:node:test --external:node:assert && node --test dist/__tests__/sanitize.test.js",
     "prepare": "npm run build"
   },
   "dependencies": {
