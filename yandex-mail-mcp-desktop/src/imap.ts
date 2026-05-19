@@ -1,4 +1,4 @@
-import { ImapFlow, type FetchMessageObject, type MailboxObject, type ListResponse } from 'imapflow';
+import { ImapFlow, type FetchMessageObject, type ListResponse } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { loadCredentials, type Credentials } from './token.js';
 
@@ -160,26 +160,33 @@ export async function listEmails(
   _creds: Credentials, folder: string, page: number, pageSize: number
 ) {
   return getConnectionManager().withClient(async c => {
-    const mbox: MailboxObject = await c.mailboxOpen(folder, { readOnly: true });
-    const total = mbox.exists ?? 0;
-    if (!total) return { folder, total: 0, page, pageSize, hasMore: false, emails: [] as EmailHeader[] };
+    await c.mailboxOpen(folder, { readOnly: true });
 
-    // Guard: requested page is beyond the available messages
+    // BUG-01 (T-02-05): UID-based pagination — стабильно при удалении писем
+    // между страницами. Пустой SearchObject == ALL (verified в imap-flow.d.ts).
+    const searchResult = await c.search({}, { uid: true });
+    const uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+    const total = uids.length;
+    if (!total) {
+      return { folder, total: 0, page, pageSize, hasMore: false, emails: [] as EmailHeader[] };
+    }
     if ((page - 1) * pageSize >= total) {
       return { folder, total, page, pageSize, hasMore: false, emails: [] as EmailHeader[] };
     }
 
-    const lastSeq = total;
-    const lastInPage  = Math.max(1, lastSeq - (page - 1) * pageSize);
-    const firstInPage = Math.max(1, lastInPage - pageSize + 1);
-    if (firstInPage > lastInPage) return { folder, total, page, pageSize, hasMore: false, emails: [] as EmailHeader[] };
+    // UIDs приходят отсортированы по возрастанию; нам нужны свежие первыми.
+    const sortedDesc = uids.slice().sort((a, b) => b - a);
+    const start = (page - 1) * pageSize;
+    const end = Math.min(start + pageSize, total);
+    const pageUids = sortedDesc.slice(start, end);
 
     const emails: EmailHeader[] = [];
-    for await (const msg of c.fetch(`${firstInPage}:${lastInPage}`, { uid: true, flags: true, envelope: true, size: true })) {
+    for await (const msg of c.fetch(pageUids, { uid: true, flags: true, envelope: true, size: true }, { uid: true })) {
       emails.push(parseHeader(msg));
     }
-    emails.reverse();
-    return { folder, total, page, pageSize, hasMore: firstInPage > 1, emails };
+    // ImapFlow не гарантирует порядок итерации внутри fetch — досортировать.
+    emails.sort((a, b) => b.uid - a.uid);
+    return { folder, total, page, pageSize, hasMore: end < total, emails };
   });
 }
 
@@ -201,11 +208,32 @@ export async function getEmail(_creds: Credentials, folder: string, uid: number)
       size: a.size,
     }));
 
-    let textBody = parsed.text ?? undefined;
-    let htmlBody  = (parsed.html === false ? undefined : parsed.html) ?? undefined;
+    // SEC-04 (T-02-02): text-first body extraction. mailparser автоматически
+    // конвертирует HTML→text (strip tags, drop scripts, collapse hidden CSS).
+    // По умолчанию HTML НЕ возвращается в MCP output — opt-in через env.
+    const stripHtml = process.env.YANDEX_STRIP_HTML !== 'false';
+    let textBody: string | undefined = parsed.text ?? undefined;
+    let htmlBody: string | undefined = undefined;
     let truncated = false;
-    if (textBody && textBody.length > MAX_BODY_CHARS) { textBody = textBody.slice(0, MAX_BODY_CHARS) + '\n[обрезано]'; truncated = true; }
-    if (htmlBody  && htmlBody.length  > MAX_BODY_CHARS) { htmlBody  = htmlBody.slice(0, MAX_BODY_CHARS)  + '<!-- truncated -->'; truncated = true; }
+
+    if (!stripHtml) {
+      htmlBody = (parsed.html === false ? undefined : parsed.html) ?? undefined;
+      if (htmlBody && htmlBody.length > MAX_BODY_CHARS) {
+        htmlBody = htmlBody.slice(0, MAX_BODY_CHARS) + '<!-- truncated -->';
+        truncated = true;
+      }
+    }
+
+    // HTML-only письмо без текстовой части и при включённом strip:
+    // показать explicit placeholder вместо пустого body (UX guard).
+    if (!textBody && stripHtml && parsed.html && parsed.html !== false) {
+      textBody = '(HTML-only message; HTML body stripped — set YANDEX_STRIP_HTML=false to opt in)';
+    }
+
+    if (textBody && textBody.length > MAX_BODY_CHARS) {
+      textBody = textBody.slice(0, MAX_BODY_CHARS) + '\n[обрезано]';
+      truncated = true;
+    }
 
     return { ...hdr, hasAttachments: attachments.length > 0, textBody, htmlBody, attachments, truncated };
   });
