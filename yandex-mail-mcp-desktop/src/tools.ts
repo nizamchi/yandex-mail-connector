@@ -630,9 +630,14 @@ Args:
               },
             });
             if (result.action === 'accept' && result.content?.confirmed === true) {
-              // proceed to send below — mark the code as used so it cannot
-              // also be used as a token in a follow-up call.
-              verifyCode(fp, code);
+              // M-1 fix: verifyCode return value MUST gate the send. If the elicit
+              // dialog hung past the 5-min TTL the code is 'expired'; if some race
+              // burned it elsewhere it is 'used'; we must not silently fall through
+              // to send under those conditions. Only proceed on `true`.
+              const v = verifyCode(fp, code);
+              if (v !== true) {
+                return errorResult(new Error(`send blocked: confirmation code ${v} (elicit accepted but code no longer valid)`));
+              }
             } else {
               return errorResult(new Error(`send cancelled (elicit action=${result.action})`));
             }
