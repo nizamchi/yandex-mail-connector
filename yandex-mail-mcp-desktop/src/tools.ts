@@ -1,7 +1,7 @@
 // Declarative tool registry (Hook 3, AUTH-02).
 //
 // Why this shape:
-//   In v1 each tool was inlined as a `server.registerTool(...)` call inside
+//   In v1 each tool was inlined as a direct SDK registration call inside
 //   registerTools(). That worked for 10 tools, but every new tool in L2-L7
 //   would have grown an if-else lattice tied to auth level and (future)
 //   capabilities. The declarative `TOOLS[]` array makes adding a tool a one-line
