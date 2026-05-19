@@ -19,6 +19,7 @@ import { loadCredentials } from './token.js';
 import * as imap from './imap.js';
 import { sendEmail } from './smtp.js';
 import { sanitizeForDisplay, wrapUntrusted } from './sanitize.js';
+import { generateCode, verifyCode, actionFingerprint, type VerifyResult } from './confirm.js';
 import type { AuthLevel, Capability } from './auth.js';
 
 // ── Formatters ─────────────────────────────────────────────
@@ -186,15 +187,20 @@ const getSpecialFoldersSchema = z.object({}).strict();
 // the underlying object schema to the SDK and re-run .refine() inside the handler
 // to preserve the cross-field validation message.
 const sendEmailBaseSchema = z.object({
-  to:          z.array(z.string()).min(1),
-  cc:          z.array(z.string()).optional(),
-  bcc:         z.array(z.string()).optional(),
-  subject:     z.string().min(1),
-  text:        z.string().optional(),
-  html:        z.string().optional(),
-  reply_to:    z.string().optional(),
-  in_reply_to: z.string().optional(),
-  references:  z.array(z.string()).optional(),
+  to:                 z.array(z.string()).min(1),
+  cc:                 z.array(z.string()).optional(),
+  bcc:                z.array(z.string()).optional(),
+  subject:            z.string().min(1),
+  text:               z.string().optional(),
+  html:               z.string().optional(),
+  reply_to:           z.string().optional(),
+  in_reply_to:        z.string().optional(),
+  references:         z.array(z.string()).optional(),
+  // Phase 4: confirmation gate. confirmation_token is the 6-digit code the user
+  // saw out-of-band (elicit dialog, stderr, or OS toast). dry_run returns a
+  // SendPlan without touching SMTP.
+  confirmation_token: z.string().regex(/^\d{6}$/).optional(),
+  dry_run:            z.boolean().optional().default(false),
 }).strict();
 const markEmailBaseSchema = z.object({
   folder:  z.string().default('INBOX'),
@@ -206,6 +212,109 @@ const markEmailBaseSchema = z.object({
 // Silence unused-binding for the alias schemas (they document intent and could
 // be promoted later when SDK accepts ZodEffects).
 void sendEmailSchema; void markEmailSchema;
+
+// ── Phase 4: SendPlan / confirmation helpers ───────────────────────────
+// Note: node-notifier is intentionally NOT a declared dependency — see
+// package.json. Keeps the bundle <3MB and avoids forcing a native Windows
+// toast peer on every user. We dynamically import it; absence is non-fatal.
+
+type ParsedSendParams = z.infer<typeof sendEmailBaseSchema>;
+
+interface SendPlan {
+  dry_run: true;
+  action: 'send';
+  action_fingerprint: string;
+  preview: {
+    to: string[];
+    cc?: string[];
+    bcc?: string[];
+    subject: string;
+    body_first_chars: string;
+    body_length_chars: number;
+    attachments: never[];
+  };
+  checks: {
+    in_allowlist: string;
+    rate_limit_ok: string;
+    dedup: string;
+  };
+  next_step: string;
+}
+
+function stripHtmlToText(html: string): string {
+  return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function previewBody(p: ParsedSendParams): { first: string; length: number } {
+  const raw = p.text ?? (p.html ? stripHtmlToText(p.html) : '');
+  return { first: raw.slice(0, 200), length: (p.text ?? p.html ?? '').length };
+}
+
+function buildSendPlan(p: ParsedSendParams, fp: string): SendPlan {
+  const body = previewBody(p);
+  const plan: SendPlan = {
+    dry_run: true,
+    action: 'send',
+    action_fingerprint: fp,
+    preview: {
+      to: p.to.map(x => sanitizeForDisplay(x)),
+      subject: sanitizeForDisplay(p.subject),
+      body_first_chars: wrapUntrusted(sanitizeForDisplay(body.first)),
+      body_length_chars: body.length,
+      attachments: [],
+    },
+    checks: {
+      in_allowlist: 'deferred to phase 5',
+      rate_limit_ok: 'deferred to phase 7',
+      dedup: 'deferred to phase 7',
+    },
+    next_step:
+      'Call yandex_send_email again WITHOUT dry_run to trigger confirmation. ' +
+      'You will receive a 6-digit code via elicit dialog or stderr/OS toast; ' +
+      'then call yandex_send_email a third time with confirmation_token=<code>. Code expires in 300s.',
+  };
+  if (p.cc) plan.preview.cc = p.cc.map(x => sanitizeForDisplay(x));
+  if (p.bcc) plan.preview.bcc = p.bcc.map(x => sanitizeForDisplay(x));
+  return plan;
+}
+
+function buildStderrBlock(p: ParsedSendParams, code: string): string {
+  const body = previewBody(p);
+  const banner = '═══════════════ CONFIRMATION REQUIRED ═══════════════';
+  const footer = '═════════════════════════════════════════════════════';
+  const primary = p.to.map(x => sanitizeForDisplay(x)).join(', ');
+  return [
+    banner,
+    'Action: SEND EMAIL',
+    `To: ${primary}`,
+    `Subject: ${sanitizeForDisplay(p.subject)}`,
+    `Body preview: ${wrapUntrusted(sanitizeForDisplay(body.first.slice(0, 80)))}`,
+    `Code: ${code} (expires in 5 min)`,
+    'Reply with confirmation_token=<code> to proceed.',
+    footer,
+    '',
+  ].join('\n');
+}
+
+function verifyResultToError(r: Exclude<VerifyResult, true>): string {
+  switch (r) {
+    case 'expired': return 'confirmation code expired, request a new one with dry_run:true';
+    case 'used':    return 'code already used';
+    case 'locked':  return 'locked, retry after 5min';
+    case 'wrong':   return 'invalid confirmation code';
+  }
+}
+
+async function tryNotify(title: string, message: string): Promise<void> {
+  try {
+    const mod = await import('node-notifier').catch(() => null) as
+      | { default?: { notify?: (opts: { title: string; message: string }) => void } }
+      | null;
+    if (mod && mod.default && typeof mod.default.notify === 'function') {
+      mod.default.notify({ title, message });
+    }
+  } catch { /* opportunistic — never block on absence */ }
+}
 
 // readonly array + Object.freeze at module bottom keeps the declarative
 // invariant enforceable: runtime mutation of TOOLS would throw in strict
@@ -437,7 +546,7 @@ Args: folder, uid, permanent (bool, default false). permanent=true — безв�
     },
   },
 
-  // 10. Send email (L2) — destructive; Phase 4 will add confirmation_token / dry_run
+  // 10. Send email (L2) — destructive; Phase 4 confirmation gate active.
   {
     name: 'yandex_send_email',
     title: 'Отправить письмо',
@@ -450,16 +559,109 @@ Args:
   html     (string?) — тело HTML
   reply_to (string?) — Reply-To адрес
   in_reply_to (string?) — Message-ID письма, на которое отвечаем
-  references  (string[]?) — цепочка Message-ID для треда`,
+  references  (string[]?) — цепочка Message-ID для треда
+  dry_run  (boolean?) — если true, возвращает SendPlan и НЕ отправляет
+  confirmation_token (string?) — 6-цифр код, полученный пользователем
+    out-of-band (elicit / stderr / OS toast). Без него send блокируется.`,
     inputSchema: sendEmailBaseSchema,
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     requires: { authLevel: 2 },
-    handler: async (params, _ctx) => {
+    handler: async (params, ctx) => {
       try {
         const p = sendEmailBaseSchema.parse(params);
         if (p.text === undefined && p.html === undefined) {
           throw new Error('Укажите хотя бы одно из полей: text или html');
         }
+
+        // Fingerprint over the SEND payload only — not over dry_run /
+        // confirmation_token, which are control-plane fields. Strip them
+        // before canonicalization so the same logical send maps to the same fp
+        // whether the agent is in dry_run / token / direct mode.
+        const {
+          dry_run: _dr,
+          confirmation_token: token,
+          ...payload
+        } = p;
+        const fp = actionFingerprint('send', payload as unknown as Record<string, unknown>);
+
+        // (1) dry_run — return SendPlan, NEVER send.
+        if (p.dry_run === true) {
+          const plan = buildSendPlan(p, fp);
+          return {
+            content: [{ type: 'text', text: JSON.stringify(plan, null, 2) }],
+            structuredContent: plan as unknown as Record<string, unknown>,
+            isError: false,
+          };
+        }
+
+        // (2) confirmation_token provided — verify and proceed on match.
+        if (token !== undefined) {
+          const v = verifyCode(fp, token);
+          if (v !== true) {
+            return errorResult(new Error(verifyResultToError(v)));
+          }
+          // fall through to send path
+        } else {
+          // (3) Neither dry_run nor token. Gate by elicitation capability.
+          if (ctx.serverContext.canElicit && ctx.serverContext.elicit) {
+            // Pre-issue a fallback code so the agent can retry via token path
+            // if the elicit times out or the dialog is dismissed.
+            const { code, expiresAt } = generateCode(fp);
+            const sanitizedTo = p.to.map(x => sanitizeForDisplay(x)).join(', ');
+            const bodyPrev = previewBody(p);
+            const elicitMessage =
+              `Send email?\n` +
+              `To: ${sanitizedTo}\n` +
+              `Subject: ${sanitizeForDisplay(p.subject)}\n` +
+              `Body preview: ${wrapUntrusted(sanitizeForDisplay(bodyPrev.first.slice(0, 200)))}`;
+            // Belt-and-braces: also drop the code into stderr in case the
+            // client renders elicit but the user prefers the token path. Code
+            // is never echoed into MCP content[].
+            process.stderr.write(buildStderrBlock(p, code));
+            void expiresAt; // expiresAt is informational; not surfaced via elicit
+            const result = await ctx.serverContext.elicit({
+              message: elicitMessage,
+              requestedSchema: {
+                type: 'object',
+                properties: {
+                  confirmed: { type: 'boolean', title: 'Send this email?' },
+                },
+                required: ['confirmed'],
+              },
+            });
+            if (result.action === 'accept' && result.content?.confirmed === true) {
+              // proceed to send below — mark the code as used so it cannot
+              // also be used as a token in a follow-up call.
+              verifyCode(fp, code);
+            } else {
+              return errorResult(new Error(`send cancelled (elicit action=${result.action})`));
+            }
+          } else {
+            // Path B: no elicitation. Issue code, write stderr block, attempt
+            // OS toast, return isError:false with requires_confirmation marker.
+            const { code, expiresAt } = generateCode(fp);
+            process.stderr.write(buildStderrBlock(p, code));
+            const primary = p.to[0] ? sanitizeForDisplay(p.to[0]) : '(unknown)';
+            await tryNotify('yandex-mail-mcp', `Confirm send to ${primary}: ${code}`);
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  'Confirmation required. Verify the action plan in stderr/notification ' +
+                  'and re-call yandex_send_email with confirmation_token=<6-digit code>. ' +
+                  'Code expires in 300s.',
+              }],
+              structuredContent: {
+                requires_confirmation: true,
+                action_fingerprint: fp,
+                expires_at: expiresAt,
+              },
+              isError: false,
+            };
+          }
+        }
+
+        // ── Send path ────────────────────────────────────────
         const r = await sendEmail(creds(), {
           to: p.to, cc: p.cc, bcc: p.bcc,
           subject: p.subject, text: p.text, html: p.html,
