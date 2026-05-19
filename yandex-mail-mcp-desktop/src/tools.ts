@@ -27,6 +27,51 @@ import type { AuthLevel, Capability } from './auth.js';
 import * as allowlist from './allowlist.js';
 import { getStateDir } from './state-dir.js';
 import { auditLog, auditLogAction, EMAIL_ACTIONS, subjectHash } from './audit.js';
+import { enforceSendGuards, recordSend, isAdvisory, is2FASender, isProtectedFolder, type GuardResult } from './guards.js';
+
+// Domain extraction helper used by guard audit records (D-RECIP-DOMAINS: never
+// log raw recipient addresses; domains-only for forensics correlation).
+function domainOnly(addr: string): string {
+  const trimmed = addr.trim();
+  const m = trimmed.match(/<([^>]+)>/);
+  const bare = (m?.[1] ?? trimmed).toLowerCase();
+  const at = bare.lastIndexOf('@');
+  return at >= 0 ? bare.slice(at + 1) : '(unknown)';
+}
+
+// Human-readable error message for the guard violation reasons. Exhaustive
+// switch with never assertion: if a new GuardResult variant ships in Layer 2+
+// the compile-time-ish reminder fires here (esbuild won't catch it, but the
+// pattern documents the contract for the next maintainer).
+function errorTextFor(g: Extract<GuardResult, { ok: false }>): string {
+  switch (g.reason) {
+    case 'daily_send_limit_exceeded':
+      return 'daily_send_limit_exceeded: limit=' + g.limit + ', remaining=' + g.remaining +
+        '. Wait ~24h or raise YANDEX_DAILY_SEND_LIMIT.';
+    case 'per_recipient_rate_limit':
+      return 'per_recipient_rate_limit: recipient=' + g.recipient + ', limit=' + g.limit +
+        '/hour, retry_after=' + g.retryAfter.toISOString() + '.';
+    case 'duplicate_send_within_window':
+      return 'duplicate_send_within_window: window=' + g.windowSec +
+        's. The same send was already submitted recently. Adjust subject/body or wait the window out.';
+    default: {
+      const _exhaustive: never = g;
+      return 'guard_violation_unknown: ' + String(_exhaustive);
+    }
+  }
+}
+
+// Helper for protected-folder gate (used by move_email and delete_email).
+// Returns the canonical entry from the set (preserves operator casing) so the
+// audit + error message echo the configured path verbatim.
+function checkProtectedFolder(folder: string, protectedSet: ReadonlySet<string>): { blocked: boolean; matched: string | null } {
+  if (!isProtectedFolder(folder, protectedSet)) return { blocked: false, matched: null };
+  const target = folder.toLowerCase();
+  for (const entry of protectedSet) {
+    if (entry.toLowerCase() === target) return { blocked: true, matched: entry };
+  }
+  return { blocked: true, matched: folder };
+}
 
 // ── Formatters ─────────────────────────────────────────────
 
@@ -85,6 +130,11 @@ export interface ToolCtx {
     canElicit: boolean;
     elicit?: ElicitFn;
   };
+  // Phase 7: protected-folder set resolved ONCE at startup
+  // (resolveProtectedFolders in guards.ts) and threaded through here. Empty
+  // Set is acceptable for L0 callers; gate firing happens only at L1+ inside
+  // the move/delete handlers.
+  protectedFolders: ReadonlySet<string>;
 }
 
 // Internal handler return shape — extends the SDK-visible shape with an
@@ -871,12 +921,65 @@ Args:
           }
         }
 
+        // ── Phase 7: Operational guards ──────────────────────
+        // Insertion point: AFTER allowlist + confirmation succeed. Dedup uses
+        // the verified fingerprint. Pipeline order is now
+        //   allowlist -> confirmation -> guards -> smtp.
+        // enforceSendGuards is pure (no state mutation); recordSend below is
+        // the SOLE state-mutation site, fired only on the success branch.
+        const guardPayload = { to: p.to, cc: p.cc, bcc: p.bcc };
+        const guardResult = enforceSendGuards(guardPayload, ctx.authLevel, fp);
+        if (!guardResult.ok) {
+          const recipientDomains = p.to.map(domainOnly);
+          if (isAdvisory(ctx.authLevel)) {
+            // L3 (auto): warn-only, do NOT block. Audit BEFORE the send so the
+            // operator sees the advisory even if the send then errors.
+            auditLog({
+              action: 'yandex_send_email',
+              status: 'denied',
+              level: 'warn',
+              ts: new Date().toISOString(),
+              reason: guardResult.reason + '_L3_advisory',
+              recipients: recipientDomains,
+              from_domain: '(self)',
+            });
+            // fall through to send path
+          } else {
+            // L1/L2: hard block.
+            auditLog({
+              action: 'yandex_send_email',
+              status: 'denied',
+              level: 'warn',
+              ts: new Date().toISOString(),
+              reason: guardResult.reason,
+              recipients: recipientDomains,
+              from_domain: '(self)',
+            });
+            return {
+              content: [{ type: 'text', text: errorTextFor(guardResult) }],
+              isError: true,
+              _audit: {
+                recipients: recipientDomains,
+                subject_hash: subjectHash(p.subject),
+                body_length: (p.text ?? p.html ?? '').length,
+                message_id: '<blocked-no-message-id>',
+              },
+            };
+          }
+        }
+
         // ── Send path ────────────────────────────────────────
         const r = await sendEmail(creds(), {
           to: p.to, cc: p.cc, bcc: p.bcc,
           subject: p.subject, text: p.text, html: p.html,
           replyTo: p.reply_to, inReplyTo: p.in_reply_to, references: p.references,
         });
+        // Phase 7: recordSend fires ONLY on the success branch (after
+        // sendEmail resolved). Counter / dedup state mutates regardless of L3
+        // advisory pass-through, so subsequent calls see the prior send.
+        if (r.success) {
+          recordSend(guardPayload, fp);
+        }
         const text = r.success
           ? `Письмо отправлено. Message-ID: ${r.messageId ?? 'n/a'}`
           : `Ошибка отправки: ${r.error}`;
