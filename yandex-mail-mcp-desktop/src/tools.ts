@@ -754,7 +754,6 @@ Args:
       } catch (e) { return errorResult(e); }
     },
   },
-,
 
   // 11. Trust address (L1) — Phase 5 TOFU allowlist write path.
   // Validates a single-use trust_token issued out-of-band by the CLI
