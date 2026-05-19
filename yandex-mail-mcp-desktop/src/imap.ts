@@ -286,6 +286,36 @@ export async function markEmail(folder: string, uid: number, seen?: boolean, fla
   });
 }
 
+// findByMessageId — used by Phase 5 in_reply_to auto-trust flow in tools.ts.
+// Bounded to INBOX + Sent so we don't fan out across every folder (T-05-13).
+// Returns the FROM address of the matching message (lowercased) — that is who
+// gets the auto-trust on the reply path, NOT the new recipient (T-05-06).
+export async function findByMessageId(messageId: string): Promise<{ from: string; folder: string; uid: number } | null> {
+  if (!messageId) return null;
+  return getConnectionManager().withClient(async c => {
+    const list = await c.list();
+    const sentPath = pickSpecialFolder(list, '\\Sent');
+    const folders = ['INBOX', sentPath];
+    for (const folder of folders) {
+      try {
+        await c.mailboxOpen(folder, { readOnly: true });
+        const uids = await c.search({ header: { 'message-id': messageId } } as Record<string, unknown>, { uid: true });
+        if (!Array.isArray(uids) || uids.length === 0) continue;
+        const uid = uids[0] as number;
+        for await (const msg of c.fetch(String(uid), { uid: true, envelope: true }, { uid: true })) {
+          const fromAddr = msg.envelope?.from?.[0]?.address;
+          if (fromAddr && typeof fromAddr === 'string') {
+            return { from: fromAddr.toLowerCase(), folder, uid };
+          }
+        }
+      } catch {
+        // Continue to next folder on per-folder errors (eg mailbox absent).
+      }
+    }
+    return null;
+  });
+}
+
 export async function getSpecialFolders(): Promise<{
   inbox: string; sent: string; drafts: string; trash: string; spam: string;
 }> {

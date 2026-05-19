@@ -15,12 +15,17 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { timingSafeEqual } from 'node:crypto';
 import { loadCredentials } from './token.js';
 import * as imap from './imap.js';
 import { sendEmail } from './smtp.js';
 import { sanitizeForDisplay, wrapUntrusted } from './sanitize.js';
 import { generateCode, verifyCode, actionFingerprint, type VerifyResult } from './confirm.js';
 import type { AuthLevel, Capability } from './auth.js';
+import * as allowlist from './allowlist.js';
+import { getStateDir } from './state-dir.js';
 
 // ── Formatters ─────────────────────────────────────────────
 
@@ -181,6 +186,11 @@ const markEmailSchema = z.object({
   message: 'Укажите хотя бы одно из полей: seen или flagged',
 });
 const getSpecialFoldersSchema = z.object({}).strict();
+const trustAddressSchema = z.object({
+  address:     z.string().min(3),
+  scope:       z.enum(['permanent', 'session']).default('permanent'),
+  trust_token: z.string().length(64),
+}).strict();
 
 // Note: send_email schema uses .refine() which returns ZodEffects, not ZodObject.
 // SDK requires the inputSchema field be a ZodObject (or its plain shape). We pass
@@ -264,7 +274,7 @@ function buildSendPlan(p: ParsedSendParams, fp: string): SendPlan {
       attachments: [],
     },
     checks: {
-      in_allowlist: 'deferred to phase 5',
+      in_allowlist: 'pass (allowlist gate runs before dry_run preview)',
       rate_limit_ok: 'deferred to phase 7',
       dedup: 'deferred to phase 7',
     },
@@ -389,7 +399,13 @@ Args: folder (default "INBOX"), uid (integer UID письма).
         const { folder, uid } = getEmailSchema.parse(params);
         const email = await imap.getEmail(folder, uid);
         if (!email) return { content: [{ type: 'text', text: `Письмо UID ${uid} не найдено в ${folder}.` }] };
-        const body = email.textBody ?? email.htmlBody ?? '(пусто)';
+        let body = email.textBody ?? email.htmlBody ?? '(пусто)';
+        // Phase 5: prepend untrusted-sender marker INSIDE the wrapUntrusted
+        // boundary (per ROADMAP SC #9). ASCII per D-EMOJI-MARKER — no glyph.
+        const fromAddr = email.from[0]?.address?.toLowerCase();
+        if (fromAddr && !allowlist.isAllowed(fromAddr)) {
+          body = `[!UNTRUSTED SENDER: ${sanitizeForDisplay(fromAddr)}]\n` + body;
+        }
         const attachLine = email.attachments.length
           ? `Вложения: ${email.attachments.map(a => `${sanitizeForDisplay(a.filename)} (${(a.size/1024).toFixed(1)} KB)`).join(', ')}`
           : '';
@@ -573,6 +589,65 @@ Args:
           throw new Error('Укажите хотя бы одно из полей: text или html');
         }
 
+        // ── Phase 5: Allowlist gate ──────────────────────────────────
+        // Runs BEFORE the dry_run / confirmation_token / SMTP path so that
+        // an untrusted recipient blocks the action immediately — including
+        // BCC, which is the primary exfil vector (T-INT-03 / T-05-05).
+        // Only enforced at L1+; L0 cannot reach this tool (not registered).
+        if (ctx.authLevel >= 1) {
+          // Strip optional "Name <addr>" wrapping → pull just the address.
+          const extractAddr = (s: string): string => {
+            const m = s.match(/<([^>]+)>/);
+            return (m?.[1] ?? s).trim().toLowerCase();
+          };
+          const recipients = [
+            ...p.to,
+            ...(p.cc ?? []),
+            ...(p.bcc ?? []),
+          ].map(extractAddr).filter(a => a.length > 0);
+
+          // in_reply_to auto-trust: the SENDER of the looked-up message
+          // (envelope.from) is the one auto-trusted — NOT the new recipients
+          // (T-05-06). This means in_reply_to does NOT bypass the recipient
+          // gate; it only seeds trust for future replies in the same thread.
+          if (p.in_reply_to) {
+            try {
+              const found = await imap.findByMessageId(p.in_reply_to);
+              if (found && found.from) {
+                allowlist.addTrusted(found.from, 'auto', 'auto_trust_reply');
+              }
+            } catch {
+              // Best-effort — failure to look up the original message must
+              // not crash the send; recipient gate below is the real check.
+            }
+          }
+
+          const untrusted = recipients.filter(a => !allowlist.isAllowed(a));
+          if (untrusted.length > 0) {
+            const trusted = recipients.filter(a => allowlist.isAllowed(a));
+            const trustedStr   = trusted.length   ? trusted.map(sanitizeForDisplay).join(', ')   : '(none)';
+            const untrustedStr = untrusted.map(sanitizeForDisplay).join(', ');
+            allowlist.auditEmit({
+              action: 'untrusted_block',
+              untrusted,
+              trusted,
+              level: ctx.authLevel,
+            });
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  `Send blocked — untrusted recipient(s).\n` +
+                  `Trusted (allowed): ${trustedStr}\n` +
+                  `Untrusted (blocked): ${untrustedStr}\n` +
+                  `To trust: npx yandex-mail-mcp-trust <addr>, then call yandex_trust_address.\n` +
+                  `Or send with in_reply_to=<message-id> if replying to existing thread.`,
+              }],
+              isError: true,
+            };
+          }
+        }
+
         // Fingerprint over the SEND payload only — not over dry_run /
         // confirmation_token, which are control-plane fields. Strip them
         // before canonicalization so the same logical send maps to the same fp
@@ -677,6 +752,76 @@ Args:
           : `Ошибка отправки: ${r.error}`;
         return { content: [{ type: 'text', text }], structuredContent: r };
       } catch (e) { return errorResult(e); }
+    },
+  },
+,
+
+  // 11. Trust address (L1) — Phase 5 TOFU allowlist write path.
+  // Validates a single-use trust_token issued out-of-band by the CLI
+  // (`npx yandex-mail-mcp-trust <addr>`). The CLI writes pending-trust.json
+  // mode 0600 in getStateDir(); this handler reads it, timing-safe compares,
+  // appends to allowlist, then deletes (single-use). 5-min TTL enforced.
+  {
+    name: 'yandex_trust_address',
+    title: 'Доверять адресу для отправки',
+    description: `Добавить адрес в allowlist для отправки писем. Требует trust_token,
+полученный из терминала через 'npx yandex-mail-mcp-trust <адрес>' (TTL 5 минут).
+Args:
+  address     (string) — email-адрес для добавления (точное совпадение)
+  scope       ('permanent' | 'session', default 'permanent')
+  trust_token (string) — 64-hex token из CLI, single-use`,
+    inputSchema: trustAddressSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    requires: { authLevel: 1 },
+    handler: async (params, _ctx) => {
+      try {
+        const { address, scope, trust_token } = trustAddressSchema.parse(params);
+        const pendingPath = path.join(getStateDir(), 'pending-trust.json');
+        if (!fs.existsSync(pendingPath)) {
+          return errorResult(new Error(
+            'No pending trust request. Run `npx yandex-mail-mcp-trust <addr>` in a terminal first.',
+          ));
+        }
+        let pending: { address: string; scope: string; trust_token: string; expires_at_ms: number };
+        try {
+          pending = JSON.parse(fs.readFileSync(pendingPath, 'utf-8')) as typeof pending;
+        } catch (e) {
+          try { fs.unlinkSync(pendingPath); } catch { /* ignore */ }
+          return errorResult(new Error(`pending-trust.json is corrupt; deleted. Re-run CLI. (${e instanceof Error ? e.message : String(e)})`));
+        }
+        if (typeof pending.expires_at_ms !== 'number' || pending.expires_at_ms <= Date.now()) {
+          try { fs.unlinkSync(pendingPath); } catch { /* ignore */ }
+          return errorResult(new Error('Trust token expired (TTL 5 min). Re-run `npx yandex-mail-mcp-trust <addr>`.'));
+        }
+        if (pending.address.toLowerCase() !== address.toLowerCase()) {
+          // Do NOT echo pending.trust_token — only the address mismatch.
+          return errorResult(new Error(`Address mismatch — pending request is for ${sanitizeForDisplay(pending.address)}.`));
+        }
+        // Length already enforced by schema (.length(64)). Decode both.
+        let pBuf: Buffer;
+        let aBuf: Buffer;
+        try {
+          pBuf = Buffer.from(pending.trust_token, 'hex');
+          aBuf = Buffer.from(trust_token, 'hex');
+        } catch {
+          return errorResult(new Error('Invalid trust token (not hex).'));
+        }
+        if (pBuf.length !== 32 || aBuf.length !== 32 || pBuf.length !== aBuf.length) {
+          return errorResult(new Error('Invalid trust token.'));
+        }
+        if (!timingSafeEqual(pBuf, aBuf)) {
+          // Wrong-token attempts do NOT burn the pending slot — TTL bounds replay.
+          return errorResult(new Error('Invalid trust token.'));
+        }
+        allowlist.addTrusted(address, scope, 'user_trust_token');
+        try { fs.unlinkSync(pendingPath); } catch { /* ignore */ }
+        return {
+          content: [{ type: 'text', text: `Адрес ${sanitizeForDisplay(address)} добавлен в allowlist (scope=${scope}).` }],
+          structuredContent: { success: true, address: address.toLowerCase(), scope },
+        };
+      } catch (e) {
+        return errorResult(e);
+      }
     },
   },
 ];
