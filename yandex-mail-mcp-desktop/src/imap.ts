@@ -1,6 +1,6 @@
 import { ImapFlow, type FetchMessageObject, type MailboxObject, type ListResponse } from 'imapflow';
 import { simpleParser } from 'mailparser';
-import type { Credentials } from './token.js';
+import { loadCredentials, type Credentials } from './token.js';
 
 // ── Constants ──────────────────────────────────────────────
 const IMAP_HOST = 'imap.yandex.com';
@@ -51,14 +51,43 @@ function makeClient(creds: Credentials): ImapFlow {
   });
 }
 
-async function withClient<T>(creds: Credentials, fn: (c: ImapFlow) => Promise<T>): Promise<T> {
-  const c = makeClient(creds);
-  try {
-    await c.connect();
-    return await fn(c);
-  } finally {
-    await c.logout().catch(() => {});
+// ── Hook 4: ConnectionManager (see ARCHITECTURE-NOTES.md §Hook 4) ──
+//
+// Wraps the per-call connect/logout pattern in a class so future layers can
+// add long-lived (L7 IDLE) and pooled (L2/L3 batch) variants without touching
+// any of the call sites in this file or in tools.ts.
+
+export class ConnectionManager {
+  constructor(private creds: Credentials) {}
+
+  async withClient<T>(fn: (c: ImapFlow) => Promise<T>): Promise<T> {
+    const c = makeClient(this.creds);
+    try {
+      await c.connect();
+      return await fn(c);
+    } finally {
+      await c.logout().catch(() => {});
+    }
   }
+
+  // future hooks (NOT in Phase 1):
+  //   withIdleClient<T>(...)   — long-lived connection for L7 wait_for_email
+  //   withPooledClient<T>(...) — pooled re-use for L2/L3 batch (index build, manifest)
+}
+
+let _connectionManager: ConnectionManager | null = null;
+export function getConnectionManager(): ConnectionManager {
+  if (!_connectionManager) {
+    _connectionManager = new ConnectionManager(loadCredentials());
+  }
+  return _connectionManager;
+}
+
+// Legacy top-level shim — delegates to singleton.
+// Signature changed: was (creds, fn), now (fn). No external caller uses this
+// directly (tools.ts goes through public exports listFolders/getEmail/etc.).
+export async function withClient<T>(fn: (c: ImapFlow) => Promise<T>): Promise<T> {
+  return getConnectionManager().withClient(fn);
 }
 
 // ── Helpers ────────────────────────────────────────────────
@@ -104,9 +133,12 @@ function parseHeader(msg: FetchMessageObject): EmailHeader {
 }
 
 // ── Public API ─────────────────────────────────────────────
+// Note: creds param on each export is vestigial in Phase 1 — real creds come
+// from getConnectionManager() singleton. Param retained for ABI compat with
+// tools.ts in this phase; Phase 3 (Hook 3 — declarative TOOLS[]) will remove it.
 
-export async function listFolders(creds: Credentials): Promise<Folder[]> {
-  return withClient(creds, async c => {
+export async function listFolders(_creds: Credentials): Promise<Folder[]> {
+  return getConnectionManager().withClient(async c => {
     const list = await c.list();
     return list.map((item: { path: string; name: string; specialUse?: string; flags?: Set<string> }) => ({
       path: item.path,
@@ -117,17 +149,17 @@ export async function listFolders(creds: Credentials): Promise<Folder[]> {
   });
 }
 
-export async function folderStatus(creds: Credentials, folder: string) {
-  return withClient(creds, async c => {
+export async function folderStatus(_creds: Credentials, folder: string) {
+  return getConnectionManager().withClient(async c => {
     const s = await c.status(folder, { messages: true, unseen: true });
     return { folder, messageCount: s.messages ?? 0, unseenCount: s.unseen ?? 0 };
   });
 }
 
 export async function listEmails(
-  creds: Credentials, folder: string, page: number, pageSize: number
+  _creds: Credentials, folder: string, page: number, pageSize: number
 ) {
-  return withClient(creds, async c => {
+  return getConnectionManager().withClient(async c => {
     const mbox: MailboxObject = await c.mailboxOpen(folder, { readOnly: true });
     const total = mbox.exists ?? 0;
     if (!total) return { folder, total: 0, page, pageSize, hasMore: false, emails: [] as EmailHeader[] };
@@ -151,8 +183,8 @@ export async function listEmails(
   });
 }
 
-export async function getEmail(creds: Credentials, folder: string, uid: number): Promise<EmailMessage | null> {
-  return withClient(creds, async c => {
+export async function getEmail(_creds: Credentials, folder: string, uid: number): Promise<EmailMessage | null> {
+  return getConnectionManager().withClient(async c => {
     await c.mailboxOpen(folder, { readOnly: true });
     let raw: Buffer | null = null;
     let hdr: EmailHeader | null = null;
@@ -180,12 +212,12 @@ export async function getEmail(creds: Credentials, folder: string, uid: number):
 }
 
 export async function searchEmails(
-  creds: Credentials,
+  _creds: Credentials,
   folder: string,
   query: Record<string, unknown>,
   maxResults: number
 ): Promise<EmailHeader[]> {
-  return withClient(creds, async c => {
+  return getConnectionManager().withClient(async c => {
     await c.mailboxOpen(folder, { readOnly: true });
     const uids = await c.search(query, { uid: true });
     if (!uids.length) return [];
@@ -198,15 +230,15 @@ export async function searchEmails(
   });
 }
 
-export async function moveEmail(creds: Credentials, folder: string, uid: number, target: string) {
-  await withClient(creds, async c => {
+export async function moveEmail(_creds: Credentials, folder: string, uid: number, target: string) {
+  await getConnectionManager().withClient(async c => {
     await c.mailboxOpen(folder);
     await c.messageMove(String(uid), target, { uid: true });
   });
 }
 
-export async function deleteEmail(creds: Credentials, folder: string, uid: number, permanent: boolean) {
-  await withClient(creds, async c => {
+export async function deleteEmail(_creds: Credentials, folder: string, uid: number, permanent: boolean) {
+  await getConnectionManager().withClient(async c => {
     await c.mailboxOpen(folder);
     if (permanent) {
       await c.messageDelete(String(uid), { uid: true });
@@ -217,8 +249,8 @@ export async function deleteEmail(creds: Credentials, folder: string, uid: numbe
   });
 }
 
-export async function markEmail(creds: Credentials, folder: string, uid: number, seen?: boolean, flagged?: boolean) {
-  await withClient(creds, async c => {
+export async function markEmail(_creds: Credentials, folder: string, uid: number, seen?: boolean, flagged?: boolean) {
+  await getConnectionManager().withClient(async c => {
     await c.mailboxOpen(folder);
     if (seen === true)    await c.messageFlagsAdd   (String(uid), ['\\Seen'],    { uid: true });
     if (seen === false)   await c.messageFlagsRemove(String(uid), ['\\Seen'],    { uid: true });
@@ -227,10 +259,10 @@ export async function markEmail(creds: Credentials, folder: string, uid: number,
   });
 }
 
-export async function getSpecialFolders(creds: Credentials): Promise<{
+export async function getSpecialFolders(_creds: Credentials): Promise<{
   inbox: string; sent: string; drafts: string; trash: string; spam: string;
 }> {
-  return withClient(creds, async c => {
+  return getConnectionManager().withClient(async c => {
     const list = await c.list();
     return {
       inbox:  'INBOX',

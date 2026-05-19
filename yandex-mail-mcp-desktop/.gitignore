@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build artifacts: dist/ is intentionally NOT ignored — bundle ships in git for npx-shipping
+# (see CLAUDE.md and ROADMAP Phase 1)
+
+# Secrets — NEVER commit
+token.json
+.env
+.env.*
+*.pem
+*.key
+
+# Audit log (Phase 6, getStateDir() — but ignore here in case env override writes locally)
+audit.jsonl
+*.audit.log
+*.log
+
+# Allowlist (Phase 5, getStateDir() — same rationale)
+allowlist.json
+
+# package-lock.json is intentionally NOT ignored — DIST-05 requires it in git

@@ -1,3 +1,6 @@
+// Verified against nodemailer v8.0.7 + @types/nodemailer v6.4.23 .d.ts on 2026-05-19.
+// Options interface (mailer/index.d.ts:98) and OAuth2 auth shape (smtp-connection/xoauth2)
+// are byte-compatible with v6 usage. No API changes required for Phase 1.
 import nodemailer from 'nodemailer';
 import type { Credentials } from './token.js';
 
