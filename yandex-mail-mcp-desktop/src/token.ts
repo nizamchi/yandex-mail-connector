@@ -26,6 +26,28 @@ export interface Credentials {
   smtpHost?: string;
 }
 
+// SEC-03 (T-02-01): host allowlist для защиты от env-poisoning. Оба `.com` и
+// `.ru` first-class (CNAME + TLS SAN, см. ARCHITECTURE-NOTES.md Fact 1);
+// `imap.ya.ru` — legacy alias, тоже допустим.
+const ALLOWED_HOSTS = new Set<string>([
+  'imap.yandex.com',
+  'imap.yandex.ru',
+  'imap.ya.ru',
+  'smtp.yandex.com',
+  'smtp.yandex.ru',
+]);
+
+function validateHost(host: string | undefined, kind: 'imap' | 'smtp'): void {
+  if (host == null) return; // defaults в imap.ts / smtp.ts уже в allowlist
+  if (process.env.YANDEX_ALLOW_CUSTOM_HOSTS === 'true') return;
+  if (!ALLOWED_HOSTS.has(host)) {
+    throw new Error(
+      `Refused ${kind}Host "${host}" — not in Yandex host allowlist. ` +
+      `Set YANDEX_ALLOW_CUSTOM_HOSTS=true to bypass (NOT recommended for production).`,
+    );
+  }
+}
+
 function findTokenFile(): string | null {
   // Look next to dist/index.js → project root → cwd
   const candidates = [
@@ -55,24 +77,30 @@ export function loadCredentials(): Credentials {
     if (!raw.access_token || !raw.email) {
       throw new Error('token.json must contain "access_token" and "email"');
     }
-    return {
+    const creds: Credentials = {
       email:      raw.email as string,
       oauthToken: raw.access_token as string,
       imapHost:   raw.imap_host as string | undefined,
       smtpHost:   raw.smtp_host as string | undefined,
     };
+    validateHost(creds.imapHost, 'imap');
+    validateHost(creds.smtpHost, 'smtp');
+    return creds;
   }
 
   // 2. Env var fallback
   const token = process.env.YANDEX_OAUTH_TOKEN;
   const email = process.env.YANDEX_EMAIL;
   if (token && email) {
-    return {
+    const creds: Credentials = {
       email,
       oauthToken: token,
       imapHost:   process.env.YANDEX_IMAP_HOST,
       smtpHost:   process.env.YANDEX_SMTP_HOST,
     };
+    validateHost(creds.imapHost, 'imap');
+    validateHost(creds.smtpHost, 'smtp');
+    return creds;
   }
 
   throw new Error(
