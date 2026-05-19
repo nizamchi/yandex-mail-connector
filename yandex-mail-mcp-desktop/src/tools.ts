@@ -21,7 +21,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { loadCredentials } from './token.js';
 import * as imap from './imap.js';
 import { sendEmail } from './smtp.js';
-import { sanitizeForDisplay, wrapUntrusted } from './sanitize.js';
+import { sanitizeForDisplay, wrapUntrusted, sanitizeError } from './sanitize.js';
 import { generateCode, verifyCode, actionFingerprint, type VerifyResult } from './confirm.js';
 import type { AuthLevel, Capability } from './auth.js';
 import * as allowlist from './allowlist.js';
@@ -184,7 +184,7 @@ const creds = (): ReturnType<typeof loadCredentials> => loadCredentials();
 // Narrow helper to format the error path consistently across handlers.
 function errorResult(e: unknown): HandlerResult {
   return {
-    content: [{ type: 'text', text: `Ошибка: ${e instanceof Error ? e.message : String(e)}` }],
+    content: [{ type: 'text', text: `Ошибка: ${sanitizeError(e)}` }],
     isError: true,
   };
 }

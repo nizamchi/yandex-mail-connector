@@ -52,3 +52,116 @@ export function wrapUntrusted(body: string | null | undefined): string {
   const safe = body ?? '';
   return `${UNTRUSTED_BEGIN}\n${safe}\n${UNTRUSTED_END}`;
 }
+
+// ── Error sanitiser (Phase 8, T-08-01) ─────────────────────────────────────
+//
+// sanitizeError(e) coerces any thrown value into a single-line string of the
+// shape `[Category] message` with sensitive substrings redacted. See plan
+// 08-01 Task 2 for the full contract.
+//
+// IMPORTANT ordering (so token-redaction doesn't fire on email local-parts and
+// password JSON values aren't first eaten by the long-token regex):
+//   1. Password JSON keys -> [REDACTED]
+//   2. Authorization / Bearer header values -> [REDACTED]
+//   3. Email addresses -> [REDACTED-EMAIL]
+//   4. Long hex / base64-like tokens -> [REDACTED-TOKEN]
+
+// Category detection runs against the ORIGINAL message body BEFORE redaction
+// so the markers don't fool detection.
+type ErrorCategory = 'NetworkError' | 'AuthError' | 'ImapError' | 'SmtpError' | 'GuardError' | 'Error';
+
+const GUARD_TOKENS = [
+  'daily_send_limit_exceeded',
+  'per_recipient_rate_limit',
+  'protected_folder',
+  'duplicate_send_within_window',
+  '2fa_sender_redacted',
+];
+
+function detectCategory(e: unknown, rawMsg: string): ErrorCategory {
+  for (const tok of GUARD_TOKENS) {
+    if (rawMsg.indexOf(tok) >= 0) return 'GuardError';
+  }
+  if (/AUTH|Invalid login|authentication failed|535/i.test(rawMsg)) return 'AuthError';
+  if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNRESET/.test(rawMsg)) return 'NetworkError';
+  const ctorName = (e && typeof e === 'object' && (e as { constructor?: { name?: string } }).constructor?.name) || '';
+  if (ctorName.indexOf('IMAP') >= 0 || /^IMAP|imapflow/i.test(rawMsg)) return 'ImapError';
+  if (
+    ctorName.indexOf('SMTP') >= 0 ||
+    typeof (e as { responseCode?: unknown })?.responseCode === 'number' ||
+    /SMTP|nodemailer/i.test(rawMsg)
+  ) return 'SmtpError';
+  return 'Error';
+}
+
+// Password / credential JSON values. Single alternation per plan-check W-1.
+const PASSWORD_JSON_RE = new RegExp(
+  '"(password|secret|key|token|access_token|refresh_token|oauthToken|app_password|api_key|client_secret)"\\s*:\\s*"[^"]*"',
+  'gi',
+);
+
+// Authorization header line (e.g. "Authorization: Bearer xyz...").
+// Match "Authorization: <scheme> <value>" up to end-of-line / message. The
+// scheme + value can contain spaces (Basic <b64>, Bearer <token>), so we
+// consume to a hard delimiter.
+const AUTH_HEADER_RE = /Authorization\s*:\s*[^\r\n,;}]+/gi;
+// Inline "Bearer <token>".
+const BEARER_RE = /Bearer\s+[A-Za-z0-9._\-]+/g;
+
+// RFC-loose email.
+const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+// Long hex / base64-like runs (>=32 chars). Base64 alphabet excludes typical
+// English words but to avoid eating ordinary sentences we require >=32 in a
+// row.
+const HEX_RE = /[0-9a-fA-F]{32,}/g;
+const BASE64_RE = /[A-Za-z0-9+/_\-]{32,}/g;
+
+export function sanitizeError(e: unknown): string {
+  let raw: string;
+  if (e instanceof Error) {
+    raw = e.message;
+  } else if (typeof e === 'string') {
+    raw = e;
+  } else if (e === undefined) {
+    raw = 'undefined';
+  } else if (e === null) {
+    raw = 'null';
+  } else {
+    try {
+      raw = JSON.stringify(e);
+    } catch {
+      raw = String(e);
+    }
+  }
+
+  const category = detectCategory(e, raw);
+
+  // Collapse to a single line first (errors with embedded newlines break the
+  // single-line contract).
+  let out = raw.replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
+
+  // 1. Password JSON keys — must run before token regex so the "value" half
+  //    of the credential JSON isn't redacted as a generic token leaving the
+  //    key visible.
+  out = out.replace(PASSWORD_JSON_RE, (_m, key: string) => `"${key}":"[REDACTED]"`);
+
+  // 2. Authorization / Bearer header values.
+  out = out.replace(AUTH_HEADER_RE, 'Authorization: [REDACTED]');
+  out = out.replace(BEARER_RE, 'Bearer [REDACTED]');
+
+  // 3. Email addresses.
+  out = out.replace(EMAIL_RE, '[REDACTED-EMAIL]');
+
+  // 4. Long hex / base64 tokens.
+  out = out.replace(HEX_RE, '[REDACTED-TOKEN]');
+  out = out.replace(BASE64_RE, '[REDACTED-TOKEN]');
+
+  // Idempotency: if the message already begins with "[<Category>]" we keep
+  // it as-is (no double bracketing).
+  if (/^\[[A-Za-z]+\]\s/.test(out)) {
+    return out;
+  }
+  return `[${category}] ${out}`;
+}
+
