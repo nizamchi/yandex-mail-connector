@@ -1,0 +1,361 @@
+// allowlist.ts — TOFU (trust-on-first-use) recipient allowlist with HMAC signing.
+//
+// Closes T-INT-03 (BCC exfil via prompt injection) and T-PI exfil routes by
+// gating every outbound recipient against a permanent file-backed allowlist.
+// The file is HMAC-SHA256 signed against a per-install secret (secret.bin in
+// getStateDir()) so a file-system-only attacker cannot extend it without
+// also stealing the key. Both files are written mode 0o600 on POSIX.
+//
+// On first L1+ start index.ts calls bootstrap() which walks the user's Sent
+// folder, pulls the last 500 unique recipient addresses (to + cc), and treats
+// those as the initial trust set ("you've emailed them before — they're real").
+// Subsequent additions happen ONLY via:
+//   - addTrusted() called from the in_reply_to auto-trust flow in tools.ts
+//     (scope='auto', source='auto_trust_reply'), or
+//   - addTrusted() called from the yandex_trust_address MCP tool after the
+//     CLI hands over a single-use trust_token via pending-trust.json.
+//
+// Per D-PHASE6-AUDIT-HOOK: auditEmit() is a module-local sink that writes one
+// JSON line to stderr today. Phase 6 will replace this sink by importing
+// auditLog from audit.ts. Search-and-replace target: the literal string
+// 'auditEmit('.
+//
+// Per D-HMAC-SECRET-SOURCE: secret is auto-generated, persisted to secret.bin
+// (NOT reused from YANDEX_CONFIRMATION_PASSWORD — that env is L2-only).
+//
+// No `any`. ESM `.js` suffix on internal imports.
+
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import type { ImapFlow } from 'imapflow';
+
+import { getStateDir } from './state-dir.js';
+
+// ── Types ──────────────────────────────────────────────────
+
+export type AllowlistScope = 'permanent' | 'session' | 'auto';
+export type AllowlistSource = 'sent_history' | 'user_trust_token' | 'auto_trust_reply';
+
+export interface AllowlistEntry {
+  address: string;
+  scope: AllowlistScope;
+  source: AllowlistSource;
+  added_at: string;
+}
+
+interface AllowlistFile {
+  version: 1;
+  schema: 'yandex-mail-mcp-allowlist/v1';
+  bootstrap_completed_at: string | null;
+  entries: AllowlistEntry[];
+  signature: string;
+}
+
+// ── Paths ──────────────────────────────────────────────────
+
+function allowlistPath(): string {
+  return process.env.YANDEX_ALLOWLIST_PATH ?? path.join(getStateDir(), 'allowlist.json');
+}
+
+function secretPath(): string {
+  return path.join(getStateDir(), 'secret.bin');
+}
+
+function pendingTrustPath(): string {
+  return path.join(getStateDir(), 'pending-trust.json');
+}
+
+export function getAllowlistPath(): string { return allowlistPath(); }
+export function getSecretPath(): string { return secretPath(); }
+export function getPendingTrustPath(): string { return pendingTrustPath(); }
+
+// ── Secret management ──────────────────────────────────────
+
+// In-process cache of the resolved secret. Cleared by _resetForTests().
+let secretCache: Buffer | null = null;
+
+function loadSecret(): Buffer {
+  if (secretCache !== null) return secretCache;
+  const p = secretPath();
+  if (fs.existsSync(p)) {
+    const buf = fs.readFileSync(p);
+    if (buf.length !== 32) {
+      // Corrupt secret — fail closed. Caller (verifySignature) returns false.
+      throw new Error(`allowlist secret at ${p} has unexpected length ${buf.length} (expected 32). Delete the file to regenerate (this wipes all trust).`);
+    }
+    secretCache = buf;
+    return buf;
+  }
+  const buf = randomBytes(32);
+  atomicWrite(p, buf, 0o600);
+  secretCache = buf;
+  return buf;
+}
+
+// ── Canonicalization + signing ────────────────────────────
+
+// Recursive deterministic JSON serializer with sorted keys at every object
+// level. Used as HMAC input. Excludes the 'signature' field — caller passes
+// the file object with signature stripped or set to ''.
+function canonicalStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return '[' + value.map(canonicalStringify).join(',') + ']';
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalStringify(obj[k])).join(',') + '}';
+}
+
+function canonicalize(file: AllowlistFile): string {
+  const { signature: _sig, ...rest } = file;
+  void _sig;
+  return canonicalStringify(rest);
+}
+
+function computeSignature(file: AllowlistFile, secret: Buffer): string {
+  return createHmac('sha256', secret).update(canonicalize(file)).digest('hex');
+}
+
+// ── Atomic write helper ────────────────────────────────────
+
+function atomicWrite(target: string, data: Buffer | string, mode: number): void {
+  const tmp = target + '.tmp';
+  try {
+    fs.writeFileSync(tmp, data, { mode });
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    // Best-effort cleanup of half-written tmpfile.
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    throw new Error(`atomicWrite to ${target} failed: ${err.message ?? String(e)}`);
+  }
+}
+
+// ── Audit hook (D-PHASE6-AUDIT-HOOK) ──────────────────────
+
+export function auditEmit(record: Record<string, unknown>): void {
+  const line = JSON.stringify({ ts: new Date().toISOString(), ...record });
+  process.stderr.write('[yandex-mail-audit] ' + line + '\n');
+}
+
+// ── Address normalisation ─────────────────────────────────
+
+function norm(address: string): string {
+  return address.trim().toLowerCase();
+}
+
+// ── Load / persist ────────────────────────────────────────
+
+function emptyFile(): AllowlistFile {
+  return {
+    version: 1,
+    schema: 'yandex-mail-mcp-allowlist/v1',
+    bootstrap_completed_at: null,
+    entries: [],
+    signature: '',
+  };
+}
+
+export function loadAllowlist(): AllowlistFile {
+  const p = allowlistPath();
+  if (!fs.existsSync(p)) return emptyFile();
+  try {
+    const raw = fs.readFileSync(p, 'utf-8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (
+      typeof parsed !== 'object' || parsed === null ||
+      (parsed as { version?: unknown }).version !== 1 ||
+      (parsed as { schema?: unknown }).schema !== 'yandex-mail-mcp-allowlist/v1' ||
+      !Array.isArray((parsed as { entries?: unknown }).entries)
+    ) {
+      // Corrupt — return fresh-empty so caller's verifySignature() can return
+      // false and trigger the startup gate.
+      return { ...emptyFile(), signature: 'corrupt' };
+    }
+    return parsed as AllowlistFile;
+  } catch {
+    return { ...emptyFile(), signature: 'corrupt' };
+  }
+}
+
+function persist(file: AllowlistFile): void {
+  atomicWrite(allowlistPath(), JSON.stringify(file, null, 2), 0o600);
+}
+
+// ── Public API ────────────────────────────────────────────
+
+// verifySignature: NEVER throws on bad input. Returns:
+//   true  — fresh state (empty + never bootstrapped) OR signature matches.
+//   false — file exists but signature missing/wrong/corrupt; caller exits.
+export function verifySignature(): boolean {
+  const file = loadAllowlist();
+  if (file.signature === 'corrupt') return false;
+  // Fresh state: never bootstrapped, no entries, empty signature → OK.
+  if (file.bootstrap_completed_at === null && file.entries.length === 0 && file.signature === '') {
+    return true;
+  }
+  let secret: Buffer;
+  try { secret = loadSecret(); } catch { return false; }
+  const expected = computeSignature(file, secret);
+  const expectedBuf = Buffer.from(expected, 'hex');
+  const actualBuf = Buffer.from(file.signature, 'hex');
+  if (expectedBuf.length !== actualBuf.length || expectedBuf.length === 0) return false;
+  try {
+    return timingSafeEqual(expectedBuf, actualBuf);
+  } catch {
+    return false;
+  }
+}
+
+// resign(): re-sign current allowlist file. With newSecret arg → rotate the
+// stored secret AND re-sign with the new one (single-call rotation). Without
+// arg → recompute signature with the current secret. Atomic write.
+export function resign(newSecret?: Buffer): void {
+  if (newSecret !== undefined) {
+    if (newSecret.length !== 32) {
+      throw new Error(`resign: new secret must be 32 bytes (got ${newSecret.length})`);
+    }
+    atomicWrite(secretPath(), newSecret, 0o600);
+    secretCache = newSecret;
+  }
+  const secret = loadSecret();
+  const file = loadAllowlist();
+  if (file.signature === 'corrupt') {
+    throw new Error('resign: allowlist file is corrupt — cannot resign. Delete it to regenerate.');
+  }
+  file.signature = computeSignature(file, secret);
+  persist(file);
+}
+
+export function isAllowed(address: string): boolean {
+  const target = norm(address);
+  if (!target) return false;
+  const file = loadAllowlist();
+  return file.entries.some(e => e.address === target);
+}
+
+export function addTrusted(address: string, scope: AllowlistScope, source: AllowlistSource): void {
+  const target = norm(address);
+  if (!target) return;
+  const file = loadAllowlist();
+  if (file.signature === 'corrupt') {
+    throw new Error('addTrusted: allowlist file is corrupt — refusing to mutate.');
+  }
+  const existing = file.entries.find(e => e.address === target);
+  if (existing) return;
+  file.entries.push({
+    address: target,
+    scope,
+    source,
+    added_at: new Date().toISOString(),
+  });
+  const secret = loadSecret();
+  file.signature = computeSignature(file, secret);
+  persist(file);
+  auditEmit({ action: 'allowlist_add', address: target, scope, source });
+}
+
+// bootstrap(client, limit, sentPath): one-shot Sent-folder mining of the
+// initial trust set. Guarded by bootstrap_completed_at — returns 0 if already
+// bootstrapped. sentPath is taken as a parameter (DI) so callers resolve it
+// via imap.getSpecialFolders() — this avoids hardcoding 'Sent' (CLAUDE.md
+// requires cyrillic-safe handling) and makes the function easy to unit-test
+// with a mock client.
+export async function bootstrap(
+  client: ImapFlow,
+  limit: number,
+  sentPath: string,
+): Promise<number> {
+  const file = loadAllowlist();
+  if (file.signature === 'corrupt') {
+    throw new Error('bootstrap: allowlist file is corrupt — refusing to mutate.');
+  }
+  if (file.bootstrap_completed_at !== null) return 0;
+  if (!Number.isFinite(limit) || limit <= 0) limit = 500;
+
+  await client.mailboxOpen(sentPath, { readOnly: true });
+  const searchResult = await client.search({ all: true }, { uid: true });
+  const uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+  if (uids.length === 0) {
+    // Empty Sent — mark bootstrap complete with zero entries so we don't retry
+    // on every restart. User will accrue trust via in_reply_to + CLI.
+    file.bootstrap_completed_at = new Date().toISOString();
+    const secret = loadSecret();
+    file.signature = computeSignature(file, secret);
+    persist(file);
+    auditEmit({ action: 'allowlist_bootstrap', count: 0, source: 'sent_history' });
+    return 0;
+  }
+
+  // Take last `limit` UIDs (highest = most recent in Yandex's UID assignment).
+  const slice = uids.slice(-limit);
+
+  const addrs = new Set<string>();
+  const MAX_RAW = limit * 10;
+  for await (const msg of client.fetch(slice, { uid: true, envelope: true }, { uid: true })) {
+    const env = msg.envelope;
+    if (!env) continue;
+    const collect = (list?: Array<{ address?: string | null }>): void => {
+      if (!list) return;
+      for (const a of list) {
+        if (a.address && typeof a.address === 'string') {
+          const n = norm(a.address);
+          if (n) addrs.add(n);
+        }
+      }
+    };
+    // Plan-check fix W-4: read BOTH to AND cc (ALLOW-01).
+    collect(env.to);
+    collect(env.cc);
+    if (addrs.size > MAX_RAW) break;
+  }
+
+  const now = new Date().toISOString();
+  const existingSet = new Set(file.entries.map(e => e.address));
+  let added = 0;
+  for (const a of addrs) {
+    if (existingSet.has(a)) continue;
+    file.entries.push({
+      address: a,
+      scope: 'permanent',
+      source: 'sent_history',
+      added_at: now,
+    });
+    added++;
+  }
+
+  file.bootstrap_completed_at = now;
+  const secret = loadSecret();
+  file.signature = computeSignature(file, secret);
+  persist(file);
+  auditEmit({ action: 'allowlist_bootstrap', count: added, source: 'sent_history' });
+  return added;
+}
+
+// sweepPendingTrust: orphan-sweep called from index.ts startup. Removes a
+// pending-trust.json older than the TTL (5 minutes). Plan-check fix W-3.
+// Returns true iff a sweep happened (for stderr quiet-log gate).
+const PENDING_TTL_MS = 5 * 60 * 1000;
+export function sweepPendingTrust(): boolean {
+  const p = pendingTrustPath();
+  if (!fs.existsSync(p)) return false;
+  try {
+    const st = fs.statSync(p);
+    const ageMs = Date.now() - st.mtimeMs;
+    if (ageMs > PENDING_TTL_MS) {
+      fs.unlinkSync(p);
+      auditEmit({ action: 'pending_trust_swept', age_ms: Math.round(ageMs) });
+      return true;
+    }
+  } catch { /* ignore — best-effort */ }
+  return false;
+}
+
+// Test-only: flush in-process caches (secret + any future state).
+export function _resetForTests(): void {
+  secretCache = null;
+}
