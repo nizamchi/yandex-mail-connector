@@ -26,7 +26,32 @@ if (isInvalidAuthLevel()) {
 }
 
 const server = new McpServer({ name: 'yandex-mail-mcp', version: '2.0.0' });
-registerTools(server, { authLevel, capabilities });
+
+// Mutable bag shared with every tool handler via ctx.serverContext. canElicit
+// starts false and is updated by the oninitialized hook below; elicit dispatches
+// through the underlying SDK Server without leaking the McpServer reference
+// into handler code.
+const serverContext: {
+  canElicit: boolean;
+  elicit?: (params: { message: string; requestedSchema: { type: 'object'; properties: Record<string, { type: 'boolean' | 'string' | 'number'; title?: string; description?: string }>; required?: string[] } }) => Promise<{ action: 'accept' | 'cancel' | 'decline'; content?: Record<string, unknown> }>;
+} = { canElicit: false };
+
+// The MCP SDK dispatches `oninitialized` ASYNCHRONOUSLY when the client sends
+// the `notifications/initialized` notification (see SDK server/index.js:53).
+// By that point `_clientCapabilities` is populated (index.js:272), so
+// `getClientCapabilities()` returns the resolved value. The MCP protocol
+// guarantees `notifications/initialized` arrives before any `tools/call`, so
+// handlers reading serverContext.canElicit lazily at call-time always see the
+// resolved value. Must be assigned BEFORE server.connect(transport).
+server.server.oninitialized = (): void => {
+  const caps = server.server.getClientCapabilities();
+  serverContext.canElicit = caps?.elicitation !== undefined;
+  process.stderr.write(`[yandex-mail] client capabilities: elicitation=${serverContext.canElicit}\n`);
+};
+
+serverContext.elicit = (params) => server.server.elicitInput(params) as Promise<{ action: 'accept' | 'cancel' | 'decline'; content?: Record<string, unknown> }>;
+
+registerTools(server, { authLevel, capabilities, serverContext });
 
 const transport = new StdioServerTransport();
 server.connect(transport).catch(err => {

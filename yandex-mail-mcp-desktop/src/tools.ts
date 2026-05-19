@@ -48,9 +48,36 @@ function parseSearchDate(s: string, field: string): Date {
 
 // ── Public types (consumed by index.ts and tools-registry.test.ts) ─────────
 
+// Shape of the elicit dispatcher exposed to handlers. Inlined here (rather than
+// imported from @modelcontextprotocol/sdk/types.js) so tools.ts stays loosely
+// coupled to the SDK. The actual SDK signature is verified at integration
+// point in src/index.ts where the closure is wired.
+export interface ElicitFn {
+  (params: {
+    message: string;
+    requestedSchema: {
+      type: 'object';
+      properties: Record<string, { type: 'boolean' | 'string' | 'number'; title?: string; description?: string }>;
+      required?: string[];
+    };
+  }): Promise<{
+    action: 'accept' | 'cancel' | 'decline';
+    content?: Record<string, unknown>;
+  }>;
+}
+
 export interface ToolCtx {
   authLevel: AuthLevel;
   capabilities: Set<Capability>;
+  // serverContext.canElicit is set ASYNCHRONOUSLY by the SDK's
+  // `notifications/initialized` handler (server.server.oninitialized hook in
+  // src/index.ts). Handlers MUST NOT read it at registration time — only at
+  // tool-call time, which is guaranteed to follow `notifications/initialized`
+  // per MCP protocol. The bag is mutated in place; the reference is shared.
+  serverContext: {
+    canElicit: boolean;
+    elicit?: ElicitFn;
+  };
 }
 
 export interface ToolDef {
