@@ -4,7 +4,8 @@
   "description": "MCP server for Yandex Mail — Claude Desktop (stdio)",
   "main": "dist/index.js",
   "bin": {
-    "yandex-mail-mcp": "dist/yandex-mail-mcp.js"
+    "yandex-mail-mcp": "dist/yandex-mail-mcp.js",
+    "yandex-mail-mcp-trust": "dist/cli-trust.js"
   },
   "files": [
     "dist/",
@@ -14,9 +15,9 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --minify --platform=node --target=node18 --outfile=dist/yandex-mail-mcp.js --format=cjs --banner:js=\"#!/usr/bin/env node\" --external:node-notifier",
+    "build": "esbuild src/index.ts --bundle --minify --platform=node --target=node18 --outfile=dist/yandex-mail-mcp.js --format=cjs --banner:js=\"#!/usr/bin/env node\" --external:node-notifier && esbuild src/cli-trust.ts --bundle --minify --platform=node --target=node18 --outfile=dist/cli-trust.js --format=cjs --banner:js=\"#!/usr/bin/env node\"",
     "start": "node dist/yandex-mail-mcp.js",
-    "test": "esbuild src/__tests__/sanitize.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/sanitize.test.js --external:node:test --external:node:assert && esbuild src/__tests__/auth.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/auth.test.js --external:node:test --external:node:assert && esbuild src/__tests__/tools-registry.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/tools-registry.test.js --external:node:test --external:node:assert && esbuild src/__tests__/confirm.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/confirm.test.js --external:node:test --external:node:assert && node --test dist/__tests__/sanitize.test.js dist/__tests__/auth.test.js dist/__tests__/tools-registry.test.js dist/__tests__/confirm.test.js",
+    "test": "esbuild src/__tests__/sanitize.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/sanitize.test.js --external:node:test --external:node:assert && esbuild src/__tests__/auth.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/auth.test.js --external:node:test --external:node:assert && esbuild src/__tests__/tools-registry.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/tools-registry.test.js --external:node:test --external:node:assert && esbuild src/__tests__/confirm.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/confirm.test.js --external:node:test --external:node:assert && esbuild src/__tests__/state-dir.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/state-dir.test.js --external:node:test --external:node:assert && esbuild src/__tests__/allowlist.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/allowlist.test.js --external:node:test --external:node:assert && esbuild src/__tests__/cli-trust.test.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/__tests__/cli-trust.test.js --external:node:test --external:node:assert && node --test dist/__tests__/sanitize.test.js dist/__tests__/auth.test.js dist/__tests__/tools-registry.test.js dist/__tests__/confirm.test.js dist/__tests__/state-dir.test.js dist/__tests__/allowlist.test.js dist/__tests__/cli-trust.test.js",
     "prepare": "npm run build"
   },
   "dependencies": {
