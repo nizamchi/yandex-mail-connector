@@ -4,6 +4,7 @@ import { registerTools, TOOLS } from './tools.js';
 import { getAuthLevel, detectCapabilities, describeAuthLevel, isInvalidAuthLevel } from './auth.js';
 import * as allowlist from './allowlist.js';
 import * as imap from './imap.js';
+import { auditLog } from './audit.js';
 
 // Resolve auth level ONCE at startup. After this point the value never changes
 // for the life of the process — re-reading env mid-run would be a TOCTOU
@@ -96,9 +97,14 @@ async function main(): Promise<void> {
   // bootstrap_completed_at) we mine the Sent folder ONCE for the initial
   // trust set. Failures here are stderr-logged but NOT fatal — bootstrap
   // can retry on the next start. The verify gate above already ran.
+  // bootstrapState is reported in the Phase 6 server_start audit record.
+  // Possible values: 'n/a_L0' | 'already_bootstrapped' | 'bootstrapped' | 'deferred'.
+  let bootstrapState: string = 'n/a_L0';
   if (authLevel >= 1) {
     const file = allowlist.loadAllowlist();
-    if (file.bootstrap_completed_at === null) {
+    if (file.bootstrap_completed_at !== null) {
+      bootstrapState = 'already_bootstrapped';
+    } else {
       try {
         const limit = Number(process.env.YANDEX_ALLOWLIST_BOOTSTRAP_LIMIT ?? 500);
         const folders = await imap.getSpecialFolders();
@@ -106,12 +112,28 @@ async function main(): Promise<void> {
           return allowlist.bootstrap(c, limit, folders.sent);
         });
         process.stderr.write(`[yandex-mail] allowlist bootstrap: ${added} addresses from Sent.\n`);
+        bootstrapState = 'bootstrapped';
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         process.stderr.write(`[yandex-mail] allowlist bootstrap deferred (will retry on next start): ${msg}\n`);
+        bootstrapState = 'deferred';
       }
     }
   }
+
+  // Phase 6: server_start record — emitted AFTER bootstrap block AND BEFORE
+  // server.connect. Documents the resolved auth level, capability set, and
+  // bootstrap outcome. No secrets in reason — only enum-like state strings.
+  auditLog({
+    action: 'server_start',
+    status: 'success',
+    level: 'info',
+    ts: new Date().toISOString(),
+    reason:
+      'authLevel=' + authLevel +
+      ',capabilities=' + Array.from(capabilities).join(',') +
+      ',bootstrap_state=' + bootstrapState,
+  });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

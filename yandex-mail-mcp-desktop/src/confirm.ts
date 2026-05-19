@@ -18,6 +18,7 @@
 //   expiry/lockout without depending on real wall-clock time.
 
 import * as crypto from 'node:crypto';
+import { auditLog } from './audit.js';
 
 export type VerifyResult = true | 'expired' | 'used' | 'locked' | 'wrong';
 
@@ -84,6 +85,16 @@ function recordFailure(fp: string, now: number): void {
   entry.timestamps = entry.timestamps.filter(t => now - t <= FAIL_WINDOW_MS);
   if (entry.timestamps.length >= FAIL_THRESHOLD) {
     entry.lockoutUntil = now + LOCKOUT_MS;
+    // Audit only the threshold-crossing event (NOT every failure beyond).
+    // reason carries only the 8-hex fingerprint prefix — never the raw code,
+    // never the SECRET buffer, never the full fingerprint hex.
+    auditLog({
+      action: 'lockout',
+      status: 'denied',
+      level: 'warn',
+      ts: new Date().toISOString(),
+      reason: 'fp=' + fp.slice(0, 8) + ',threshold=' + FAIL_THRESHOLD + ',window_ms=' + FAIL_WINDOW_MS,
+    });
   }
 }
 
@@ -102,6 +113,15 @@ export function generateCode(fingerprint: string): { code: string; expiresAt: nu
   const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
   const expiresAt = now + CODE_TTL_MS;
   codes.set(fingerprint, { code, expiresAt, used: false });
+  // Audit AFTER state mutation. The 6-digit code is NEVER logged — only the
+  // 8-hex fingerprint prefix + TTL metadata.
+  auditLog({
+    action: 'code_generated',
+    status: 'success',
+    level: 'info',
+    ts: new Date().toISOString(),
+    reason: 'fp=' + fingerprint.slice(0, 8) + ',ttl_sec=' + Math.round(CODE_TTL_MS / 1000),
+  });
   return { code, expiresAt };
 }
 
@@ -124,18 +144,40 @@ export function verifyCode(fingerprint: string, code: string): VerifyResult {
   const b = Buffer.from(code);
   if (a.length !== b.length) {
     recordFailure(fingerprint, now);
+    auditLog({
+      action: 'verify_failed',
+      status: 'denied',
+      level: 'warn',
+      ts: new Date().toISOString(),
+      reason: 'fp=' + fingerprint.slice(0, 8) + ',mode=length',
+    });
     return 'wrong';
   }
   if (!crypto.timingSafeEqual(a, b)) {
     recordFailure(fingerprint, now);
+    auditLog({
+      action: 'verify_failed',
+      status: 'denied',
+      level: 'warn',
+      ts: new Date().toISOString(),
+      reason: 'fp=' + fingerprint.slice(0, 8) + ',mode=mismatch',
+    });
     return 'wrong';
   }
   // B-3 INVARIANT: critical section below runs synchronously in one event-loop
   // turn. NEVER introduce a yield-point (the four-letter keyword spelled
   // a-w-a-i-t) between the read of entry.used and the write entry.used = true.
   // Task 2 grep-checks this function body for that token.
+  // auditLog is sync (void return; enqueues internally) — safe to call here.
   if (entry.used) return 'used';
   entry.used = true;
+  auditLog({
+    action: 'verify_succeeded',
+    status: 'success',
+    level: 'info',
+    ts: new Date().toISOString(),
+    reason: 'fp=' + fingerprint.slice(0, 8),
+  });
   return true;
 }
 
