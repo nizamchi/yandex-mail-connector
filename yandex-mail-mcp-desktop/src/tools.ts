@@ -669,9 +669,49 @@ Args: folder (откуда), uid (UID письма), target_folder (куда, н
     inputSchema: moveEmailSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     requires: { authLevel: 1 },
-    handler: async (params, _ctx) => {
+    handler: async (params, ctx) => {
       try {
         const { folder, uid, target_folder } = moveEmailSchema.parse(params);
+        // Phase 7: protected-folder gate -- fail-fast BEFORE any IMAP call.
+        // Check BOTH source and destination: source mutation is the obvious
+        // destruction risk (move INBOX -> Trash en masse); destination
+        // mutation can clobber a protected folder via filter side effects
+        // (move spam INTO Inbox). L1/L2 deny; L3 advisory.
+        for (const candidate of [folder, target_folder]) {
+          const gate = checkProtectedFolder(candidate, ctx.protectedFolders);
+          if (!gate.blocked) continue;
+          if (isAdvisory(ctx.authLevel)) {
+            auditLog({
+              action: 'yandex_move_email',
+              status: 'denied',
+              level: 'warn',
+              ts: new Date().toISOString(),
+              reason: 'protected_folder_L3_advisory',
+              folder: gate.matched ?? candidate,
+              uid,
+            });
+            // L3: proceed.
+            continue;
+          }
+          auditLog({
+            action: 'yandex_move_email',
+            status: 'denied',
+            level: 'warn',
+            ts: new Date().toISOString(),
+            reason: 'protected_folder',
+            folder: gate.matched ?? candidate,
+            uid,
+          });
+          return {
+            content: [{
+              type: 'text',
+              text: 'protected_folder: ' + (gate.matched ?? candidate) +
+                ' is in YANDEX_PROTECTED_FOLDERS. To allow, set YANDEX_PROTECTED_FOLDERS to exclude this folder (set to empty string to disable entirely).',
+            }],
+            isError: true,
+            _audit: { folder: gate.matched ?? candidate, uid, message_id: '<blocked-no-message-id>' },
+          };
+        }
         // Hook-2: fetch message_id BEFORE the mutating call.
         const messageId = await imap.getMessageId(folder, uid).catch(() => null);
         await imap.moveEmail(folder, uid, target_folder);
@@ -697,9 +737,47 @@ Args: folder, uid, permanent (bool, default false). permanent=true — безв�
     // the entire delete tool is gated at L1; Phase 4 will split the permanent flag
     // into an explicit confirmation-required pathway.
     requires: { authLevel: 1 },
-    handler: async (params, _ctx) => {
+    handler: async (params, ctx) => {
       try {
         const { folder, uid, permanent } = deleteEmailSchema.parse(params);
+        // Phase 7: protected-folder gate -- fail-fast BEFORE any IMAP call.
+        // delete has no destination; gate only the source folder.
+        {
+          const gate = checkProtectedFolder(folder, ctx.protectedFolders);
+          if (gate.blocked) {
+            if (isAdvisory(ctx.authLevel)) {
+              auditLog({
+                action: 'yandex_delete_email',
+                status: 'denied',
+                level: 'warn',
+                ts: new Date().toISOString(),
+                reason: 'protected_folder_L3_advisory',
+                folder: gate.matched ?? folder,
+                uid,
+              });
+              // L3: proceed.
+            } else {
+              auditLog({
+                action: 'yandex_delete_email',
+                status: 'denied',
+                level: 'warn',
+                ts: new Date().toISOString(),
+                reason: 'protected_folder',
+                folder: gate.matched ?? folder,
+                uid,
+              });
+              return {
+                content: [{
+                  type: 'text',
+                  text: 'protected_folder: ' + (gate.matched ?? folder) +
+                    ' is in YANDEX_PROTECTED_FOLDERS. To allow, set YANDEX_PROTECTED_FOLDERS to exclude this folder (set to empty string to disable entirely).',
+                }],
+                isError: true,
+                _audit: { folder: gate.matched ?? folder, uid, message_id: '<blocked-no-message-id>' },
+              };
+            }
+          }
+        }
         // Hook-2: fetch message_id BEFORE the (potentially permanent) mutation.
         const messageId = await imap.getMessageId(folder, uid).catch(() => null);
         await imap.deleteEmail(folder, uid, permanent);
