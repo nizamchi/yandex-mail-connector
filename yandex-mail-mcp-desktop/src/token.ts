@@ -48,6 +48,32 @@ function validateHost(host: string | undefined, kind: 'imap' | 'smtp'): void {
   }
 }
 
+// T-08-02 (OPS-06): on Unix, refuse token.json that is group/other-readable.
+// process.platform === 'win32': skip entirely — Windows fs mode is unreliable.
+// Otherwise: if mode & 0o077 !== 0 → stderr warning. If
+// YANDEX_STRICT_FILE_PERMS=true AND mode !== 0o600 → process.exit(1).
+function permCheck(tokenPath: string): void {
+  if (process.platform === 'win32') return;
+  let mode: number;
+  try {
+    mode = fs.statSync(tokenPath).mode & 0o777;
+  } catch {
+    return; // accessSync passed already; treat stat failure as non-blocking
+  }
+  if ((mode & 0o077) === 0) return; // 0o600 or tighter
+  const octal = mode.toString(8).padStart(3, '0');
+  process.stderr.write(
+    `[yandex-mail-mcp] token.json at ${tokenPath} has mode ${octal}; ` +
+    `expected 600. Tighten with: chmod 600 ${tokenPath}\n`,
+  );
+  if (process.env.YANDEX_STRICT_FILE_PERMS === 'true' && mode !== 0o600) {
+    process.stderr.write(
+      `[yandex-mail-mcp] YANDEX_STRICT_FILE_PERMS=true; refusing to start.\n`,
+    );
+    process.exit(1);
+  }
+}
+
 function findTokenFile(): string | null {
   // Look next to dist/index.js → project root → cwd
   const candidates = [
@@ -67,6 +93,7 @@ export function loadCredentials(): Credentials {
   // 1. Try token.json
   const tokenFile = findTokenFile();
   if (tokenFile) {
+    permCheck(tokenFile);
     let raw: Record<string, unknown>;
     try {
       raw = JSON.parse(fs.readFileSync(tokenFile, 'utf8'));
