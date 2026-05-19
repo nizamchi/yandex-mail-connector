@@ -30,6 +30,17 @@ Thumbs.db
 *.swp
 *.swo
 
+# Plan-check temporary output
+**/dist/__check__/
+
+# Phase 6 audit log + rotation file (runtime, never committed)
+audit.jsonl.1
+**/audit.jsonl.1
+pending-trust.json
+**/pending-trust.json
+secret.bin
+**/secret.bin
+
 # GSD runtime state
 .planning/STATE.local.md
 .planning/HANDOFF.json

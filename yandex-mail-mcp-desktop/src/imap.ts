@@ -316,6 +316,24 @@ export async function findByMessageId(messageId: string): Promise<{ from: string
   });
 }
 
+// Hook-2 helper (Phase 6): fetch only the message-id of a single message
+// without pulling source/flags/size. Used by tools.ts move/delete/mark
+// handlers BEFORE the mutating IMAP call so audit records carry message_id.
+// Returns null if the message is absent or the envelope has no message-id.
+// Callers MUST treat failure as non-fatal (the mutation is the user's intent;
+// missing message_id only degrades the audit trail to a sentinel value).
+export async function getMessageId(folder: string, uid: number): Promise<string | null> {
+  return getConnectionManager().withClient(async c => {
+    await c.mailboxOpen(folder, { readOnly: true });
+    const it = c.fetch(String(uid), { uid: true, envelope: true }, { uid: true });
+    for await (const msg of it) {
+      const mid = msg.envelope?.messageId;
+      return (typeof mid === 'string' && mid.length > 0) ? mid : null;
+    }
+    return null;
+  });
+}
+
 export async function getSpecialFolders(): Promise<{
   inbox: string; sent: string; drafts: string; trash: string; spam: string;
 }> {

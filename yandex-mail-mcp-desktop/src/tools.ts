@@ -460,7 +460,14 @@ Args: folder (default "INBOX"), uid (integer UID письма).
       try {
         const { folder, uid } = getEmailSchema.parse(params);
         const email = await imap.getEmail(folder, uid);
-        if (!email) return { content: [{ type: 'text', text: `Письмо UID ${uid} не найдено в ${folder}.` }] };
+        if (!email) {
+          // No email → Hook-2 sentinel so the audit layer doesn't fire a
+          // schema-violation on a benign not-found.
+          return {
+            content: [{ type: 'text', text: `Письмо UID ${uid} не найдено в ${folder}.` }],
+            _audit: { folder, uid, message_id: '<not-found-no-message-id>' },
+          };
+        }
         let body = email.textBody ?? email.htmlBody ?? '(пусто)';
         // Phase 5: prepend untrusted-sender marker INSIDE the wrapUntrusted
         // boundary (per ROADMAP SC #9). ASCII per D-EMOJI-MARKER — no glyph.
@@ -486,7 +493,20 @@ Args: folder (default "INBOX"), uid (integer UID письма).
         // SEC-06: text channel получает explicit BEGIN/END markers (LLM).
         // structuredContent — для programmatic клиентов (не подвержены
         // prompt injection); body отдаётся raw без markers сознательно.
-        return { content: [{ type: 'text', text: lines }], structuredContent: email };
+        const _bodyLen = (email.textBody ?? email.htmlBody ?? '').length;
+        const _fromDomain = (email.from[0]?.address ?? '').split('@')[1] ?? '(unknown)';
+        return {
+          content: [{ type: 'text', text: lines }],
+          structuredContent: email,
+          _audit: {
+            folder,
+            uid,
+            message_id: email.messageId && email.messageId.length > 0 ? email.messageId : '<not-found-no-message-id>',
+            subject_hash: subjectHash(email.subject),
+            body_length: _bodyLen,
+            from_domain: _fromDomain,
+          },
+        };
       } catch (e) { return errorResult(e); }
     },
   },
@@ -573,12 +593,19 @@ Args: folder, uid, seen (bool?), flagged (bool?). Хотя бы один из se
           throw new Error('Укажите хотя бы одно из полей: seen или flagged');
         }
         const { folder, uid, seen, flagged } = p;
+        // Hook-2: fetch message_id BEFORE the mutating call. Failure to fetch
+        // MUST NOT block the mutation — the audit field degrades to a sentinel.
+        const messageId = await imap.getMessageId(folder, uid).catch(() => null);
         await imap.markEmail(folder, uid, seen, flagged);
         const changes = [
           seen !== undefined ? (seen ? 'прочитано' : 'непрочитано') : '',
           flagged !== undefined ? (flagged ? 'отмечено ★' : 'снята звёздочка') : '',
         ].filter(Boolean).join(', ');
-        return { content: [{ type: 'text', text: `UID ${uid}: ${changes}.` }], structuredContent: { success: true } };
+        return {
+          content: [{ type: 'text', text: `UID ${uid}: ${changes}.` }],
+          structuredContent: { success: true },
+          _audit: { folder, uid, message_id: messageId ?? '<not-found-no-message-id>' },
+        };
       } catch (e) { return errorResult(e); }
     },
   },
@@ -595,9 +622,15 @@ Args: folder (откуда), uid (UID письма), target_folder (куда, н
     handler: async (params, _ctx) => {
       try {
         const { folder, uid, target_folder } = moveEmailSchema.parse(params);
+        // Hook-2: fetch message_id BEFORE the mutating call.
+        const messageId = await imap.getMessageId(folder, uid).catch(() => null);
         await imap.moveEmail(folder, uid, target_folder);
         const text = `UID ${uid}: перемещено из ${folder} в ${target_folder}.`;
-        return { content: [{ type: 'text', text }], structuredContent: { success: true } };
+        return {
+          content: [{ type: 'text', text }],
+          structuredContent: { success: true },
+          _audit: { folder, uid, message_id: messageId ?? '<not-found-no-message-id>' },
+        };
       } catch (e) { return errorResult(e); }
     },
   },
@@ -617,9 +650,15 @@ Args: folder, uid, permanent (bool, default false). permanent=true — безв�
     handler: async (params, _ctx) => {
       try {
         const { folder, uid, permanent } = deleteEmailSchema.parse(params);
+        // Hook-2: fetch message_id BEFORE the (potentially permanent) mutation.
+        const messageId = await imap.getMessageId(folder, uid).catch(() => null);
         await imap.deleteEmail(folder, uid, permanent);
         const text = permanent ? `UID ${uid} безвозвратно удалено.` : `UID ${uid} перемещено в Корзину.`;
-        return { content: [{ type: 'text', text }], structuredContent: { success: true, permanent } };
+        return {
+          content: [{ type: 'text', text }],
+          structuredContent: { success: true, permanent },
+          _audit: { folder, uid, message_id: messageId ?? '<not-found-no-message-id>' },
+        };
       } catch (e) { return errorResult(e); }
     },
   },
@@ -711,6 +750,12 @@ Args:
                   `Or send with in_reply_to=<message-id> if replying to existing thread.`,
               }],
               isError: true,
+              // Hook-2: blocked send produced no message — explicit sentinel
+              // keeps the audit schema happy while signalling no real ID.
+              _audit: {
+                recipients: untrusted.map(a => a.split('@')[1] ?? a),
+                message_id: '<blocked-no-message-id>',
+              },
             };
           }
         }
@@ -733,14 +778,31 @@ Args:
             content: [{ type: 'text', text: JSON.stringify(plan, null, 2) }],
             structuredContent: plan as unknown as Record<string, unknown>,
             isError: false,
+            _audit: {
+              recipients: p.to.map(a => a.split('@')[1] ?? a),
+              subject_hash: subjectHash(p.subject),
+              body_length: (p.text ?? p.html ?? '').length,
+              message_id: '<dry-run-no-message-id>',
+            },
           };
         }
+
+        // Sentinel _audit for the no-actual-send return paths below
+        // (token-wrong, elicit-cancelled, requires-confirmation). Hook-2
+        // requires message_id on every EMAIL_ACTIONS record; sentinels keep
+        // audit.ts from firing a schema-violation on legitimate gates.
+        const noSendAudit: HandlerAuditExtras = {
+          recipients: p.to.map(a => a.split('@')[1] ?? a),
+          subject_hash: subjectHash(p.subject),
+          body_length: (p.text ?? p.html ?? '').length,
+          message_id: '<blocked-no-message-id>',
+        };
 
         // (2) confirmation_token provided — verify and proceed on match.
         if (token !== undefined) {
           const v = verifyCode(fp, token);
           if (v !== true) {
-            return errorResult(new Error(verifyResultToError(v)));
+            return { ...errorResult(new Error(verifyResultToError(v))), _audit: noSendAudit };
           }
           // fall through to send path
         } else {
@@ -778,10 +840,10 @@ Args:
               // to send under those conditions. Only proceed on `true`.
               const v = verifyCode(fp, code);
               if (v !== true) {
-                return errorResult(new Error(`send blocked: confirmation code ${v} (elicit accepted but code no longer valid)`));
+                return { ...errorResult(new Error(`send blocked: confirmation code ${v} (elicit accepted but code no longer valid)`)), _audit: noSendAudit };
               }
             } else {
-              return errorResult(new Error(`send cancelled (elicit action=${result.action})`));
+              return { ...errorResult(new Error(`send cancelled (elicit action=${result.action})`)), _audit: noSendAudit };
             }
           } else {
             // Path B: no elicitation. Issue code, write stderr block, attempt
@@ -804,6 +866,7 @@ Args:
                 expires_at: expiresAt,
               },
               isError: false,
+              _audit: noSendAudit,
             };
           }
         }
@@ -817,7 +880,16 @@ Args:
         const text = r.success
           ? `Письмо отправлено. Message-ID: ${r.messageId ?? 'n/a'}`
           : `Ошибка отправки: ${r.error}`;
-        return { content: [{ type: 'text', text }], structuredContent: r };
+        return {
+          content: [{ type: 'text', text }],
+          structuredContent: r,
+          _audit: {
+            recipients: p.to.map(a => a.split('@')[1] ?? a),
+            subject_hash: subjectHash(p.subject),
+            body_length: (p.text ?? p.html ?? '').length,
+            message_id: r.messageId && r.messageId.length > 0 ? r.messageId : '<send-failed-no-message-id>',
+          },
+        };
       } catch (e) { return errorResult(e); }
     },
   },
