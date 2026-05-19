@@ -7,31 +7,31 @@ import * as imap from './imap.js';
 import { auditLog } from './audit.js';
 
 // Resolve auth level ONCE at startup. After this point the value never changes
-// for the life of the process — re-reading env mid-run would be a TOCTOU
+// for the life of the process -- re-reading env mid-run would be a TOCTOU
 // vulnerability (the LLM could trick the user into changing env between calls).
 const authLevel = getAuthLevel();
 const capabilities = detectCapabilities(authLevel);
 
-// Startup banner — stderr so we don't corrupt the stdio MCP frame on stdout.
+// Startup banner -- stderr so we don't corrupt the stdio MCP frame on stdout.
 // Only the "implicit L0" case (no env set at all) prints the verbose warning.
 // If the user explicitly set YANDEX_AUTH_LEVEL=readonly that's a deliberate
-// choice — we acknowledge with the standard info line.
+// choice -- we acknowledge with the standard info line.
 if (isInvalidAuthLevel()) {
-  process.stderr.write(`[yandex-mail] WARNING: YANDEX_AUTH_LEVEL="${process.env.YANDEX_AUTH_LEVEL}" is not recognised — falling back to READ-ONLY (L0).\n`);
+  process.stderr.write(`[yandex-mail] WARNING: YANDEX_AUTH_LEVEL="${process.env.YANDEX_AUTH_LEVEL}" is not recognised -- falling back to READ-ONLY (L0).\n`);
   process.stderr.write('[yandex-mail] Valid values: readonly | safe | destructive | auto (or 0..3).\n');
 } else if (authLevel === 0 && process.env.YANDEX_AUTH_LEVEL === undefined) {
-  process.stderr.write('[yandex-mail] AUTH_LEVEL not set — running in READ-ONLY mode (L0).\n');
+  process.stderr.write('[yandex-mail] AUTH_LEVEL not set -- running in READ-ONLY mode (L0).\n');
   process.stderr.write('[yandex-mail] To enable writes: set YANDEX_AUTH_LEVEL=safe | destructive | auto.\n');
   process.stderr.write('[yandex-mail] See: AUTH-DESIGN.md §3 for level semantics.\n');
 } else {
   const visible = TOOLS.filter(t => authLevel >= t.requires.authLevel).length;
-  process.stderr.write(`[yandex-mail] AUTH_LEVEL=${describeAuthLevel(authLevel)} — ${visible} tools registered.\n`);
+  process.stderr.write(`[yandex-mail] AUTH_LEVEL=${describeAuthLevel(authLevel)} -- ${visible} tools registered.\n`);
 }
 
 // ── Phase 5: allowlist signature gate ─────────────────────────────────
 // Runs BEFORE anything else (server.connect, token-load, bootstrap). Fail-closed.
 // On bad signature we print a multi-line stderr recovery block (per plan-check
-// W-1 fix: THREE recovery paths — delete allowlist vs delete secret+allowlist
+// W-1 fix: THREE recovery paths -- delete allowlist vs delete secret+allowlist
 // vs manual resign).
 if (!allowlist.verifySignature()) {
   const allowlistPath = allowlist.getAllowlistPath();
@@ -40,11 +40,11 @@ if (!allowlist.verifySignature()) {
     `[yandex-mail] FATAL: allowlist signature invalid.\n` +
     `[yandex-mail] The file ${allowlistPath} or its signing key ${secretPath} was modified outside of the connector.\n` +
     `[yandex-mail]\n` +
-    `[yandex-mail] Recovery option A (lost trust, fast — ~30s IMAP re-bootstrap):\n` +
+    `[yandex-mail] Recovery option A (lost trust, fast -- ~30s IMAP re-bootstrap):\n` +
     `[yandex-mail]   delete ${allowlistPath} and restart. A fresh bootstrap will re-read last 500 sent\n` +
     `[yandex-mail]   addresses from Yandex Sent folder.\n` +
     `[yandex-mail]\n` +
-    `[yandex-mail] Recovery option B (catastrophic — secret.bin compromised or lost):\n` +
+    `[yandex-mail] Recovery option B (catastrophic -- secret.bin compromised or lost):\n` +
     `[yandex-mail]   delete BOTH ${allowlistPath} AND ${secretPath}, then restart. A new secret is\n` +
     `[yandex-mail]   generated and every previously-trusted address is wiped. Pending-trust tokens\n` +
     `[yandex-mail]   issued under the old secret become permanently invalid.\n` +
@@ -60,7 +60,7 @@ if (!allowlist.verifySignature()) {
 // Plan-check W-3 fix: orphan-sweep pending-trust.json on startup, BEFORE
 // server.connect. If a CLI run wrote a pending token and the user never
 // invoked the matching MCP tool (or restarted in between), prune it once
-// the TTL has lapsed. Quiet — only audits if a sweep happened.
+// the TTL has lapsed. Quiet -- only audits if a sweep happened.
 allowlist.sweepPendingTrust();
 
 const server = new McpServer({ name: 'yandex-mail-mcp', version: '2.0.0' });
@@ -95,7 +95,7 @@ async function main(): Promise<void> {
   // ── Phase 5: first-L1+-start bootstrap ───────────────────────────────
   // If we are at L1+ AND the allowlist has never been bootstrapped (no
   // bootstrap_completed_at) we mine the Sent folder ONCE for the initial
-  // trust set. Failures here are stderr-logged but NOT fatal — bootstrap
+  // trust set. Failures here are stderr-logged but NOT fatal -- bootstrap
   // can retry on the next start. The verify gate above already ran.
   // bootstrapState is reported in the Phase 6 server_start audit record.
   // Possible values: 'n/a_L0' | 'already_bootstrapped' | 'bootstrapped' | 'deferred'.
@@ -121,9 +121,9 @@ async function main(): Promise<void> {
     }
   }
 
-  // Phase 6: server_start record — emitted AFTER bootstrap block AND BEFORE
+  // Phase 6: server_start record -- emitted AFTER bootstrap block AND BEFORE
   // server.connect. Documents the resolved auth level, capability set, and
-  // bootstrap outcome. No secrets in reason — only enum-like state strings.
+  // bootstrap outcome. No secrets in reason -- only enum-like state strings.
   auditLog({
     action: 'server_start',
     status: 'success',
