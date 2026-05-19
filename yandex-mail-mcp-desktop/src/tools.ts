@@ -3,16 +3,24 @@ import { z } from 'zod';
 import { loadCredentials } from './token.js';
 import * as imap from './imap.js';
 import { sendEmail } from './smtp.js';
+import { sanitizeForDisplay, wrapUntrusted } from './sanitize.js';
 
 // ── Formatters ─────────────────────────────────────────────
+
+// Address part из IMAP envelope считаем syntactically valid и НЕ sanitize-уем
+// (это сломает legitimate '+' / '.' / '@'). Display-name — untrusted, sanitize.
+function fmtAddr(a: imap.EmailAddress): string {
+  if (a.name) return `${sanitizeForDisplay(a.name)} <${a.address}>`;
+  return a.address;
+}
 
 function fmtHeaders(emails: imap.EmailHeader[]): string {
   if (!emails.length) return 'Писем не найдено.';
   return emails.map(e => [
-    `UID: ${e.uid}  |  ${e.seen ? '✓прочит.' : '●непрочит.'}${e.flagged ? '  ★' : ''}`,
-    `От: ${e.from.map(a => a.name ? `${a.name} <${a.address}>` : a.address).join(', ')}`,
-    `Тема: ${e.subject}`,
-    `Дата: ${e.date}  |  ${(e.size/1024).toFixed(1)} KB${e.hasAttachments ? '  📎' : ''}`,
+    `UID: ${e.uid}  |  ${e.seen ? '[read]' : '[unread]'}${e.flagged ? '  [*]' : ''}`,
+    `От: ${e.from.map(fmtAddr).join(', ')}`,
+    `Тема: ${sanitizeForDisplay(e.subject)}`,
+    `Дата: ${e.date}  |  ${(e.size/1024).toFixed(1)} KB${e.hasAttachments ? '  [attach]' : ''}`,
   ].join('\n')).join('\n\n──\n\n');
 }
 
@@ -103,19 +111,25 @@ Args: folder (default "INBOX"), uid (integer UID письма).
     try {
       const email = await imap.getEmail(creds(), folder, uid);
       if (!email) return { content: [{ type: 'text', text: `Письмо UID ${uid} не найдено в ${folder}.` }] };
+      const body = email.textBody ?? email.htmlBody ?? '(пусто)';
+      const attachLine = email.attachments.length
+        ? `Вложения: ${email.attachments.map(a => `${sanitizeForDisplay(a.filename)} (${(a.size/1024).toFixed(1)} KB)`).join(', ')}`
+        : '';
       const lines = [
-        `От: ${email.from.map(a => a.name ? `${a.name} <${a.address}>` : a.address).join(', ')}`,
-        `Кому: ${email.to.map(a => a.address).join(', ')}`,
-        email.cc.length ? `CC: ${email.cc.map(a => a.address).join(', ')}` : '',
-        `Тема: ${email.subject}`,
+        `От: ${email.from.map(fmtAddr).join(', ')}`,
+        `Кому: ${email.to.map(fmtAddr).join(', ')}`,
+        email.cc.length ? `CC: ${email.cc.map(fmtAddr).join(', ')}` : '',
+        `Тема: ${sanitizeForDisplay(email.subject)}`,
         `Дата: ${email.date}`,
-        `Статус: ${email.seen ? 'Прочитано' : 'Непрочитано'}${email.flagged ? '  ★' : ''}`,
-        email.attachments.length ? `Вложения: ${email.attachments.map(a => `${a.filename} (${(a.size/1024).toFixed(1)} KB)`).join(', ')}` : '',
-        email.truncated ? '\n⚠ Тело обрезано до 8000 символов.' : '',
+        `Статус: ${email.seen ? 'Прочитано' : 'Непрочитано'}${email.flagged ? '  [*]' : ''}`,
+        attachLine,
+        email.truncated ? '\n[Body truncated at 8000 chars]' : '',
         '',
-        '─── Тело ───',
-        email.textBody ?? email.htmlBody ?? '(пусто)',
+        wrapUntrusted(body),
       ].filter(Boolean).join('\n');
+      // SEC-06: text channel получает explicit BEGIN/END markers (LLM).
+      // structuredContent — для programmatic клиентов (не подвержены
+      // prompt injection); body отдаётся raw без markers сознательно.
       return { content: [{ type: 'text', text: lines }], structuredContent: email };
     } catch (e) {
       return {
