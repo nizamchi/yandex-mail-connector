@@ -1,4 +1,4 @@
-// audit.ts — append-only JSON Lines forensics log (Phase 6, OPS-01 + Hook-2).
+// audit.ts -- append-only JSON Lines forensics log (Phase 6, OPS-01 + Hook-2).
 //
 // Hook-2 enforcement contract:
 //   For any action in EMAIL_ACTIONS (yandex_get_email, yandex_send_email,
@@ -6,7 +6,7 @@
 //   carry a non-empty message_id. If a caller forgets to pass one, this module
 //   writes a stderr 'schema-violation' line AND still appends the record with
 //   level forced to 'warn' and 'hook2_missing_message_id' added to redacted[].
-//   We NEVER throw out of auditLog — a forensics-log failure must never crash
+//   We NEVER throw out of auditLog -- a forensics-log failure must never crash
 //   the handler that emitted it.
 //
 // D-RECIP-DOMAINS: the recipients[] field carries DOMAINS, NOT full addresses
@@ -18,7 +18,7 @@
 //   a stable join key across forensics + dedup.
 //
 // FORBIDDEN_KEYS (defence-in-depth redaction):
-//   Zod schema is .strict() — unknown keys are dropped at parse time. On top
+//   Zod schema is .strict() -- unknown keys are dropped at parse time. On top
 //   of that we strip a hard-coded list of forbidden key names (case-insensitive)
 //   BEFORE parse, and record the stripped names in redacted[]. This gives a
 //   greppable guarantee in the codebase: a single FORBIDDEN_KEYS array names
@@ -35,7 +35,7 @@
 //   All appendFile calls chain through writeChain (single Promise). This means:
 //   - records appear in the file in the same order auditLog() was called
 //   - no record is lost under concurrent tool invocations
-//   - errors are caught and reported to stderr — writeChain never rejects
+//   - errors are caught and reported to stderr -- writeChain never rejects
 //   - the chain is non-blocking: auditLog returns synchronously after enqueue
 //
 // No `any`. ESM `.js` import suffix.
@@ -47,7 +47,7 @@ import { z } from 'zod';
 
 import { getStateDir } from './state-dir.js';
 
-// ── Constants ──────────────────────────────────────────────
+// -- Constants ----------------------------------------------
 
 // The five tool names that constitute an "email action" per Hook 2. Anything
 // outside this set MUST NOT carry message_id (non-email tools like list_folders
@@ -63,7 +63,7 @@ export const EMAIL_ACTIONS: ReadonlySet<string> = new Set<string>([
 const MB = 1024 * 1024;
 const DEFAULT_MAX_MB = 10;
 
-// Forbidden top-level keys — stripped at input layer (defence-in-depth).
+// Forbidden top-level keys -- stripped at input layer (defence-in-depth).
 // Order is irrelevant; matching is case-insensitive on the key name.
 const FORBIDDEN_KEYS: readonly string[] = [
   'body',
@@ -82,7 +82,7 @@ const FORBIDDEN_KEYS: readonly string[] = [
   'raw_subject',
 ];
 
-// ── Zod schema ─────────────────────────────────────────────
+// -- Zod schema ---------------------------------------------
 
 export const AuditRecord = z.object({
   ts: z.string().datetime(),
@@ -102,7 +102,7 @@ export const AuditRecord = z.object({
 
 export type AuditRecord = z.infer<typeof AuditRecord>;
 
-// ── Path + size resolution (read env at call time, not at module load) ─────
+// -- Path + size resolution (read env at call time, not at module load) -----
 
 function logPath(): string | null {
   const v = process.env.YANDEX_AUDIT_LOG;
@@ -120,7 +120,7 @@ function maxBytes(): number {
   return n * MB;
 }
 
-// ── Rotation (single-prior-file, checked once per process per target path) ──
+// -- Rotation (single-prior-file, checked once per process per target path) --
 
 let rotationChecked: string | null = null;
 
@@ -142,7 +142,7 @@ function maybeRotate(target: string): void {
   rotationChecked = target;
 }
 
-// ── Async write queue ─────────────────────────────────────
+// -- Async write queue -------------------------------------
 
 let writeChain: Promise<void> = Promise.resolve();
 
@@ -158,7 +158,7 @@ function enqueue(line: string, target: string): Promise<void> {
   return writeChain;
 }
 
-// ── Redaction ─────────────────────────────────────────────
+// -- Redaction ---------------------------------------------
 
 interface StripResult {
   clean: Record<string, unknown>;
@@ -179,7 +179,7 @@ function stripForbidden(obj: Record<string, unknown>): StripResult {
   return { clean, redacted };
 }
 
-// ── Public API ────────────────────────────────────────────
+// -- Public API --------------------------------------------
 
 export function auditLog(input: unknown): void {
   const target = logPath();
@@ -208,7 +208,7 @@ export function auditLog(input: unknown): void {
     return;
   }
 
-  // Hook 2 enforcement — applied AFTER successful schema parse.
+  // Hook 2 enforcement -- applied AFTER successful schema parse.
   const record: AuditRecord = { ...parsed.data };
   if (EMAIL_ACTIONS.has(record.action)) {
     if (record.message_id === undefined || record.message_id.length === 0) {
@@ -248,7 +248,7 @@ export function auditLogAction(
   auditLog({ action, status, level, ts, ...filtered });
 }
 
-// ── Test seams (NOT for production callers) ───────────────
+// -- Test seams (NOT for production callers) ---------------
 
 export async function _drainForTests(): Promise<void> {
   await writeChain;
@@ -259,7 +259,7 @@ export function _resetForTests(): void {
   rotationChecked = null;
 }
 
-// subject_hash helper — sha256 of subject, first 16 hex (non-reversible).
+// subject_hash helper -- sha256 of subject, first 16 hex (non-reversible).
 // Header comment: this is a non-reversible fingerprint, NOT a cipher. It lets
 // forensics correlate "same subject across N records" without ever logging
 // the subject itself.
