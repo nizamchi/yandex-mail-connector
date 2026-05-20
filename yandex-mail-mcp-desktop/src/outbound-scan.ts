@@ -203,8 +203,10 @@ export function scanOutbound(input: { body: string; subject?: string }): ScanRes
   // L3: body cap guard.
   const bodyBytes = Buffer.byteLength(body, 'utf8');
   if (bodyBytes > BODY_CAP_BYTES) {
+    // body_length is the AuditRecord schema field for non-negative integers
+    // describing body size; reusing it keeps audit.ts strict-zod compatible.
     auditLogAction('outbound_scan_oversize', 'attempt', {
-      body_byte_length: bodyBytes,
+      body_length: bodyBytes,
     });
     return { hits: [], totalScore: 0, summary: 'body too large' };
   }
