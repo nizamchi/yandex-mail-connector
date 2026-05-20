@@ -98,6 +98,16 @@ export const AuditRecord = z.object({
   subject_hash: z.string().length(16).optional(),
   body_length: z.number().int().nonnegative().optional(),
   redacted: z.array(z.string()).optional(),
+  // Phase 2 outbound-scan REDACTED-MATCH payload (D15 / L2 of 02-01-PLAN.md).
+  // Content-free by construction: category name + byte range + hash of the
+  // first-4-chars (NEVER the raw 4 chars; that stays behind YANDEX_SCAN_DEBUG=1
+  // on stderr only). These fields ONLY accompany action='outbound_scan_match'
+  // and action='outbound_scan_oversize' (oversize uses none of them).
+  category: z.string().optional(),
+  subCategory: z.string().optional(),
+  byteStart: z.number().int().nonnegative().optional(),
+  byteEnd: z.number().int().nonnegative().optional(),
+  prefix4_hash: z.string().regex(/^[0-9a-f]{8}$/).optional(),
 }).strict();
 
 export type AuditRecord = z.infer<typeof AuditRecord>;
