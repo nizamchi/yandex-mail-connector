@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { registerTools, TOOLS } from './tools.js';
 import { getAuthLevel, detectCapabilities, describeAuthLevel, isInvalidAuthLevel } from './auth.js';
 import * as allowlist from './allowlist.js';
+import * as policy from './policy.js';
 import * as imap from './imap.js';
 import { auditLog } from './audit.js';
 import { resolveProtectedFolders } from './guards.js';
@@ -57,6 +58,18 @@ if (!allowlist.verifySignature()) {
   );
   process.exit(1);
 }
+
+// ── Phase 1: policy loader + FATAL gate ─────────────────────────────────
+// Runs AFTER allowlist.verifySignature() (which gates the allowlist HMAC
+// chain and may bootstrap secret.bin if it had to call loadSecret) and
+// BEFORE allowlist.sweepPendingTrust(). Order rationale: allowlist verify
+// gates integrity FIRST so a tampered allowlist crashes the process before
+// policy starts touching its file. Both modules share secret.bin via D1
+// domain prefix; whichever calls loadSecret first bootstraps it. On policy
+// load failure, policy.loadPolicy() invokes recoverFatal() which prints the
+// 3-step recovery banner and calls process.exit(1). No try/catch here --
+// FATAL is meant to crash.
+policy.loadPolicy();
 
 // Plan-check W-3 fix: orphan-sweep pending-trust.json on startup, BEFORE
 // server.connect. If a CLI run wrote a pending token and the user never
