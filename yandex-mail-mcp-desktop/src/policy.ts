@@ -218,10 +218,26 @@ function freezePolicy(p: RiskPolicy): RiskPolicy {
 // ── Public API ────────────────────────────────────────────────
 
 export function loadPolicy(): RiskPolicy {
+  const explicit = process.env.YANDEX_POLICY_FILE;
+  const usingExplicit = explicit !== undefined && explicit.length > 0;
   const filePath = getPolicyPath();
+
   if (!fs.existsSync(filePath)) {
-    // First-launch behavior added in T-05; for now return defaults without
-    // writing.
+    if (usingExplicit) {
+      // Mirror token.ts M-2: an explicit override at a non-existent path is
+      // almost always a typo. Auto-creating there could write 0o600 to an
+      // unexpected location. Throw with a clear, actionable error.
+      throw new Error(
+        `YANDEX_POLICY_FILE=${explicit} (resolved: ${filePath}) is not readable. ` +
+        `Unset YANDEX_POLICY_FILE to fall back to <state-dir>/risk-policy.json (auto-created with defaults), ` +
+        `or create the file with valid policy + HMAC signature.`
+      );
+    }
+    // First-launch (D5): write defaults + sign + stderr log.
+    writePolicy(DEFAULT_POLICY);
+    process.stderr.write(
+      '[yandex-mail-mcp] risk-policy.json created at ' + filePath + ' with defaults\n'
+    );
     cachedPolicy = freezePolicy(DEFAULT_POLICY);
     loaded = true;
     return cachedPolicy;
