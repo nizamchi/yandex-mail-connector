@@ -320,10 +320,22 @@ export function is2FASender(fromAddr: string | null | undefined): boolean {
       if (addr === pattern) return true;
       continue;
     }
-    // Bare domain (e.g. 'github.com') -- match any address at that domain.
+    // Bare domain (e.g. 'github.com') -- match any address at that domain or
+    // its subdomains. L-4 fix: 'noreply@security.yandex.ru' must match the
+    // 'yandex.ru' pattern (it didn't before because endsWith('@yandex.ru')
+    // checks an exact domain anchor and excludes subdomains).
+    //
+    // Lookalike safety: 'user@evilyandex.ru' does NOT match 'yandex.ru' because
+    // the host 'evilyandex.ru' is not equal to 'yandex.ru' and does not end
+    // with '.yandex.ru' (no leading dot). Subdomain match requires the dot
+    // boundary explicitly.
+    //
     // Wildcard patterns ('security@*', '*@domain') are deferred to Layer 2+.
     const domain = pattern.startsWith('@') ? pattern.slice(1) : pattern;
-    if (addr.endsWith('@' + domain)) return true;
+    const atIdx = addr.lastIndexOf('@');
+    if (atIdx < 0) continue;
+    const host = addr.slice(atIdx + 1);
+    if (host === domain || host.endsWith('.' + domain)) return true;
   }
   return false;
 }

@@ -205,16 +205,29 @@ test('isAdvisory returns true only for L3 (auto)', () => {
 
 // ── Case 8 ─────────────────────────────────────────────────────────────
 
-test('is2FASender bare-domain endsWith + exact-address + case-insensitive', () => {
+test('is2FASender bare-domain endsWith + exact-address + case-insensitive + L-4 subdomain', () => {
   const cleanup = setup();
   try {
-    // Defaults include 'github.com'.
+    // Defaults include 'github.com', 'yandex.ru'.
     assert.equal(is2FASender('noreply@github.com'), true);
     assert.equal(is2FASender('USER@GITHUB.COM'), true, 'case-insensitive');
-    assert.equal(is2FASender('user@notgithub.com'), false, 'endsWith @github.com must fail');
+    assert.equal(is2FASender('user@notgithub.com'), false, 'lookalike root must not match');
     assert.equal(is2FASender(null), false);
     assert.equal(is2FASender(''), false);
     assert.equal(is2FASender(undefined), false);
+
+    // L-4: subdomain match (deep review HIGH-adjacent). Before the fix this
+    // returned false because addr.endsWith('@yandex.ru') anchored on @ which
+    // excluded subdomains. After: 'noreply@security.yandex.ru' MUST match the
+    // 'yandex.ru' default pattern because the host suffix '.yandex.ru' is a
+    // subdomain of the blocked domain.
+    assert.equal(is2FASender('noreply@security.yandex.ru'), true, 'L-4: subdomain of yandex.ru');
+    assert.equal(is2FASender('alert@notify.security.yandex.ru'), true, 'L-4: deep subdomain');
+    assert.equal(is2FASender('user@security.github.com'), true, 'L-4: subdomain of github.com');
+    // L-4 lookalike-safety: subdomain match must NOT accept lookalike domains
+    // that lack the dot boundary.
+    assert.equal(is2FASender('user@evilyandex.ru'), false, 'L-4: lookalike root must not match');
+    assert.equal(is2FASender('user@yandex.ru.evil.com'), false, 'L-4: suffix-spoofing must not match');
 
     // Exact-address override.
     process.env.YANDEX_BLOCK_2FA_SENDERS = 'security@example.org';
