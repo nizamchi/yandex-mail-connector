@@ -189,6 +189,41 @@ test('T-PRE-01-005: zero-width chars stripped; CORE D8 byte-offset test', () => 
   assert.equal(r.normalizedToOriginalByte[2], 8);
 });
 
+// T-PRE-01-007 addresses W-03 from 02-01-REVIEW.md: T-PRE-01-005 and
+// T-PRE-01-006 only probe the preprocess() fast path (ZWSP and Unicode-tag
+// chars do NOT trigger NFKC compatibility decomposition, so `nfkc === input`
+// holds for those inputs). The slow-path branch in preprocess.ts (the
+// `else` arm at the lock-step NFKC walk) had ZERO byte-offset-correctness
+// assertions before this test. Detectors in 02-02 rely on the
+// `normalizedToOriginalByte` map staying correct through the slow path;
+// without this test, a future refactor of the slow-path walk could silently
+// misalign `ScanHit.evidence.byteStart/byteEnd`.
+//
+// Fixture: fullwidth Latin 'Ａ' (U+FF21, 3 UTF-8 bytes) + ASCII 'B' (1 byte)
+// + fullwidth digit '１' (U+FF11, 3 UTF-8 bytes) = 7 UTF-8 bytes. NFKC
+// compat-decomposes the fullwidth forms to 'A' / '1', then case-fold maps
+// to 'ab1'. The byte-offset table should point each normalized code unit
+// back to its ORIGINAL UTF-8 byte offset: a->0, b->3, 1->4.
+test('T-PRE-01-007: slow path preserves byte offsets across NFKC compatibility decomposition (W-03)', () => {
+  // Sanity: this fixture MUST exercise the slow path, not the fast path.
+  // input.normalize('NFKC') !== input <=> slow path fires.
+  const input = 'Ａ' + 'B' + '１';
+  assert.notEqual(input.normalize('NFKC'), input, 'fixture must force slow path');
+  assert.equal(Buffer.byteLength(input, 'utf8'), 7, 'fixture must be 7 UTF-8 bytes');
+
+  const r = preprocess(input);
+
+  // NFKC compat-decomp collapses fullwidth Latin/digits to ASCII; the case-
+  // fold pass (toLocaleLowerCase('ru-RU')) then lowers 'A' -> 'a' and 'B' ->
+  // 'b'. '1' is unaffected by case-fold.
+  assert.equal(r.normalized, 'ab1');
+  assert.equal(r.normalizedToOriginalByte.length, 3);
+  assert.equal(r.normalizedToOriginalByte[0], 0, "'a' (from 'Ａ') -> byte 0");
+  assert.equal(r.normalizedToOriginalByte[1], 3, "'b' (from 'B') -> byte 3 (after 3-byte 'Ａ')");
+  assert.equal(r.normalizedToOriginalByte[2], 4, "'1' (from '１') -> byte 4 (after 1-byte 'B')");
+  assert.equal(r.originalByteLength, 7);
+});
+
 test('T-PRE-01-006: Unicode tag chars stripped; Cyrillic preserved', () => {
   // 'тест' + U+E0041 (Unicode tag) + 'тест'. Each Cyrillic char is 2 UTF-8
   // bytes; the Unicode tag at U+E0041 is a supplementary plane codepoint
