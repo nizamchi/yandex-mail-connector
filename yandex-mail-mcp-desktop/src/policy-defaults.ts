@@ -39,6 +39,14 @@ export interface RiskPolicy {
 
     // Velocity signals (from Phase 7 guards)
     burst_pattern: number;
+
+    // Phase 2 plan-02 (cat 2.4 credentials_fuzzy keyword pass)
+    // outbound_keyword: per-keyword weight (low because cat 2.4 hits are
+    // ALWAYS companion-gated -- never fire standalone).
+    // outbound_keyword_cap: maximum aggregate weight contribution from cat 2.4
+    // across an entire scan (prevents keyword-spam inflation).
+    outbound_keyword: number;
+    outbound_keyword_cap: number;
   };
   thresholds: {
     augment: number;
@@ -91,6 +99,9 @@ export const DEFAULT_POLICY: RiskPolicy = {
     large_body: 15,
 
     burst_pattern: 25,
+
+    outbound_keyword: 10,
+    outbound_keyword_cap: 40,
   },
   thresholds: {
     augment: 30,

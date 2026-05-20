@@ -60,6 +60,8 @@ const weightsSchema = z.object({
   multi_recipient: z.number().int().nonnegative(),
   large_body: z.number().int().nonnegative(),
   burst_pattern: z.number().int().nonnegative(),
+  outbound_keyword: z.number().int().nonnegative(),
+  outbound_keyword_cap: z.number().int().nonnegative(),
 }).strict();
 
 const thresholdsSchema = z.object({
