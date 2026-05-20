@@ -200,6 +200,21 @@ function recoverFatal(reason: string): never {
   throw new Error('FATAL: ' + reason);
 }
 
+// ── Deep-freeze helper ────────────────────────────────────────
+// Returned policy is frozen at top level + key sub-objects to prevent
+// Phase 2+ consumers from mutating shared state.
+
+function freezePolicy(p: RiskPolicy): RiskPolicy {
+  return Object.freeze({
+    ...p,
+    weights: Object.freeze({ ...p.weights }),
+    thresholds: Object.freeze({ ...p.thresholds }),
+    categories: Object.freeze({ ...p.categories }),
+    outbound_keywords: Object.freeze([...p.outbound_keywords]),
+    blocked_domains: Object.freeze([...p.blocked_domains]),
+  }) as RiskPolicy;
+}
+
 // ── Public API ────────────────────────────────────────────────
 
 export function loadPolicy(): RiskPolicy {
@@ -207,7 +222,7 @@ export function loadPolicy(): RiskPolicy {
   if (!fs.existsSync(filePath)) {
     // First-launch behavior added in T-05; for now return defaults without
     // writing.
-    cachedPolicy = DEFAULT_POLICY;
+    cachedPolicy = freezePolicy(DEFAULT_POLICY);
     loaded = true;
     return cachedPolicy;
   }
@@ -273,8 +288,29 @@ export function loadPolicy(): RiskPolicy {
     recoverFatal('signature invalid');
   }
 
-  // Anti-tamper (T-04) and first-launch (T-05) added next.
-  cachedPolicy = policy;
+  // Anti-tamper (D3): a forged file would already be rejected by HMAC above;
+  // this branch handles the case where an attacker WITH the secret (or the
+  // user themselves under prompt-injection coercion) lowered the block
+  // threshold and re-signed. Only thresholds.block is protected -- lowering
+  // augment/strict is intentionally allowed (D3).
+  if (
+    policy.thresholds.block < DEFAULT_POLICY.thresholds.block &&
+    policy.override_block_threshold !== true
+  ) {
+    process.stderr.write(
+      `[yandex-mail-mcp] policy rejected: block threshold lowered to ` +
+      `${policy.thresholds.block} (default ${DEFAULT_POLICY.thresholds.block}) ` +
+      `without override_block_threshold:true. Falling back to defaults. ` +
+      `To accept lowered block threshold, set override_block_threshold:true in the file ` +
+      `and re-sign by running 'yandex-mail-mcp-trust --policy reset' (Phase 7) or by ` +
+      `deleting risk-policy.json to regenerate defaults.\n`
+    );
+    cachedPolicy = freezePolicy(DEFAULT_POLICY);
+    loaded = true;
+    return cachedPolicy;
+  }
+
+  cachedPolicy = freezePolicy(policy);
   loaded = true;
   return cachedPolicy;
 }
