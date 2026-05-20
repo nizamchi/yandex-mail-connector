@@ -194,10 +194,39 @@ function writePolicy(policy: RiskPolicy): void {
   atomicWrite(getPolicyPath(), JSON.stringify(file, null, 2), 0o600);
 }
 
-// ── FATAL recovery (stub; T-06 replaces with hook-based banner) ──
+// ── FATAL recovery with test-substitutable hook seam (B-2) ─────
+// Production wiring uses process.stderr.write + process.exit(1).
+// Tests substitute via _setFatalHooksForTests so the in-process node:test
+// runner is not killed when the FATAL path is exercised. Convention mirror:
+// same underscore-prefix pattern as _resetForTests.
+//
+// Production code MUST NOT call _setFatalHooksForTests. The underscore
+// prefix is the convention signal; the grep gate in package.json scripts
+// (T-10) enforces no production caller exists outside __tests__/.
+
+let _fatalExit: (code: number) => never = (code) => process.exit(code);
+let _fatalStderr: (msg: string) => void = (msg) => { process.stderr.write(msg); };
+
+export function _setFatalHooksForTests(opts: {
+  exit?: (code: number) => never;
+  stderr?: (msg: string) => void;
+}): () => void {
+  const prev = { exit: _fatalExit, stderr: _fatalStderr };
+  if (opts.exit) _fatalExit = opts.exit;
+  if (opts.stderr) _fatalStderr = opts.stderr;
+  return () => { _fatalExit = prev.exit; _fatalStderr = prev.stderr; };
+}
 
 function recoverFatal(reason: string): never {
-  throw new Error('FATAL: ' + reason);
+  const p = getPolicyPath();
+  _fatalStderr(
+    `\nFATAL: risk-policy.json ${reason}.\n` +
+    `  Recovery options:\n` +
+    `    1. Delete ${p} -- regenerates from defaults on next start.\n` +
+    `    2. Restore from backup if you have one.\n` +
+    `    3. Run yandex-mail-mcp-trust --policy reset to rewrite from defaults (Phase 7).\n\n`
+  );
+  return _fatalExit(1);
 }
 
 // ── Deep-freeze helper ────────────────────────────────────────
