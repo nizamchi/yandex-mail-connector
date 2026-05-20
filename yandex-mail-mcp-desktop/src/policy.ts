@@ -102,6 +102,14 @@ let loaded: boolean = false;
 let secretCache: Buffer | null = null;
 
 // ── Path resolution ───────────────────────────────────────────
+// SINGLE source of truth for the policy file path. All file I/O in this
+// module (read in loadPolicy, write in writePolicy) routes through here.
+// No env-var caching -- every call re-reads process.env.YANDEX_POLICY_FILE
+// so tests can flip the env between cases.
+//
+// Behavior matrix (D4):
+//   YANDEX_POLICY_FILE unset    -> <state-dir>/risk-policy.json (auto-create on missing).
+//   YANDEX_POLICY_FILE=<path>   -> path.resolve(<path>) (throw on missing -- mirrors token.ts M-2).
 
 export function getPolicyPath(): string {
   const explicit = process.env.YANDEX_POLICY_FILE;
