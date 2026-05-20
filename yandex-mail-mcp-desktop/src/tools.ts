@@ -906,16 +906,32 @@ Args:
             ...bccNorm.addresses,
           ];
 
-          // in_reply_to auto-trust: the SENDER of the looked-up message
-          // (envelope.from) is the one auto-trusted -- NOT the new recipients
-          // (T-05-06). This means in_reply_to does NOT bypass the recipient
-          // gate; it only seeds trust for future replies in the same thread.
+          // H-1: in_reply_to auto-trust delegated to allowlist.autoTrustOnReply.
+          // Policy (per MILESTONE-v2.0.0-DEEP-REVIEW.md §H-1):
+          //   - Fires ONLY when findByMessageId resolves the message in the Sent
+          //     folder (prior-correspondence evidence). INBOX-source resolutions
+          //     are attacker-controllable metadata and emit allowlist_skip instead.
+          //   - Elevation is scope='session' -- in-memory only, NOT persisted to
+          //     allowlist.json. Blast radius: one process lifetime.
+          //   - YANDEX_AUTO_TRUST_REPLY=off disables the flow entirely.
+          // Doc-comment contract restored: in_reply_to does NOT bypass the recipient
+          // gate; the elevated entry passes the gate on the same call only when
+          // the user already had Sent-folder evidence of correspondence.
           if (p.in_reply_to) {
             try {
               const found = await imap.findByMessageId(p.in_reply_to);
-              if (found && found.from) {
-                allowlist.addTrusted(found.from, 'auto', 'auto_trust_reply');
-              }
+              allowlist.autoTrustOnReply(found, {
+                onSkip: (reason) => {
+                  auditLog({
+                    action: 'allowlist_skip',
+                    status: 'denied',
+                    level: 'warn',
+                    ts: new Date().toISOString(),
+                    from_domain: found && found.from ? (found.from.split('@')[1] ?? '(none)') : '(none)',
+                    reason: 'auto_trust_reply,' + reason,
+                  });
+                },
+              });
             } catch {
               // Best-effort -- failure to look up the original message must
               // not crash the send; recipient gate below is the real check.

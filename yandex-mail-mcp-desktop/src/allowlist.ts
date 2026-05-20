@@ -10,10 +10,16 @@
 // folder, pulls the last 500 unique recipient addresses (to + cc), and treats
 // those as the initial trust set ("you've emailed them before — they're real").
 // Subsequent additions happen ONLY via:
-//   - addTrusted() called from the in_reply_to auto-trust flow in tools.ts
-//     (scope='auto', source='auto_trust_reply'), or
+//   - autoTrustOnReply() called from the in_reply_to auto-trust flow in
+//     tools.ts. Per H-1 fix this runs ONLY when imap.findByMessageId resolved
+//     the message-id in the Sent folder (prior-correspondence evidence), and
+//     the entry is added with scope='session' -- in-memory only, NOT
+//     persisted to allowlist.json. The blast radius of any unforeseen
+//     escalation is one process lifetime.
 //   - addTrusted() called from the yandex_trust_address MCP tool after the
-//     CLI hands over a single-use trust_token via pending-trust.json.
+//     CLI hands over a single-use trust_token via pending-trust.json
+//     (scope='permanent', persisted + signed).
+//   - bootstrap() (scope='permanent', source='sent_history').
 //
 // Phase 6 (06-01) replaced auditEmit() with audit.ts:auditLog().
 //
@@ -72,6 +78,20 @@ export function getPendingTrustPath(): string { return pendingTrustPath(); }
 
 // In-process cache of the resolved secret. Cleared by _resetForTests().
 let secretCache: Buffer | null = null;
+
+// ── H-1: In-memory session-scope store ─────────────────────
+// scope='session' entries live ONLY here -- never written to allowlist.json,
+// never HMAC-signed. isAllowed() consults this set alongside the persisted
+// file. Cleared by _resetForTests() (which restores deterministic state for
+// tests and would also wipe the set on a process restart).
+//
+// Map keeps the metadata (source + added_at) so _listTrusted() can surface
+// session grants to the user with a clear ephemerality marker (H-1 §Q1).
+interface SessionEntry {
+  source: AllowlistSource;
+  added_at: string;
+}
+const sessionEntries: Map<string, SessionEntry> = new Map();
 
 function loadSecret(): Buffer {
   if (secretCache !== null) return secretCache;
@@ -225,13 +245,60 @@ export function resign(newSecret?: Buffer): void {
 export function isAllowed(address: string): boolean {
   const target = norm(address);
   if (!target) return false;
+  // H-1: session-scope entries are consulted alongside the persisted file.
+  // Either source grants trust; neither alone is sufficient to escalate
+  // (the file is HMAC-gated; the session set is process-local).
+  if (sessionEntries.has(target)) return true;
   const file = loadAllowlist();
   return file.entries.some(e => e.address === target);
 }
 
+// addTrusted(address, scope, source):
+//
+//   scope='session' (H-1) -> in-memory only. No file I/O, no HMAC mutation.
+//     Survives only until the process exits or _resetForTests() runs. Used
+//     by the auto_trust_reply flow when a Sent-folder lookup demonstrates
+//     prior correspondence with the sender.
+//
+//   scope='permanent' or scope='auto' -> persisted to allowlist.json with a
+//     fresh HMAC signature. Survives process restart. Used by the explicit
+//     user-trust CLI flow (permanent) and the legacy bootstrap path.
+//
+// Dedupe is case-insensitive and cross-scope: if an address is already in
+// either the persisted file or the session set, the call is a no-op. We do
+// NOT "upgrade" a session entry to permanent here -- that would require the
+// caller to pass a distinct scope, and the dedupe-then-skip behavior keeps
+// the function's contract simple.
 export function addTrusted(address: string, scope: AllowlistScope, source: AllowlistSource): void {
   const target = norm(address);
   if (!target) return;
+
+  // H-1: session scope is process-local; never touch disk.
+  if (scope === 'session') {
+    if (sessionEntries.has(target)) return;
+    // Dedupe against the persisted file too -- no value in tracking a
+    // session entry for an already-permanent address.
+    const persisted = loadAllowlist();
+    if (persisted.signature !== 'corrupt' && persisted.entries.some(e => e.address === target)) return;
+    sessionEntries.set(target, {
+      source,
+      added_at: new Date().toISOString(),
+    });
+    auditLog({
+      action: 'allowlist_add',
+      status: 'success',
+      level: 'info',
+      ts: new Date().toISOString(),
+      from_domain: target.split('@')[1] ?? '(none)',
+      reason: 'scope=session,source=' + source,
+    });
+    return;
+  }
+
+  // Persisted scopes ('permanent', 'auto') -- legacy path. Note: the H-1
+  // fix routes auto_trust_reply through scope='session' so 'auto' should
+  // no longer reach this branch in normal flow. We keep the type union
+  // open in case a future caller has a legitimate persisted-auto need.
   const file = loadAllowlist();
   if (file.signature === 'corrupt') {
     throw new Error('addTrusted: allowlist file is corrupt — refusing to mutate.');
@@ -255,6 +322,90 @@ export function addTrusted(address: string, scope: AllowlistScope, source: Allow
     from_domain: target.split('@')[1] ?? '(none)',
     reason: 'scope=' + scope + ',source=' + source,
   });
+}
+
+// autoTrustOnReply (H-1): policy helper for the yandex_send_email auto-trust
+// block. Consolidates three guards in one place so tools.ts holds no policy:
+//   1. Env opt-out:  YANDEX_AUTO_TRUST_REPLY=off -> hard no-op.
+//   2. Sent-only:    only Sent-folder findByMessageId results elevate trust.
+//                    INBOX hits emit allowlist_skip (forensics) and onSkip().
+//   3. Session-only: elevation goes through addTrusted(..., 'session', ...)
+//                    so the entry never persists. Process-restart wipes it.
+//
+// `opts.onSkip(reason)` lets the caller log a per-tool audit alongside the
+// allowlist module's own forensics record. Both fire on the INBOX path.
+//
+// This function NEVER throws -- a forensics failure must not crash a send.
+// Input shape accepted by autoTrustOnReply. Mirrors imap.findByMessageId
+// (which returns source + folder + uid + from). We accept either field as
+// the policy discriminant -- source preferred (canonical enum), folder
+// falls back to literal-string compare against {INBOX, Sent}. This keeps
+// the test seam simple (callers can pass folder=Sent without knowing the
+// internal source/folder split) while preserving the imap.ts contract.
+export interface AutoTrustOnReplyInput {
+  from: string;
+  source?: 'INBOX' | 'Sent';
+  folder?: 'INBOX' | 'Sent' | string;
+  uid?: number;
+}
+export interface AutoTrustOnReplyOpts {
+  onSkip?: (reason: string) => void;
+}
+export function autoTrustOnReply(
+  found: AutoTrustOnReplyInput | null,
+  opts: AutoTrustOnReplyOpts = {},
+): void {
+  // 1. Env opt-out. Silent -- this is a global policy, not a per-call event.
+  if (process.env.YANDEX_AUTO_TRUST_REPLY === 'off') return;
+
+  if (!found || !found.from) return;
+
+  const target = norm(found.from);
+  if (!target) return;
+
+  // 2. Sent-only gate. The H-1 invariant: INBOX-source resolutions are NOT
+  // trust evidence; they're attacker-controllable metadata. Emit forensics.
+  const isSent = found.source === 'Sent' || found.folder === 'Sent';
+  if (!isSent) {
+    try {
+      auditLog({
+        action: 'allowlist_skip',
+        status: 'denied',
+        level: 'warn',
+        ts: new Date().toISOString(),
+        from_domain: target.split('@')[1] ?? '(none)',
+        reason: 'inbox_source',
+      });
+    } catch { /* forensics best-effort */ }
+    try { opts.onSkip?.('inbox_source'); } catch { /* caller best-effort */ }
+    return;
+  }
+
+  // 3. Sent path -> session-scope elevation. addTrusted handles dedupe and
+  // its own audit emit (allowlist_add, scope=session).
+  try {
+    addTrusted(target, 'session', 'auto_trust_reply');
+  } catch { /* must not crash a send */ }
+}
+
+// _listTrusted (H-1 §Q1): returns every trusted entry across BOTH the
+// persisted file and the in-memory session set, with a clear scope marker so
+// a future UX (yandex_trust_address --list, or a tool that surfaces trust
+// state) can warn users that scope='session' grants evaporate on restart.
+// Test seam: also used by auto-trust-reply.test.ts T-H1-04 to verify
+// visibility of session entries.
+export function _listTrusted(): Array<{ address: string; scope: AllowlistScope; source: AllowlistSource; added_at: string }> {
+  const out: Array<{ address: string; scope: AllowlistScope; source: AllowlistSource; added_at: string }> = [];
+  const file = loadAllowlist();
+  if (file.signature !== 'corrupt') {
+    for (const e of file.entries) {
+      out.push({ address: e.address, scope: e.scope, source: e.source, added_at: e.added_at });
+    }
+  }
+  for (const [address, meta] of sessionEntries) {
+    out.push({ address, scope: 'session', source: meta.source, added_at: meta.added_at });
+  }
+  return out;
 }
 
 // bootstrap(client, limit, sentPath): one-shot Sent-folder mining of the
@@ -371,7 +522,9 @@ export function sweepPendingTrust(): boolean {
   return false;
 }
 
-// Test-only: flush in-process caches (secret + any future state).
+// Test-only: flush in-process caches (secret + session-scope entries).
+// H-1: also wipes the session set so tests cannot bleed trust across cases.
 export function _resetForTests(): void {
   secretCache = null;
+  sessionEntries.clear();
 }

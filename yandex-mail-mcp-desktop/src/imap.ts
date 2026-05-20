@@ -290,13 +290,31 @@ export async function markEmail(folder: string, uid: number, seen?: boolean, fla
 // Bounded to INBOX + Sent so we don't fan out across every folder (T-05-13).
 // Returns the FROM address of the matching message (lowercased) — that is who
 // gets the auto-trust on the reply path, NOT the new recipient (T-05-06).
-export async function findByMessageId(messageId: string): Promise<{ from: string; folder: string; uid: number } | null> {
+//
+// H-1 fix: also returns a canonical `source` discriminant ('INBOX' | 'Sent')
+// so the caller can gate trust elevation on Sent-folder evidence ONLY.
+// `folder` keeps the literal mailbox path (cyrillic-safe on RU locales);
+// `source` is the policy-level enum the auto-trust block reads.
+export type FindByMessageIdSource = 'INBOX' | 'Sent';
+export interface FindByMessageIdResult {
+  from: string;
+  folder: string;
+  source: FindByMessageIdSource;
+  uid: number;
+}
+export async function findByMessageId(messageId: string): Promise<FindByMessageIdResult | null> {
   if (!messageId) return null;
   return getConnectionManager().withClient(async c => {
     const list = await c.list();
     const sentPath = pickSpecialFolder(list, '\\Sent');
-    const folders = ['INBOX', sentPath];
-    for (const folder of folders) {
+    // INBOX first, Sent second. Order matters because a message-id is unique
+    // per RFC 5322 -- if it shows in both, INBOX wins (sender sent us back
+    // our own thread). source is derived from WHICH folder matched.
+    const folders: Array<{ path: string; source: FindByMessageIdSource }> = [
+      { path: 'INBOX',   source: 'INBOX' },
+      { path: sentPath,  source: 'Sent'  },
+    ];
+    for (const { path: folder, source } of folders) {
       try {
         await c.mailboxOpen(folder, { readOnly: true });
         const uids = await c.search({ header: { 'message-id': messageId } } as Record<string, unknown>, { uid: true });
@@ -305,7 +323,7 @@ export async function findByMessageId(messageId: string): Promise<{ from: string
         for await (const msg of c.fetch(String(uid), { uid: true, envelope: true }, { uid: true })) {
           const fromAddr = msg.envelope?.from?.[0]?.address;
           if (fromAddr && typeof fromAddr === 'string') {
-            return { from: fromAddr.toLowerCase(), folder, uid };
+            return { from: fromAddr.toLowerCase(), folder, source, uid };
           }
         }
       } catch {
