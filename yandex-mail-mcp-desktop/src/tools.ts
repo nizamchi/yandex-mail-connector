@@ -366,6 +366,15 @@ interface SendPlan {
     rate_limit_ok: string;
     dedup: string;
   };
+  // H-2 FIX: guards-pure status surfaces in dry_run output so the user
+  // can see "47/50 daily, 0/5 per-recipient, no dedup hit" BEFORE consuming
+  // any confirmation code. When guards.ok=false the field carries the
+  // blocking reason and NO confirmation_token is issued (Q1 = yes, Q2 = no).
+  guard_status?: { ok: true };
+  guard_violation?:
+    | { reason: 'daily_send_limit_exceeded'; remaining: number; limit: number }
+    | { reason: 'per_recipient_rate_limit'; recipient: string; retry_after: string; limit: number }
+    | { reason: 'duplicate_send_within_window'; window_sec: number };
   next_step: string;
 }
 
@@ -378,8 +387,18 @@ function previewBody(p: ParsedSendParams): { first: string; length: number } {
   return { first: raw.slice(0, 200), length: (p.text ?? p.html ?? '').length };
 }
 
-function buildSendPlan(p: ParsedSendParams, fp: string): SendPlan {
+function buildSendPlan(p: ParsedSendParams, fp: string, guard?: GuardResult): SendPlan {
+  // H-2 FIX SENTINEL v1: when guard is provided, surface it in the plan so
+  // dry_run callers see the gate decision BEFORE the confirmation step. ok=true
+  // -> guard_status snapshot (Q1 = yes); ok=false -> guard_violation field +
+  // NO confirmation_token issued downstream (Q2 = no).
   const body = previewBody(p);
+  const rateOk = guard !== undefined && guard.ok === true
+    ? 'pass (guards-pure: daily + per-recipient + dedup)'
+    : 'deferred to phase 7';
+  const dedupOk = guard !== undefined && guard.ok === true
+    ? 'pass (no fingerprint hit in dedup window)'
+    : 'deferred to phase 7';
   const plan: SendPlan = {
     dry_run: true,
     action: 'send',
@@ -393,8 +412,8 @@ function buildSendPlan(p: ParsedSendParams, fp: string): SendPlan {
     },
     checks: {
       in_allowlist: 'pass (allowlist gate runs before dry_run preview)',
-      rate_limit_ok: 'deferred to phase 7',
-      dedup: 'deferred to phase 7',
+      rate_limit_ok: rateOk,
+      dedup: dedupOk,
     },
     next_step:
       'Call yandex_send_email again WITHOUT dry_run to trigger confirmation. ' +
@@ -403,6 +422,44 @@ function buildSendPlan(p: ParsedSendParams, fp: string): SendPlan {
   };
   if (p.cc) plan.preview.cc = p.cc.map(x => sanitizeForDisplay(x));
   if (p.bcc) plan.preview.bcc = p.bcc.map(x => sanitizeForDisplay(x));
+  if (guard !== undefined) {
+    if (guard.ok) {
+      plan.guard_status = { ok: true };
+    } else {
+      switch (guard.reason) {
+        case 'daily_send_limit_exceeded':
+          plan.guard_violation = {
+            reason: 'daily_send_limit_exceeded',
+            remaining: guard.remaining,
+            limit: guard.limit,
+          };
+          plan.next_step =
+            'Send blocked by daily limit (' + guard.limit + '/day). Wait ~24h or raise ' +
+            'YANDEX_DAILY_SEND_LIMIT, then re-run dry_run to get a fresh confirmation code.';
+          break;
+        case 'per_recipient_rate_limit':
+          plan.guard_violation = {
+            reason: 'per_recipient_rate_limit',
+            recipient: guard.recipient,
+            retry_after: guard.retryAfter.toISOString(),
+            limit: guard.limit,
+          };
+          plan.next_step =
+            'Send blocked by per-recipient rate limit (' + guard.limit + '/hour for ' + guard.recipient +
+            '). Retry after ' + guard.retryAfter.toISOString() + ', then re-run dry_run.';
+          break;
+        case 'duplicate_send_within_window':
+          plan.guard_violation = {
+            reason: 'duplicate_send_within_window',
+            window_sec: guard.windowSec,
+          };
+          plan.next_step =
+            'Send blocked: identical fingerprint already submitted within the ' + guard.windowSec +
+            's dedup window. Adjust subject/body or wait the window out, then re-run dry_run.';
+          break;
+      }
+    }
+  }
   return plan;
 }
 
@@ -999,9 +1056,23 @@ Args:
         };
         const fp = actionFingerprint('send', payload as unknown as Record<string, unknown>);
 
-        // (1) dry_run -- return SendPlan, NEVER send.
+        // ── H-2 FIX: pure guards check FIRST ─────────────────
+        // Pipeline order is now
+        //   allowlist -> guards-pure -> [dry_run | verifyCode] -> smtp -> recordSend
+        // enforceSendGuards is pure (no state mutation); recordSend below is
+        // the SOLE state-mutation site, fired only on the success branch. We
+        // run guards BEFORE any code-burn so a guard violation NEVER consumes
+        // a user-approved confirmation token (see
+        // .planning/debug/h2-confirm-burned-before-guards.md).
+        // B-1 fix preserved: guards see the SAME normalized set as the
+        // allowlist gate and the SMTP layer.
+        const guardPayload = { to: toFlat, cc: ccFlat.length ? ccFlat : undefined, bcc: bccFlat.length ? bccFlat : undefined };
+        const guardResult = enforceSendGuards(guardPayload, ctx.authLevel, fp);
+
+        // (1) dry_run -- return SendPlan, NEVER send. Surface guards verdict
+        // (Q1 = yes: always; Q2 = no: never pre-issue a confirmation_token).
         if (p.dry_run === true) {
-          const plan = buildSendPlan(p, fp);
+          const plan = buildSendPlan(p, fp, guardResult);
           return {
             content: [{ type: 'text', text: JSON.stringify(plan, null, 2) }],
             structuredContent: plan as unknown as Record<string, unknown>,
@@ -1016,9 +1087,9 @@ Args:
         }
 
         // Sentinel _audit for the no-actual-send return paths below
-        // (token-wrong, elicit-cancelled, requires-confirmation). Hook-2
-        // requires message_id on every EMAIL_ACTIONS record; sentinels keep
-        // audit.ts from firing a schema-violation on legitimate gates.
+        // (guard-block, token-wrong, elicit-cancelled, requires-confirmation).
+        // Hook-2 requires message_id on every EMAIL_ACTIONS record; sentinels
+        // keep audit.ts from firing a schema-violation on legitimate gates.
         const noSendAudit: HandlerAuditExtras = {
           recipients: p.to.map(a => a.split('@')[1] ?? a),
           subject_hash: subjectHash(p.subject),
@@ -1026,7 +1097,50 @@ Args:
           message_id: '<blocked-no-message-id>',
         };
 
-        // (2) confirmation_token provided -- verify and proceed on match.
+        // (2) guards verdict: hard-block at L1/L2 BEFORE any code burn or
+        // elicit prompt (Q3 = yes); warn-only at L3 advisory and fall through.
+        if (!guardResult.ok) {
+          const recipientDomains = p.to.map(domainOnly);
+          if (isAdvisory(ctx.authLevel)) {
+            // L3 (auto): warn-only, do NOT block. Audit BEFORE the send so the
+            // operator sees the advisory even if the send then errors.
+            auditLog({
+              action: 'yandex_send_email',
+              status: 'denied',
+              level: 'warn',
+              ts: new Date().toISOString(),
+              reason: guardResult.reason + '_L3_advisory',
+              recipients: recipientDomains,
+              from_domain: '(self)',
+            });
+            // fall through to verify/send path
+          } else {
+            // L1/L2: hard block. NOTE: no verifyCode call has happened yet --
+            // any user-supplied confirmation_token remains valid for a fresh
+            // submit once the window clears.
+            auditLog({
+              action: 'yandex_send_email',
+              status: 'denied',
+              level: 'warn',
+              ts: new Date().toISOString(),
+              reason: guardResult.reason,
+              recipients: recipientDomains,
+              from_domain: '(self)',
+            });
+            return {
+              content: [{ type: 'text', text: errorTextFor(guardResult) }],
+              isError: true,
+              _audit: {
+                recipients: recipientDomains,
+                subject_hash: subjectHash(p.subject),
+                body_length: (p.text ?? p.html ?? '').length,
+                message_id: '<blocked-no-message-id>',
+              },
+            };
+          }
+        }
+
+        // (3) confirmation_token provided -- verify and proceed on match.
         if (token !== undefined) {
           const v = verifyCode(fp, token);
           if (v !== true) {
@@ -1034,7 +1148,9 @@ Args:
           }
           // fall through to send path
         } else {
-          // (3) Neither dry_run nor token. Gate by elicitation capability.
+          // (4) Neither dry_run nor token. Gate by elicitation capability.
+          // Reached only when guards.ok=true (or L3 advisory fell through);
+          // we never burn a code / surface elicit on a doomed send.
           if (ctx.serverContext.canElicit && ctx.serverContext.elicit) {
             // Pre-issue a fallback code so the agent can retry via token path
             // if the elicit times out or the dialog is dismissed.
@@ -1095,54 +1211,6 @@ Args:
               },
               isError: false,
               _audit: noSendAudit,
-            };
-          }
-        }
-
-        // ── Phase 7: Operational guards ──────────────────────
-        // Insertion point: AFTER allowlist + confirmation succeed. Dedup uses
-        // the verified fingerprint. Pipeline order is now
-        //   allowlist -> confirmation -> guards -> smtp.
-        // enforceSendGuards is pure (no state mutation); recordSend below is
-        // the SOLE state-mutation site, fired only on the success branch.
-        // B-1 fix: guards see the SAME normalized set as the allowlist and SMTP.
-        const guardPayload = { to: toFlat, cc: ccFlat.length ? ccFlat : undefined, bcc: bccFlat.length ? bccFlat : undefined };
-        const guardResult = enforceSendGuards(guardPayload, ctx.authLevel, fp);
-        if (!guardResult.ok) {
-          const recipientDomains = p.to.map(domainOnly);
-          if (isAdvisory(ctx.authLevel)) {
-            // L3 (auto): warn-only, do NOT block. Audit BEFORE the send so the
-            // operator sees the advisory even if the send then errors.
-            auditLog({
-              action: 'yandex_send_email',
-              status: 'denied',
-              level: 'warn',
-              ts: new Date().toISOString(),
-              reason: guardResult.reason + '_L3_advisory',
-              recipients: recipientDomains,
-              from_domain: '(self)',
-            });
-            // fall through to send path
-          } else {
-            // L1/L2: hard block.
-            auditLog({
-              action: 'yandex_send_email',
-              status: 'denied',
-              level: 'warn',
-              ts: new Date().toISOString(),
-              reason: guardResult.reason,
-              recipients: recipientDomains,
-              from_domain: '(self)',
-            });
-            return {
-              content: [{ type: 'text', text: errorTextFor(guardResult) }],
-              isError: true,
-              _audit: {
-                recipients: recipientDomains,
-                subject_hash: subjectHash(p.subject),
-                body_length: (p.text ?? p.html ?? '').length,
-                message_id: '<blocked-no-message-id>',
-              },
             };
           }
         }
