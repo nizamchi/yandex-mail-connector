@@ -12,7 +12,20 @@
 
 ## Шаг 2: token.json
 
-Создать файл `token.json` рядом с бандлом (или в `cwd` при запуске):
+**Рекомендуемое расположение** — рядом с остальным state (allowlist, audit,
+secret). Это работает для всех способов запуска, включая `npx`:
+
+| Платформа | Путь к state-каталогу |
+|---|---|
+| Windows | `%APPDATA%\yandex-mail-mcp\token.json` |
+| Linux | `$XDG_CONFIG_HOME/yandex-mail-mcp/token.json` (или `~/.config/yandex-mail-mcp/token.json`) |
+| macOS | `~/.config/yandex-mail-mcp/token.json` |
+
+Каталог создаётся автоматически при первом запуске сервера. Можно
+переопределить через `YANDEX_STATE_DIR=/custom/path` — тогда `token.json`
+ищется по `$YANDEX_STATE_DIR/token.json`.
+
+Формат:
 
 ```json
 {
@@ -32,8 +45,17 @@ chmod 600 token.json
 завершится с кодом 1 при mode != 600. На Windows эта проверка
 пропускается (mode lies on win32).
 
-Альтернатива файлу — environment variables:
-`YANDEX_OAUTH_TOKEN` + `YANDEX_EMAIL`.
+### Альтернативные расположения
+
+1. **Произвольный путь:** `YANDEX_TOKEN_FILE=/абсолютный/путь/token.json`.
+   Полезно для CI / dotfiles / shared secrets.
+2. **Project-root** (legacy): `<repo>/token.json` — работает при
+   `git clone` + `npm start`. Не работает для `npx -y github:...` (бандл
+   живёт в `~/.npm/_npx` и стирается между запусками).
+3. **CWD** (legacy): `<cwd>/token.json` — работает при ручном запуске из
+   известного каталога. Для Claude Desktop / Cursor cwd непредсказуем.
+4. **Без файла:** environment variables `YANDEX_OAUTH_TOKEN` +
+   `YANDEX_EMAIL`. Подходит для ephemeral сред (Docker, GitHub Actions).
 
 ## Шаг 3: настройка MCP-клиента
 
@@ -127,6 +149,7 @@ env как обычно.
 | `YANDEX_AUTH_LEVEL`                  | `readonly`                             | L0/L1/L2/L3 — см. Шаг 4                                      |
 | `YANDEX_ALLOW_CUSTOM_HOSTS`          | `false`                                | Пропустить host allowlist — не для production               |
 | `YANDEX_STATE_DIR`                   | platform default                       | Переопределить путь к state-каталогу                         |
+| `YANDEX_TOKEN_FILE`                  | `<state-dir>/token.json` + legacy paths | Произвольный путь к token.json (M-2)                         |
 | `YANDEX_ALLOWLIST_PATH`              | `<state-dir>/allowlist.json`            | Переопределить путь к TOFU allowlist                         |
 | `YANDEX_AUDIT_LOG`                   | `<state-dir>/audit.jsonl`               | Переопределить путь к JSONL audit log                        |
 | `YANDEX_AUDIT_LOG_MAX_MB`            | `25`                                   | Размер ротации audit log (МБ)                                |

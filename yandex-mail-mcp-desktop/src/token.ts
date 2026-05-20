@@ -2,8 +2,18 @@
  * Token loader — mirrors yandex_disk client._load_token() pattern.
  *
  * Priority (first wins):
- *   1. token.json next to this script (sources/yandex_mail/token.json style)
- *   2. YANDEX_OAUTH_TOKEN env var (fallback for power users)
+ *   1. YANDEX_TOKEN_FILE env var (explicit path override; power-user escape)
+ *   2. <state_dir>/token.json — PREFERRED for `npx -y github:...` installs.
+ *      state_dir resolves via getStateDir() (Hook 1): %APPDATA%/yandex-mail-mcp
+ *      on Windows, $XDG_CONFIG_HOME/yandex-mail-mcp on Unix, or
+ *      $YANDEX_STATE_DIR if set. Lives alongside allowlist.json + secret.bin
+ *      + audit.jsonl, so users have one durable place for all state.
+ *   3. <project_root>/token.json — legacy: works for `git clone` + `npm start`
+ *      dev installs. Fails on `npx` because __dirname points into ~/.npm/_npx
+ *      which is wiped on each invocation.
+ *   4. <cwd>/token.json — legacy: works when manually invoked from a known cwd.
+ *      Unreliable from Claude Desktop / Cursor MCP child processes.
+ *   5. YANDEX_OAUTH_TOKEN + YANDEX_EMAIL env vars — fallback for ephemeral envs.
  *
  * token.json format (same as disk):
  *   {
@@ -18,6 +28,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { getStateDir } from './state-dir.js';
 
 export interface Credentials {
   email: string;
@@ -75,11 +86,42 @@ function permCheck(tokenPath: string): void {
 }
 
 function findTokenFile(): string | null {
-  // Look next to dist/index.js → project root → cwd
-  const candidates = [
-    path.join(__dirname, '..', 'token.json'),     // project root
-    path.join(process.cwd(), 'token.json'),        // cwd fallback
-  ];
+  // M-2 fix (milestone deep-review): resolution order extended to make
+  // `npx -y github:...` installs work without manual path archaeology.
+  //
+  // Order (first wins):
+  //   1. YANDEX_TOKEN_FILE env override — power-user escape hatch.
+  //   2. <state_dir>/token.json — PREFERRED for npx installs.
+  //   3. <project_root>/token.json — legacy: clone + npm start.
+  //   4. <cwd>/token.json — legacy: manual invoke from known cwd.
+
+  const explicit = process.env.YANDEX_TOKEN_FILE;
+  if (explicit && explicit.length > 0) {
+    const resolved = path.resolve(explicit);
+    try {
+      fs.accessSync(resolved, fs.constants.R_OK);
+      return resolved;
+    } catch {
+      // Explicit override that doesn't exist is a configuration error worth
+      // surfacing — don't silently fall through to discovery. Returning null
+      // here would mask the typo. Throw with a clear message.
+      throw new Error(
+        `YANDEX_TOKEN_FILE=${explicit} (resolved: ${resolved}) is not readable. ` +
+        `Check the path, or unset YANDEX_TOKEN_FILE to fall back to discovery.`,
+      );
+    }
+  }
+
+  const candidates: string[] = [];
+  // Preferred state-dir location. getStateDir() may throw if it cannot create
+  // the directory (e.g. parent unwritable); treat that as "no state-dir
+  // candidate" and continue with legacy paths.
+  try {
+    candidates.push(path.join(getStateDir(), 'token.json'));
+  } catch { /* state dir unavailable; legacy candidates only */ }
+  candidates.push(path.join(__dirname, '..', 'token.json'));   // project root (legacy)
+  candidates.push(path.join(process.cwd(), 'token.json'));      // cwd (legacy)
+
   for (const p of candidates) {
     try {
       fs.accessSync(p, fs.constants.R_OK);
@@ -130,10 +172,30 @@ export function loadCredentials(): Credentials {
     return creds;
   }
 
-  throw new Error(
-    'Yandex Mail credentials not found.\n' +
-    'Create token.json next to the server:\n' +
-    '  { "access_token": "y0_AgAAA...", "email": "you@yandex.ru" }\n' +
-    'Or set YANDEX_OAUTH_TOKEN + YANDEX_EMAIL env vars.'
+  // M-2 fix: error message now points users at the durable state-dir location
+  // (works for npx installs) instead of "next to the server" which is
+  // ~/.npm/_npx/... and gets wiped on every invocation.
+  let preferredDir = '';
+  try { preferredDir = getStateDir(); } catch { /* unavailable */ }
+
+  const lines = [
+    'Yandex Mail credentials not found.',
+    '',
+    'Option 1 (recommended) -- create token.json in the state directory:',
+  ];
+  if (preferredDir) {
+    lines.push(`  ${path.join(preferredDir, 'token.json')}`);
+  } else {
+    lines.push('  <state_dir>/token.json  (state_dir unavailable; check $YANDEX_STATE_DIR)');
+  }
+  lines.push(
+    '  { "access_token": "y0_AgAAA...", "email": "you@yandex.ru" }',
+    '',
+    'Option 2 -- point to an arbitrary path via env:',
+    '  YANDEX_TOKEN_FILE=/path/to/token.json',
+    '',
+    'Option 3 -- ephemeral env vars (CI / containers):',
+    '  YANDEX_OAUTH_TOKEN=y0_AgAAA...  YANDEX_EMAIL=you@yandex.ru',
   );
+  throw new Error(lines.join('\n'));
 }
