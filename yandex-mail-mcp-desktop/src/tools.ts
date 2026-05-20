@@ -28,6 +28,7 @@ import * as allowlist from './allowlist.js';
 import { getStateDir } from './state-dir.js';
 import { auditLog, auditLogAction, EMAIL_ACTIONS, subjectHash } from './audit.js';
 import { enforceSendGuards, recordSend, isAdvisory, is2FASender, isProtectedFolder, type GuardResult } from './guards.js';
+import { normalizeRecipients, validateNoSmuggling } from './recipients.js';
 
 // Domain extraction helper used by guard audit records (D-RECIP-DOMAINS: never
 // log raw recipient addresses; domains-only for forensics correlation).
@@ -308,10 +309,15 @@ const trustAddressSchema = z.object({
 // SDK requires the inputSchema field be a ZodObject (or its plain shape). We pass
 // the underlying object schema to the SDK and re-run .refine() inside the handler
 // to preserve the cross-field validation message.
+// B-1 fix: per-array refinements reject smuggled multi-address entries at
+// the schema boundary. validateNoSmuggling() parses each element through
+// nodemailer's addressparser and returns a non-null reason iff any element
+// resolves to >1 address. Defence in depth -- handler also normalizes.
+const noSmugglingRefiner = (arr: string[] | undefined): boolean => validateNoSmuggling(arr) === null;
 const sendEmailBaseSchema = z.object({
-  to:                 z.array(z.string()).min(1),
-  cc:                 z.array(z.string()).optional(),
-  bcc:                z.array(z.string()).optional(),
+  to:                 z.array(z.string()).min(1).refine(noSmugglingRefiner, { message: 'to: comma-smuggling rejected -- one address per entry' }),
+  cc:                 z.array(z.string()).optional().refine(noSmugglingRefiner, { message: 'cc: comma-smuggling rejected -- one address per entry' }),
+  bcc:                z.array(z.string()).optional().refine(noSmugglingRefiner, { message: 'bcc: comma-smuggling rejected -- one address per entry' }),
   subject:            z.string().min(1),
   text:               z.string().optional(),
   html:               z.string().optional(),
@@ -869,22 +875,36 @@ Args:
           throw new Error('Укажите хотя бы одно из полей: text или html');
         }
 
+        // ── B-1 fix: parser-symmetric recipient normalization ───────
+        // Both the allowlist gate AND the SMTP layer must operate on the SAME
+        // flat, single-address-per-entry arrays. normalizeRecipients() parses
+        // each input through nodemailer's addressparser (the same parser SMTP
+        // delivery uses internally) so the address set the gate checks is
+        // guaranteed identical to the set nodemailer will deliver to. This
+        // closes the comma-smuggling bypass that allowed exfil recipients to
+        // slip past the gate (BLOCKER B-1, T-INT-03).
+        // Schema-layer refinement (sendEmailBaseSchema) rejects multi-address
+        // entries at the boundary; this normalization runs anyway as defence
+        // in depth and as the single source of truth for the rest of the
+        // handler (allowlist, audit, SMTP).
+        const toNorm  = normalizeRecipients(p.to);
+        const ccNorm  = normalizeRecipients(p.cc);
+        const bccNorm = normalizeRecipients(p.bcc);
+        const toFlat  = toNorm.normalized as string[];
+        const ccFlat  = ccNorm.normalized as string[];
+        const bccFlat = bccNorm.normalized as string[];
+
         // ── Phase 5: Allowlist gate ──────────────────────────────────
         // Runs BEFORE the dry_run / confirmation_token / SMTP path so that
         // an untrusted recipient blocks the action immediately -- including
         // BCC, which is the primary exfil vector (T-INT-03 / T-05-05).
         // Only enforced at L1+; L0 cannot reach this tool (not registered).
         if (ctx.authLevel >= 1) {
-          // Strip optional "Name <addr>" wrapping → pull just the address.
-          const extractAddr = (s: string): string => {
-            const m = s.match(/<([^>]+)>/);
-            return (m?.[1] ?? s).trim().toLowerCase();
-          };
           const recipients = [
-            ...p.to,
-            ...(p.cc ?? []),
-            ...(p.bcc ?? []),
-          ].map(extractAddr).filter(a => a.length > 0);
+            ...toNorm.addresses,
+            ...ccNorm.addresses,
+            ...bccNorm.addresses,
+          ];
 
           // in_reply_to auto-trust: the SENDER of the looked-up message
           // (envelope.from) is the one auto-trusted -- NOT the new recipients
@@ -943,11 +963,24 @@ Args:
         // confirmation_token, which are control-plane fields. Strip them
         // before canonicalization so the same logical send maps to the same fp
         // whether the agent is in dry_run / token / direct mode.
+        //
+        // B-1 fix: substitute normalized recipient arrays so the fingerprint
+        // is invariant to display-name cosmetics and to whether the agent
+        // packed addresses into one string vs separate entries. dedup now
+        // catches both variants.
         const {
           dry_run: _dr,
           confirmation_token: token,
-          ...payload
+          to: _toIgnored, cc: _ccIgnored, bcc: _bccIgnored,
+          ...payloadRest
         } = p;
+        void _toIgnored; void _ccIgnored; void _bccIgnored;
+        const payload = {
+          ...payloadRest,
+          to: toFlat,
+          ...(ccFlat.length ? { cc: ccFlat } : {}),
+          ...(bccFlat.length ? { bcc: bccFlat } : {}),
+        };
         const fp = actionFingerprint('send', payload as unknown as Record<string, unknown>);
 
         // (1) dry_run -- return SendPlan, NEVER send.
@@ -1056,7 +1089,8 @@ Args:
         //   allowlist -> confirmation -> guards -> smtp.
         // enforceSendGuards is pure (no state mutation); recordSend below is
         // the SOLE state-mutation site, fired only on the success branch.
-        const guardPayload = { to: p.to, cc: p.cc, bcc: p.bcc };
+        // B-1 fix: guards see the SAME normalized set as the allowlist and SMTP.
+        const guardPayload = { to: toFlat, cc: ccFlat.length ? ccFlat : undefined, bcc: bccFlat.length ? bccFlat : undefined };
         const guardResult = enforceSendGuards(guardPayload, ctx.authLevel, fp);
         if (!guardResult.ok) {
           const recipientDomains = p.to.map(domainOnly);
@@ -1098,8 +1132,14 @@ Args:
         }
 
         // ── Send path ────────────────────────────────────────
+        // B-1 fix: hand the NORMALIZED flat single-address arrays to nodemailer.
+        // Each entry is already exactly one bare address; addressparser on each
+        // entry returns exactly one address, so the gate-vs-SMTP set-equality
+        // invariant holds by construction.
         const r = await sendEmail(creds(), {
-          to: p.to, cc: p.cc, bcc: p.bcc,
+          to: toFlat,
+          cc: ccFlat.length ? ccFlat : undefined,
+          bcc: bccFlat.length ? bccFlat : undefined,
           subject: p.subject, text: p.text, html: p.html,
           replyTo: p.reply_to, inReplyTo: p.in_reply_to, references: p.references,
         });
