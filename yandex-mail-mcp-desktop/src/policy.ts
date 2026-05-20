@@ -1,19 +1,23 @@
 // policy.ts -- PMLF (Phase 1) risk-policy loader.
 //
-// Mirrors the HMAC sign/verify discipline of allowlist.ts (T-03 adds the
-// actual signing in this file). Load-once per CONTEXT D7 -- no hot-reload;
-// operator must restart the MCP server after editing risk-policy.json.
+// Mirrors the HMAC sign/verify discipline of allowlist.ts. Load-once per
+// CONTEXT D7 -- no hot-reload; operator must restart the MCP server after
+// editing risk-policy.json.
 //
 // File: <state-dir>/risk-policy.json (override: YANDEX_POLICY_FILE).
 // Schema: RiskPolicySchema (Zod, strict, all keys required).
-// Integrity: HMAC-SHA256 over 'policy:' + canonicalStringify(policy)
-//            using shared <state-dir>/secret.bin (D1 domain prefix isolates
-//            this from allowlist.ts which signs without a prefix).
+// Integrity: HMAC-SHA256 over 'policy:' + canonicalStringify(policy) using
+//            shared <state-dir>/secret.bin (D1 domain prefix isolates this
+//            from allowlist.ts which signs without a prefix).
 // Anti-tamper: lowering thresholds.block without override_block_threshold:true
 //              falls back to defaults + stderr warning (D3).
 // First-launch (D5): write defaults, sign, stderr log.
 // FATAL (D6): print 3-step recovery banner + process.exit(1) via test-
 //             substitutable _fatalStderr / _fatalExit hooks (B-2).
+//
+// Coupling constraint (R-6): secret.bin is shared with allowlist.ts. Phase 7
+// rotation flow MUST resign both allowlist.json AND risk-policy.json in one
+// transaction. Phase 1 does no rotation.
 //
 // CRITICAL: this module does NOT import from allowlist.ts. canonicalStringify
 // is copied verbatim into this file (W-2 mirror discipline, enforced by
@@ -24,6 +28,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
 import { getStateDir } from './state-dir.js';
@@ -94,6 +99,7 @@ export const RiskPolicySchema = z.object({
 
 let cachedPolicy: RiskPolicy | null = null;
 let loaded: boolean = false;
+let secretCache: Buffer | null = null;
 
 // ── Path resolution ───────────────────────────────────────────
 
@@ -103,6 +109,89 @@ export function getPolicyPath(): string {
     return path.resolve(explicit);
   }
   return path.join(getStateDir(), 'risk-policy.json');
+}
+
+function secretPath(): string {
+  return path.join(getStateDir(), 'secret.bin');
+}
+
+// ── Secret management ─────────────────────────────────────────
+// IDENTICAL semantics to allowlist.ts loadSecret. The secret file is SHARED
+// with allowlist.ts -- domain prefix isolates the two HMAC users (D1).
+
+function loadSecret(): Buffer {
+  if (secretCache !== null) return secretCache;
+  const p = secretPath();
+  if (fs.existsSync(p)) {
+    const buf = fs.readFileSync(p);
+    if (buf.length !== 32) {
+      throw new Error(`policy secret at ${p} has unexpected length ${buf.length} (expected 32). Delete the file to regenerate (this wipes all allowlist trust too).`);
+    }
+    secretCache = buf;
+    return buf;
+  }
+  const buf = randomBytes(32);
+  atomicWrite(p, buf, 0o600);
+  secretCache = buf;
+  return buf;
+}
+
+// ── Canonicalization ──────────────────────────────────────────
+// MIRROR DISCIPLINE (W-2): this function is a byte-identical copy of
+// canonicalStringify in src/allowlist.ts. If semantics change in either
+// module, the change MUST land in BOTH modules in the same commit.
+// Phase 6 refactor may extract this to src/canonical-json.ts; until then,
+// the mirror is enforced by the grep gate in package.json scripts.test
+// (see T-10 / `npm run check:canonical-mirror`).
+function canonicalStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return '[' + value.map(canonicalStringify).join(',') + ']';
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalStringify(obj[k])).join(',') + '}';
+}
+
+// ── HMAC sign with 'policy:' domain prefix ────────────────────
+// Domain prefix prevents allowlist.json signatures being replayed into
+// risk-policy.json. Same secret.bin, different message preimages (D1).
+function signPolicy(policy: RiskPolicy, secret: Buffer): string {
+  return createHmac('sha256', secret).update('policy:' + canonicalStringify(policy)).digest('hex');
+}
+
+// ── Atomic write helper ───────────────────────────────────────
+// Byte-identical pattern to allowlist.ts atomicWrite (W-2 mirror principle
+// extends here in spirit; the bodies are short so no scripted gate).
+
+function atomicWrite(target: string, data: Buffer | string, mode: number): void {
+  const tmp = target + '.tmp';
+  try {
+    fs.writeFileSync(tmp, data, { mode });
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    throw new Error(`atomicWrite to ${target} failed: ${err.message ?? String(e)}`);
+  }
+}
+
+// ── File format ───────────────────────────────────────────────
+
+interface PolicyFile {
+  policy: RiskPolicy;
+  signature: string;
+}
+
+function writePolicy(policy: RiskPolicy): void {
+  const secret = loadSecret();
+  const file: PolicyFile = {
+    policy,
+    signature: signPolicy(policy, secret),
+  };
+  atomicWrite(getPolicyPath(), JSON.stringify(file, null, 2), 0o600);
 }
 
 // ── FATAL recovery (stub; T-06 replaces with hook-based banner) ──
@@ -122,6 +211,7 @@ export function loadPolicy(): RiskPolicy {
     loaded = true;
     return cachedPolicy;
   }
+
   let raw: string;
   try {
     raw = fs.readFileSync(filePath, 'utf-8');
@@ -129,6 +219,7 @@ export function loadPolicy(): RiskPolicy {
     const err = e as NodeJS.ErrnoException;
     recoverFatal('read failed: ' + (err.message ?? String(e)));
   }
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -136,17 +227,56 @@ export function loadPolicy(): RiskPolicy {
     const err = e as Error;
     recoverFatal('parse failed: ' + err.message);
   }
-  // T-03 will validate the wrapper shape; for now assume the parsed value
-  // is the policy directly. Schema validation:
+
+  // Wrapper shape: { policy: ..., signature: ... }
+  if (
+    typeof parsed !== 'object' || parsed === null ||
+    typeof (parsed as { signature?: unknown }).signature !== 'string' ||
+    typeof (parsed as { policy?: unknown }).policy !== 'object' ||
+    (parsed as { policy?: unknown }).policy === null
+  ) {
+    recoverFatal('parse failed: risk-policy.json missing policy/signature wrapper');
+  }
+  const wrapper = parsed as PolicyFile;
+
+  // Schema validation.
+  let policy: RiskPolicy;
   try {
-    const policy = RiskPolicySchema.parse(parsed);
-    cachedPolicy = policy;
-    loaded = true;
-    return cachedPolicy;
+    policy = RiskPolicySchema.parse(wrapper.policy);
   } catch (e) {
     const err = e as z.ZodError;
-    recoverFatal('schema validation failed: ' + err.message);
+    const details = err.issues.map(i => i.path.join('.') + ': ' + i.message).join('; ');
+    recoverFatal('schema validation failed: ' + details);
   }
+
+  // HMAC verification.
+  let secret: Buffer;
+  try {
+    secret = loadSecret();
+  } catch (e) {
+    const err = e as Error;
+    recoverFatal('secret.bin corruption: ' + err.message);
+  }
+  const expectedHex = signPolicy(policy, secret);
+  const expectedBuf = Buffer.from(expectedHex, 'hex');
+  const actualBuf = Buffer.from(wrapper.signature, 'hex');
+  if (expectedBuf.length !== actualBuf.length || expectedBuf.length === 0) {
+    recoverFatal('signature invalid');
+  }
+  let sigOk = false;
+  try {
+    sigOk = timingSafeEqual(expectedBuf, actualBuf);
+  } catch {
+    sigOk = false;
+  }
+  if (!sigOk) {
+    recoverFatal('signature invalid');
+  }
+
+  // Anti-tamper (T-04) and first-launch (T-05) added next.
+  cachedPolicy = policy;
+  loaded = true;
+  return cachedPolicy;
 }
 
 export function getPolicy(): RiskPolicy {
@@ -159,4 +289,5 @@ export function getPolicy(): RiskPolicy {
 export function _resetForTests(): void {
   cachedPolicy = null;
   loaded = false;
+  secretCache = null;
 }
