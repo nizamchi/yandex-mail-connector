@@ -30,7 +30,24 @@
 // stops. Caller routes to Phase 5 UX based on tier (low=silent,
 // medium=augment, high=strict, block=CLI-override). No dispatch here.
 //
-// No `any`. ESM `.js` suffix on internal imports (NodeNext). ASCII-only.
+// PHASE 6 INTEGRATION NOTE (D14):
+//   risk-score.ts ships UNCHANGED in Phase 6 -- no function bodies modified,
+//   no signal evaluators touched, no tier mapping shifted. The trustAddedAtMs
+//   and firstUse fields on RiskContext (Phase 4 D8) are now FILLED with real
+//   values by the send-pipeline.ts:computeRisk stage:
+//
+//     trustAddedAtMs <- allowlist.getTrustEntry(primaryRecipient)?.added
+//     firstUse       <- allowlist.getTrustEntry(primaryRecipient)?.useCount === 0
+//     autoTrustedThisCall <- !!ctx.allowlistDecision.autoTrusted (H-3 snapshot diff)
+//     recentSendCount <- guards.getDailyCounter().count(ctx.nowMs)
+//
+//   The new_trust signal (evalNewTrust) reads trustAddedAtMs and the first_use
+//   signal (evalFirstUse) reads the firstUse boolean. CONTEXT amendment H-2
+//   holds: session-scope trust entries report useCount=0 always; the "just
+//   auto-trusted" 60s signal is timestamp-based via (now - entry.added < 60s)
+//   inside the just_auto_trusted evaluator (Phase 4 surface; Phase 6 wiring).
+//
+//   No `any`. ESM `.js` suffix on internal imports (NodeNext). ASCII-only.
 
 import { getPolicy } from './policy.js';
 import type { ScanResult, ScanHit } from './outbound-scan.js';
