@@ -465,21 +465,18 @@ export const detectCryptoWeb3: DetectorFn = (ctx: DetectorContext): ScanHit[] =>
   // -- SOL (shape only; Ed25519 point check skipped per L2 budget) -
   //   This runs LAST among address detectors because the SOL alphabet is a
   //   strict superset of Base58 (32-44 chars unanchored). Overlap suppression
-  //   below favours earlier emitters (BTC legacy at same span beats SOL).
-  tryEmit(raw, text, SOL_RE, (m) => {
-    // FP guard: SOL shape collides with BTC legacy. If a BTC legacy or
-    // extended-key span already covers this match's start, skip. Overlap
-    // suppression handles full coverage; here we additionally reject when
-    // the candidate starts with '1' or '3' (BTC legacy leading bytes) AND
-    // length falls within BTC legacy bounds (26-35). This avoids emitting
-    // SOL for clearly BTC-shaped inputs, before the post-pass overlap
-    // suppression kicks in.
-    const lead = m.charCodeAt(0);
-    if ((lead === 49 /* '1' */ || lead === 51 /* '3' */) && m.length >= 26 && m.length <= 35) {
-      return null;
-    }
-    // Likewise reject TRX-leading shapes ('T' + 33 chars).
-    if (lead === 84 /* 'T' */ && m.length === 34) return null;
+  //   below favours earlier emitters at same [start,end) (BTC legacy with a
+  //   valid Base58Check emits at the same span FIRST in `raw`; stable sort
+  //   keeps BTC before SOL; the `r.start < lastEnd` walk then drops SOL).
+  //
+  //   H2 fix (post-review 02-02): the prior FP-guard rejected ANY candidate
+  //   starting with '1'/'3' (or 'T'+34) regardless of whether BTC/TRX
+  //   Base58Check actually validated. This produced false-negatives on
+  //   legitimate SOL addresses that happen to share BTC's leading byte but
+  //   fail Base58Check. We now emit SOL unconditionally on shape; overlap
+  //   suppression below drops the SOL hit only when a higher-precision
+  //   BTC / TRX / LTC / XKEY hit covers the same span.
+  tryEmit(raw, text, SOL_RE, () => {
     return { subCategory: 'sol_address_shape', weight: solWeight };
   });
 

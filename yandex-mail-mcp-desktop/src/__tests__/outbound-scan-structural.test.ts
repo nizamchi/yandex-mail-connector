@@ -478,6 +478,67 @@ test('T-BECH32-01: valid BIP-173 Bech32 sample matches; corrupted polymod does n
   }
 });
 
+// -- T-SOL-OVERLAP: H2 regression (post-02-02-REVIEW) ----------------
+
+test('T-SOL-OVERLAP-001: 40-char Base58 starting with "1" -> SOL shape hit, no BTC hit', () => {
+  // Regression for H2 (02-02-REVIEW): the prior SOL detector unconditionally
+  // rejected any 26-35 char Base58 candidate starting with '1' or '3', even
+  // when BTC Base58Check would have FAILED on the span. A SOL address that
+  // happens to share BTC's leading byte but is not BTC-shaped was silently
+  // dropped. The fix removes the over-eager FP-guard and relies on overlap
+  // suppression to favour BTC at same [start,end).
+  //
+  // Fixture 1: a 40-char Base58 string starting with '1'. Length 40 exceeds
+  // BTC_LEGACY_RE's `{25,34}` body cap (total 26-35), so BTC's regex cannot
+  // match at all and Base58Check is never attempted. SOL_RE's 32-44 shape
+  // matches. After H2 fix: exactly one sol_address_shape hit, zero BTC hits.
+  const dir = mkTmpStateDir();
+  try {
+    // 40 chars total: leading '1' + 39 Base58 body chars. All chars in the
+    // shared Base58 alphabet (no 0, O, I, l). Deterministic literal.
+    const solLike = '1' + 'A2B3C4D5E6F7G8H9JKLMNPQRSTUVWXYZabcdefg';
+    assert.equal(solLike.length, 40, 'fixture must be exactly 40 chars');
+    const body = 'Wallet: ' + solLike + ' deposit only';
+    const r = scanOutbound({ body });
+    const cryptoHits = r.hits.filter(h => h.category === 'crypto_seed');
+    const solHits = cryptoHits.filter(h => h.subCategory === 'sol_address_shape');
+    const btcHits = cryptoHits.filter(h => h.subCategory && h.subCategory.startsWith('btc_legacy'));
+    assert.equal(solHits.length, 1,
+      `40-char Base58 starting with '1' must emit ONE sol_address_shape hit; ` +
+      `got ${solHits.length} sol, all crypto subcats=${cryptoHits.map(h => h.subCategory).join(',')}`);
+    assert.equal(btcHits.length, 0,
+      `40-char span exceeds BTC_LEGACY_RE max length; must emit ZERO btc_legacy_* hits; got ${btcHits.length}`);
+  } finally {
+    cleanupTmpStateDir(dir);
+  }
+});
+
+test('T-SOL-OVERLAP-002: known-valid BTC P2PKH (Satoshi) -> btc_legacy_p2pkh, NO SOL hit (overlap suppression)', () => {
+  // Regression companion: ensure overlap suppression still favours BTC over
+  // SOL when both detectors fire on the same span. Satoshi's genesis address
+  // (`1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa`, 34 chars) passes BTC Base58Check
+  // (version 0x00). Length 34 is also within SOL's 32-44 range; after the H2
+  // fix, SOL_RE will produce a raw candidate, but stable-sort + lastEnd walk
+  // must drop SOL in favour of BTC.
+  const dir = mkTmpStateDir();
+  try {
+    // Satoshi genesis address - widely published public BTC P2PKH.
+    const satoshi = '1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa';
+    assert.equal(satoshi.length, 34, 'Satoshi address must be 34 chars');
+    const body = 'Donate: ' + satoshi + ' thanks';
+    const r = scanOutbound({ body });
+    const cryptoHits = r.hits.filter(h => h.category === 'crypto_seed');
+    const solHits = cryptoHits.filter(h => h.subCategory === 'sol_address_shape');
+    const btcHits = cryptoHits.filter(h => h.subCategory === 'btc_legacy_p2pkh');
+    assert.equal(btcHits.length, 1,
+      `Satoshi address must emit ONE btc_legacy_p2pkh hit; got ${btcHits.length}, all crypto subcats=${cryptoHits.map(h => h.subCategory).join(',')}`);
+    assert.equal(solHits.length, 0,
+      `overlap suppression must drop SOL when BTC covers same span; got ${solHits.length} sol hits`);
+  } finally {
+    cleanupTmpStateDir(dir);
+  }
+});
+
 // -- T-OFFSET: D8 byte-offset preservation ---------------------------
 
 test('T-OFFSET-01: zero-width-laden body -> hit.byteStart/byteEnd index ORIGINAL bytes', () => {
