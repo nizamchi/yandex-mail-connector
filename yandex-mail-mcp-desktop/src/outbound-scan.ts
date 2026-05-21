@@ -31,6 +31,18 @@ import { auditLogAction } from './audit.js';
 import { preprocess, type PreprocessResult } from './scan/preprocess.js';
 import type { RiskPolicy } from './policy-defaults.js';
 
+// 02-02-08: named imports for the 6 detector modules (categories 2.1-2.6).
+// _reregisterAllDetectors() below uses these to (re)populate the registry
+// after _resetForTests(). The side-effect of importing these modules has no
+// global effect on its own -- registration happens via the
+// _reregisterAllDetectors() call at the bottom of this file.
+import { detectPaymentCards } from './scan/detectors/payment-cards.js';
+import { detectRuBanking } from './scan/detectors/ru-banking.js';
+import { detectGovtIds } from './scan/detectors/govt-ids.js';
+import { detectCredentialsFuzzy } from './scan/detectors/credentials.js';
+import { detectStructuralSecrets } from './scan/detectors/structural-secrets.js';
+import { detectCryptoWeb3 } from './scan/detectors/crypto-web3.js';
+
 // -- Public types -------------------------------------------------
 
 export interface ScanHit {
@@ -124,12 +136,171 @@ export function _setCompositeHook(fn: typeof applyComposite): void {
   applyComposite = fn;
 }
 
-// 02-02 will append registerDetector calls for its 6 detectors here.
-// 02-03 will append registerDetector calls for its 5 detectors here.
-// 02-01 stub does nothing.
+// 02-02-08: register the 6 structural-pass detectors in deterministic order.
+// 02-03 will append its 5 keyword-pass detectors after this comment line.
+//
+// Subject-eligibility (per plan L5): only structural_secrets (cat 2.5) and
+// crypto_web3 (cat 2.6) are scanned on the subject. The other four are
+// body-only -- subjects of 50-80 chars are not a realistic surface for PAN /
+// SNILS / etc.
+//
+// Stable order is mandatory for deterministic test output (plan <interfaces>).
 export function _reregisterAllDetectors(): void {
-  // Intentionally empty in 02-01. See W-02 of 02-01-PLAN.md.
+  detectorRegistry.length = 0;
+  registerDetector('payment_card', detectPaymentCards, false);
+  registerDetector('ru_banking', detectRuBanking, false);
+  registerDetector('govt_id', detectGovtIds, false);
+  registerDetector('credentials_fuzzy', detectCredentialsFuzzy, false);
+  registerDetector('api_key_pattern', detectStructuralSecrets, true);
+  registerDetector('crypto_seed', detectCryptoWeb3, true);
+  // 02-03 keyword-pass detectors append here.
+  // Also reinstall the cat-2.4 hook in case _resetForTests cleared it.
+  _setCat24CompanionHook(applyCat24Companion);
 }
+
+// 02-02-08: cat-2.4 companion-check hook.
+//
+// Contract (per plan L4 / Patch 6 / B-2.2):
+//   - pending = ScanHit[] from detectCredentialsFuzzy (category =
+//     'credentials_fuzzy'). The detector encodes the normalized JS code-unit
+//     start index in subCategory as '<tag>:<idx>' so this hook can recover
+//     the normalized position without translating original-byte offsets back
+//     through the offset map.
+//   - realHits = ScanHit[] from every OTHER detector. Their evidence.byteStart
+//     is in ORIGINAL bytes; we translate to normalized indices via the
+//     PreprocessResult captured at scanOutbound entry (currentBodyPP /
+//     currentSubjectPP module-locals).
+//   - Promote a pending hit iff at least one realHit OR another pending hit
+//     lives within +/- 200 normalized code units of the pending hit's
+//     normalized start position. Subject and body windows are evaluated
+//     INDEPENDENTLY (no cross-section companion lookup) per L4.
+//   - Apply cap: total promoted cat-2.4 weight <= policy.weights.outbound_keyword_cap.
+//     Excess promotions dropped lowest-weight first; all cat-2.4 hits share
+//     the same per-keyword weight today, so excess is dropped tail-first
+//     (later-emitted hits get dropped first to keep the earliest companions).
+//
+// Note on subject parsing: 02-01's main loop already passes `matchedIn` on
+// every hit. We bucket by matchedIn and run window logic per-bucket using the
+// appropriate PreprocessResult.
+const CAT24_WINDOW = 200;
+
+// Module-locals refreshed on every scanOutbound entry. Read by the hook.
+// The hook is invoked synchronously inside scanOutbound, so this is race-free
+// (D4: no async, no I/O).
+let currentBodyPP: PreprocessResult | null = null;
+let currentSubjectPP: PreprocessResult | null = null;
+let currentPolicyCap: number = 40;
+
+// Parse the trailing ':<idx>' from a credentials_fuzzy subCategory string.
+// Returns null if the format does not match (defensive; the detector always
+// emits the suffix, but a future re-implementer may forget).
+function parseNormalizedIdxFromSub(sub: string | undefined): number | null {
+  if (sub === undefined) return null;
+  const colon = sub.lastIndexOf(':');
+  if (colon < 0 || colon === sub.length - 1) return null;
+  const tail = sub.slice(colon + 1);
+  // Pure ASCII digits only -- no signs, no whitespace.
+  for (let i = 0; i < tail.length; i++) {
+    const c = tail.charCodeAt(i);
+    if (c < 48 || c > 57) return null;
+  }
+  const n = Number(tail);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+// Translate an ORIGINAL byte offset to a normalized JS code-unit index by
+// binary-searching the offset map. Map is monotonically non-decreasing per
+// preprocess.ts contract. Returns the SMALLEST normalized index whose mapped
+// byte >= targetByte; if no such index exists, returns map.length (one past
+// end). Linear-search fallback for tiny maps to avoid edge cases.
+function byteToNormIndex(map: Int32Array, targetByte: number): number {
+  const n = map.length;
+  if (n === 0) return 0;
+  if (targetByte <= map[0]) return 0;
+  if (targetByte > map[n - 1]) return n;
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (map[mid] < targetByte) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function applyCat24Companion(pending: ScanHit[], realHits: ScanHit[]): ScanHit[] {
+  if (pending.length === 0) return [];
+
+  // Bucket by matchedIn. The companion search is per-section (L4: subject and
+  // body evaluated independently).
+  const pendingBody: Array<{ hit: ScanHit; idx: number }> = [];
+  const pendingSubj: Array<{ hit: ScanHit; idx: number }> = [];
+  for (const h of pending) {
+    const idx = parseNormalizedIdxFromSub(h.subCategory);
+    if (idx === null) continue;  // malformed -- drop
+    if (h.matchedIn === 'body') pendingBody.push({ hit: h, idx });
+    else pendingSubj.push({ hit: h, idx });
+  }
+
+  // Pre-compute realHit normalized indices per section.
+  const realBodyIdx: number[] = [];
+  const realSubjIdx: number[] = [];
+  if (currentBodyPP !== null) {
+    for (const r of realHits) {
+      if (r.matchedIn !== 'body') continue;
+      realBodyIdx.push(byteToNormIndex(currentBodyPP.normalizedToOriginalByte, r.evidence.byteStart));
+    }
+  }
+  if (currentSubjectPP !== null) {
+    for (const r of realHits) {
+      if (r.matchedIn !== 'subject') continue;
+      realSubjIdx.push(byteToNormIndex(currentSubjectPP.normalizedToOriginalByte, r.evidence.byteStart));
+    }
+  }
+
+  function hasCompanionWithin(
+    target: number,
+    realIdx: number[],
+    pendingIdx: ReadonlyArray<{ idx: number }>,
+  ): boolean {
+    for (const r of realIdx) {
+      if (Math.abs(r - target) <= CAT24_WINDOW) return true;
+    }
+    for (const p of pendingIdx) {
+      if (p.idx === target) continue;  // skip self
+      if (Math.abs(p.idx - target) <= CAT24_WINDOW) return true;
+    }
+    return false;
+  }
+
+  const promoted: ScanHit[] = [];
+  for (const p of pendingBody) {
+    if (hasCompanionWithin(p.idx, realBodyIdx, pendingBody)) promoted.push(p.hit);
+  }
+  for (const p of pendingSubj) {
+    if (hasCompanionWithin(p.idx, realSubjIdx, pendingSubj)) promoted.push(p.hit);
+  }
+
+  // Cap enforcement -- sum of promoted weights <= currentPolicyCap.
+  // All cat-2.4 hits share the per-keyword weight; drop tail-first.
+  let total = 0;
+  const capped: ScanHit[] = [];
+  for (const h of promoted) {
+    if (total + h.weight > currentPolicyCap) break;
+    capped.push(h);
+    total += h.weight;
+  }
+  return capped;
+}
+
+// Install the hook so scanOutbound's main loop (FROZEN) sees the real body.
+_setCat24CompanionHook(applyCat24Companion);
+
+// Run registration at module load. Production startup, dist bundle init, and
+// every `import './outbound-scan.js'` statement get the 6 detectors auto-
+// registered. Tests reset via _resetForTests() then re-populate via
+// _reregisterAllDetectors() if they want the full registry.
+_reregisterAllDetectors();
 
 // -- REDACTED-MATCH logging helper (D15, L2) ----------------------
 
@@ -214,6 +385,15 @@ export function scanOutbound(input: { body: string; subject?: string }): ScanRes
   const ppBody = preprocess(body);
   const ppSubject = subject.length > 0 ? preprocess(subject) : null;
 
+  // 02-02-08: capture state for the cat-2.4 companion hook. The hook signature
+  // (LOCKED per Patch 2) is (pending, realHits) => ScanHit[]; the hook needs
+  // the PreprocessResult to translate real-hit byte offsets to normalized
+  // indices, and the policy cap to enforce the per-scan ceiling. Module-locals
+  // are race-free because scanOutbound is pure-sync (D4).
+  currentBodyPP = ppBody;
+  currentSubjectPP = ppSubject;
+  currentPolicyCap = policy.weights.outbound_keyword_cap;
+
   const realHits: ScanHit[] = [];
   const pendingCat24: ScanHit[] = [];   // credentials_fuzzy (cat 2.4) accumulator
 
@@ -262,4 +442,9 @@ export function _resetForTests(): void {
   // Reset hook stubs to 02-01 defaults.
   applyCat24CompanionCheck = (pending, _realHits) => pending;
   applyComposite = (hits) => ({ totalScore: Math.min(100, hits.reduce((s, h) => s + h.weight, 0)) });
+  // 02-02-08: clear cat-2.4 hook state to defaults so a fresh test cannot see
+  // stale PreprocessResult / cap from a previous scanOutbound call.
+  currentBodyPP = null;
+  currentSubjectPP = null;
+  currentPolicyCap = 40;
 }
