@@ -143,6 +143,18 @@ export function generateCode(
     riskTier?: RiskTier;
     reasons?: RiskReason[];
     score?: number;
+    // REV 3 WR-06: optional riskFingerprint for block-tier stderr. Phase 5
+    // callers do NOT have this -- the block-tier stderr emits a
+    // <RISK_FINGERPRINT> placeholder and the operator obtains the real
+    // value from the Phase 6 audit / dry_run output. Phase 6 callers wire
+    // computeRiskFingerprint(action, params, score) into this opt so the
+    // operator sees the exact riskFingerprint that consumeOverrideToken
+    // will look up. The previous behavior (embedding `fingerprint` --
+    // which is actionFingerprint) caused a latent UX failure: operator
+    // copy-pastes actionFingerprint into --high-risk-send, mint binds to
+    // actionFingerprint, Phase 6 consume looks up by riskFingerprint and
+    // MISSES with reason='unknown'.
+    riskFingerprint?: string;
   },
 ): {
   code: string | null;
@@ -153,6 +165,7 @@ export function generateCode(
   const tier: RiskTier = opts?.riskTier ?? 'low';
   const reasons: RiskReason[] = opts?.reasons ?? [];
   const explicitScore: number | undefined = opts?.score;
+  const riskFingerprintOpt: string | undefined = opts?.riskFingerprint;
   const now = Date.now();
   reap(now);
 
@@ -175,9 +188,17 @@ export function generateCode(
       risk_reasons: reasons.map(r => r.signal),
       risk_tier: 'block',
     });
+    // REV 3 WR-06: emit riskFingerprint when caller supplied one (Phase 6
+    // send-pipeline wiring); otherwise emit a <RISK_FINGERPRINT> placeholder
+    // (Phase 5 callers, which do not yet have a riskFingerprint available).
+    // The earlier behavior of embedding `fingerprint` (actionFingerprint) was
+    // a latent UX failure: copy-pasting it into --high-risk-send would mint
+    // a record bound to actionFingerprint, while Phase 6 consume looks up by
+    // riskFingerprint -> reason='unknown'. See SUMMARY follow-up section.
+    const riskFpForStderr = riskFingerprintOpt ?? '<RISK_FINGERPRINT>';
     process.stderr.write(
       '[yandex-mail-mcp] risk_block: send refused. Run\n' +
-      '  yandex-mail-mcp-trust --high-risk-send=' + fingerprint + '\n' +
+      '  yandex-mail-mcp-trust --high-risk-send=' + riskFpForStderr + '\n' +
       '  to mint a single-use override token (TTL 30 min).\n' +
       '[yandex-mail-mcp] risk signals: ' + reasons.map(r => r.signal).join(', ') + '\n'
     );

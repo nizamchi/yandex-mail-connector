@@ -312,6 +312,56 @@ test('T-CONF-BLOCK-NO-CODE-01: block tier returns code=null + denied audit + ris
   }
 });
 
+test('T-CONF-BLOCK-FINGERPRINT-01: block-tier stderr embeds opts.riskFingerprint when supplied, <RISK_FINGERPRINT> placeholder otherwise (REV 3 WR-06)', async () => {
+  const restoreEnv = snapshotEnv();
+  const { stateDir, auditPath } = makeSandbox();
+  process.env.YANDEX_STATE_DIR = stateDir;
+  process.env.YANDEX_AUDIT_LOG = auditPath;
+
+  // PATH 1: riskFingerprint supplied -> stderr embeds the exact value.
+  resetAll();
+  const cap1 = captureStderr();
+  try {
+    const fp = actionFingerprint('send', { to: ['a@x.com'] });
+    const reasons = [fakeReason('api_key_pattern', 75, 'sk-... found')];
+    const result = generateCode(fp, {
+      riskTier: 'block',
+      reasons,
+      riskFingerprint: 'abc123',
+    });
+    cap1.restore();
+    const stderr = cap1.text();
+    assert.equal(result.code, null);
+    assert.match(stderr, /--high-risk-send=abc123/);
+    assert.ok(!stderr.includes('<RISK_FINGERPRINT>'), 'placeholder must NOT appear when riskFingerprint is supplied');
+    // The actionFingerprint MUST NOT leak into the stderr (this was the WR-06
+    // latent UX failure).
+    assert.ok(!stderr.includes('--high-risk-send=' + fp), 'actionFingerprint must NOT appear in --high-risk-send line');
+  } finally {
+    cap1.restore();
+  }
+
+  // PATH 2: no riskFingerprint -> stderr embeds the <RISK_FINGERPRINT> placeholder.
+  resetAll();
+  fs.rmSync(auditPath, { force: true });
+  const cap2 = captureStderr();
+  try {
+    const fp = actionFingerprint('send', { to: ['a@x.com'] });
+    const reasons = [fakeReason('api_key_pattern', 75, 'sk-... found')];
+    const result = generateCode(fp, { riskTier: 'block', reasons });
+    cap2.restore();
+    const stderr = cap2.text();
+    assert.equal(result.code, null);
+    assert.match(stderr, /--high-risk-send=<RISK_FINGERPRINT>/);
+    // The actionFingerprint MUST NOT leak into the stderr.
+    assert.ok(!stderr.includes('--high-risk-send=' + fp), 'actionFingerprint must NOT appear in --high-risk-send line');
+  } finally {
+    cap2.restore();
+    restoreEnv();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test('T-CONF-DRYRUN-TIER-01: result.tier round-trips for all 4 tiers', async () => {
   const restoreEnv = snapshotEnv();
   const { stateDir, auditPath } = makeSandbox();
