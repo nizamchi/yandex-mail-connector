@@ -30,6 +30,7 @@ import { auditLog, auditLogAction, EMAIL_ACTIONS, subjectHash } from './audit.js
 import { enforceSendGuards, recordSend, isAdvisory, is2FASender, isProtectedFolder, type GuardResult } from './guards.js';
 import { normalizeRecipients, validateNoSmuggling } from './recipients.js';
 import * as provenance from './provenance.js';
+import { sendEmailBaseSchema } from './send-schemas.js';
 
 // Domain extraction helper used by guard audit records (D-RECIP-DOMAINS: never
 // log raw recipient addresses; domains-only for forensics correlation).
@@ -306,31 +307,13 @@ const trustAddressSchema = z.object({
   trust_token: z.string().length(64),
 }).strict();
 
-// Note: send_email schema uses .refine() which returns ZodEffects, not ZodObject.
-// SDK requires the inputSchema field be a ZodObject (or its plain shape). We pass
-// the underlying object schema to the SDK and re-run .refine() inside the handler
-// to preserve the cross-field validation message.
-// B-1 fix: per-array refinements reject smuggled multi-address entries at
-// the schema boundary. validateNoSmuggling() parses each element through
-// nodemailer's addressparser and returns a non-null reason iff any element
-// resolves to >1 address. Defence in depth -- handler also normalizes.
-const noSmugglingRefiner = (arr: string[] | undefined): boolean => validateNoSmuggling(arr) === null;
-const sendEmailBaseSchema = z.object({
-  to:                 z.array(z.string()).min(1).refine(noSmugglingRefiner, { message: 'to: comma-smuggling rejected -- one address per entry' }),
-  cc:                 z.array(z.string()).optional().refine(noSmugglingRefiner, { message: 'cc: comma-smuggling rejected -- one address per entry' }),
-  bcc:                z.array(z.string()).optional().refine(noSmugglingRefiner, { message: 'bcc: comma-smuggling rejected -- one address per entry' }),
-  subject:            z.string().min(1),
-  text:               z.string().optional(),
-  html:               z.string().optional(),
-  reply_to:           z.string().optional(),
-  in_reply_to:        z.string().optional(),
-  references:         z.array(z.string()).optional(),
-  // Phase 4: confirmation gate. confirmation_token is the 6-digit code the user
-  // saw out-of-band (elicit dialog, stderr, or OS toast). dry_run returns a
-  // SendPlan without touching SMTP.
-  confirmation_token: z.string().regex(/^\d{6}$/).optional(),
-  dry_run:            z.boolean().optional().default(false),
-}).strict();
+// Note: sendEmailBaseSchema lives in src/send-schemas.ts (Phase 6 B-3/B-7) so
+// both tools.ts and send-pipeline.ts can import the canonical schema without
+// creating a cycle. The schema includes B-1 per-array refinements + Phase 6
+// override_token field. validateNoSmuggling is still imported above for
+// handler-internal defense-in-depth, but the schema-side refiner is owned by
+// send-schemas.ts.
+void validateNoSmuggling;
 const markEmailBaseSchema = z.object({
   folder:  z.string().default('INBOX'),
   uid:     z.number().int().positive(),

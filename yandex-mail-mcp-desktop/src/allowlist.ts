@@ -1,5 +1,13 @@
 // allowlist.ts — TOFU (trust-on-first-use) recipient allowlist with HMAC signing.
 //
+// Phase 6 (D9-D13): AllowlistEntry now carries trust metadata fields
+//   { added: number; lastUsed: number; useCount: number }
+// HMAC over canonicalStringify covers them automatically (no signing-code
+// change needed). Migration of legacy files (entries without the 3 numeric
+// fields) happens on loadAllowlist() -- one-shot, idempotent on subsequent
+// loads. Session-scope entries are NOT mutated by bumpUseCount* (D13); they
+// always surface useCount=0 via getTrustEntry (CONTEXT amendment H-2).
+//
 // Closes T-INT-03 (BCC exfil via prompt injection) and T-PI exfil routes by
 // gating every outbound recipient against a permanent file-backed allowlist.
 // The file is HMAC-SHA256 signed against a per-install secret (secret.bin in
@@ -39,13 +47,24 @@ import { auditLog } from './audit.js';
 // ── Types ──────────────────────────────────────────────────
 
 export type AllowlistScope = 'permanent' | 'session' | 'auto';
-export type AllowlistSource = 'sent_history' | 'user_trust_token' | 'auto_trust_reply';
+export type AllowlistSource =
+  | 'sent_history'
+  | 'user_trust_token'
+  | 'auto_trust_reply'
+  | 'legacy_migration';
 
 export interface AllowlistEntry {
   address: string;
   scope: AllowlistScope;
   source: AllowlistSource;
   added_at: string;
+  // -- Phase 6 (PMLF-TRUST-META-01): trust metadata fields. --
+  // added/lastUsed are ms epoch (consistency with risk-score.ts:trustAddedAtMs).
+  // useCount increments on successful sends via bumpUseCountBatch (D13 + H-1).
+  // canonicalStringify sorts keys -- HMAC covers these automatically.
+  added: number;
+  lastUsed: number;
+  useCount: number;
 }
 
 interface AllowlistFile {
@@ -305,11 +324,15 @@ export function addTrusted(address: string, scope: AllowlistScope, source: Allow
   }
   const existing = file.entries.find(e => e.address === target);
   if (existing) return;
+  const nowMs = Date.now();
   file.entries.push({
     address: target,
     scope,
     source,
-    added_at: new Date().toISOString(),
+    added_at: new Date(nowMs).toISOString(),
+    added: nowMs,
+    lastUsed: nowMs,
+    useCount: 0,
   });
   const secret = loadSecret();
   file.signature = computeSignature(file, secret);
@@ -469,7 +492,8 @@ export async function bootstrap(
     if (addrs.size > MAX_RAW) break;
   }
 
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   const existingSet = new Set(file.entries.map(e => e.address));
   let added = 0;
   for (const a of addrs) {
@@ -479,6 +503,9 @@ export async function bootstrap(
       scope: 'permanent',
       source: 'sent_history',
       added_at: now,
+      added: nowMs,
+      lastUsed: nowMs,
+      useCount: 0,
     });
     added++;
   }
