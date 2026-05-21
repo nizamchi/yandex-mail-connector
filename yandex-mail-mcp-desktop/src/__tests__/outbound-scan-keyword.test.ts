@@ -262,6 +262,42 @@ test('T-DS-BASE64-SKIP-001 (CRITICAL Patch 11): AKIA-prefixed base64 blob -> 1 a
   } finally { cleanupTmpStateDir(dir); }
 });
 
+test('T-DS-BASE64-MALFORMED-001 (WR-02 Patch 11 tightening): AKIA-prefix + malformed AWS suffix -> >=1 base64_blob, 0 api_key_pattern', () => {
+  const dir = mkTmpStateDir();
+  try {
+    // Build a high-entropy base64-shape blob that STARTS with AKIA but
+    // whose bytes 4..10 contain LOWERCASE chars ('invalid'), breaking
+    // the AWS shape \bAKIA[0-9A-Z]{16}\b which requires uppercase+digits
+    // only after the AKIA prefix. The OLD looksLikeKnownVendor
+    // (prefix-only VENDOR_PREFIX_RE) saw "AKIA" and suppressed the blob;
+    // the NEW form cross-checks VENDOR_PATTERNS and sees no AWS hit,
+    // so base64_blob fires.
+    //
+    // Padding uses the full base64 alphabet so the blob clears the
+    // Shannon entropy floor (BASE64_ENTROPY_FLOOR=4.5). The trick is:
+    //   * Position 0..3 = 'AKIA' (triggers OLD prefix-only suppression)
+    //   * Position 4..10 = 'invalid' (lowercase -> AWS \bAKIA[0-9A-Z]{16}\b FAILS)
+    //   * Position 11+ = high-entropy base64 padding (entropy gate clears)
+    // Under the FIXED looksLikeKnownVendor (full VENDOR_PATTERNS scan),
+    // no vendor regex matches; base64_blob emits as expected.
+    const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const padding = alpha.repeat(3);                            // 186 chars
+    const malformed = 'AK' + 'IA' + 'invalid' + padding;        // 197 chars total
+    const body = `Suspicious blob attached: ${malformed} please review.`;
+    const r = scanOutbound({ body });
+    const api = r.hits.filter(h =>
+      h.category === 'api_key_pattern' && h.subCategory === 'aws_access_key');
+    const base64 = r.hits.filter(h =>
+      h.category === 'data_shape_anomaly' && h.subCategory === 'base64_blob');
+    // The base64_blob detector MUST fire: WR-02 closes the silent-drop gap.
+    assert.ok(base64.length >= 1,
+      `WR-02: malformed AKIA-prefix base64 must produce >=1 base64_blob hit (no silent drop); got ${base64.length}`);
+    // And the AWS structural detector MUST NOT fire on this malformed shape.
+    assert.equal(api.length, 0,
+      `WR-02 control: malformed AKIA suffix must NOT produce aws_access_key; got ${api.length}`);
+  } finally { cleanupTmpStateDir(dir); }
+});
+
 // -- T-PII: demographic-pii (cat 2.11) -------------------------------
 
 test('T-PII-FLOOR-001 (D14): lone phone -> ru_phone weight 10', () => {

@@ -37,6 +37,7 @@
 import type { DetectorContext, DetectorFn, ScanHit } from '../../outbound-scan.js';
 import { emitRedactedMatch } from '../../outbound-scan.js';
 import { hasMixedScriptCyrillicLatin, MAX_HOMOGLYPH_HITS } from '../homoglyph-table.js';
+import { VENDOR_PATTERNS } from './structural-secrets.js';
 
 // Regexes -- all bounded, no nested unbounded quantifiers.
 
@@ -64,16 +65,38 @@ const HEX_BLOB_RE = /\b[0-9a-fA-F]{64,}\b/g;
 // data:image inline payload preamble -- strip before base64 scan.
 const DATA_IMAGE_RE = /\bdata:[a-z]+\/[a-z0-9+.\-]+;base64,[A-Za-z0-9+/=]{16,}/gi;
 
-// Known vendor prefixes (subset; matches the entries in
-// structural-secrets.ts that share a base64-shape with non-vendor random
-// blobs). We deliberately keep this in sync by spec rather than by import
-// to avoid coupling -- T-DS-BASE64-SKIP-001 + V-prefix tests validate the
-// behaviour, and additions to structural-secrets.ts only need a single new
-// entry here if the prefix collides with a base64-shape window.
-const VENDOR_PREFIX_RE = /^(?:A[KI](?:IA|za)|gh[opurs]_|github_pat_|gl[ph]at-|sk-[a-z]+|sk_live_|pk_live_|rk_live_|xox[abprs]-|S[GK][.]?|AC[a-fA-F0-9]|key-|sh[a-z]{3}_|EAAA|A21AA|y0_|t1\.|ey[A-Za-z0-9]|MII[A-Za-z]|do[op]_v1_|postgres:\/\/|mysql:\/\/|mongodb:\/\/|redis:\/\/)/;
-
+// WR-02 (Patch 11 tightening): looksLikeKnownVendor must suppress
+// base64_blob ONLY when the candidate would ACTUALLY fire a structural
+// vendor regex -- not when it merely shares a prefix with one. The
+// previous VENDOR_PREFIX_RE form was a hand-curated subset of vendor
+// prefixes; an AKIA-prefixed blob whose suffix did NOT satisfy the AWS
+// shape (\bAKIA[0-9A-Z]{16}\b) was silently dropped by BOTH detectors:
+//   * api_key_pattern: full regex fails -> no hit
+//   * base64_blob: prefix match passes -> suppressed by Patch 11
+// Net: zero hits on a 100+ char base64 blob with a malformed vendor
+// prefix. Attacker can deliberately craft AKIA + lowercase suffix to
+// evade detection.
+//
+// Fix: cross-check the candidate against the SAME VENDOR_PATTERNS table
+// the structural detector uses. Suppress base64_blob only if at least
+// one vendor regex actually matches the candidate -- i.e. only when the
+// structural detector WOULD emit a hit on this string. This eliminates
+// the over-suppression gap while preserving the anti-double-count
+// invariant T-DS-BASE64-SKIP-001 (a real AWS-shape AKIA still skips).
+//
+// VENDOR_PATTERNS regexes are /g-flagged; we MUST reset lastIndex before
+// each call to .test() since these are the SAME RegExp objects shared
+// with the structural detector. Empirical note: structural-secrets.ts
+// also resets lastIndex defensively before each pass, so this is safe.
 function looksLikeKnownVendor(text: string): boolean {
-  return VENDOR_PREFIX_RE.test(text);
+  for (const v of VENDOR_PATTERNS) {
+    v.pattern.lastIndex = 0;
+    if (v.pattern.test(text)) {
+      v.pattern.lastIndex = 0;
+      return true;
+    }
+  }
+  return false;
 }
 
 // Shannon entropy in bits per character (range 0..log2(64) for base64).
