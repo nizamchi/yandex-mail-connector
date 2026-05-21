@@ -150,6 +150,52 @@ test('T-COMP-XCAT-002: classified_marking MAX-not-sum is honoured at composite',
   assert.equal(r.totalScore, 60, `MAX-not-sum: expected 60, got ${r.totalScore}`);
 });
 
+test('T-COMP-LEAK-001 (WR-01 defence-in-depth): a leaked exfil_phrase hit (non-multiplier subCategory) MUST NOT count toward the +10 cross-category bonus', () => {
+  // Simulate a hypothetical Patch-12 contract drift: an exfil_phrase hit
+  // bypasses Step 1's multiplier-stripping (e.g. subCategory is missing or
+  // set to something other than 'multiplier'). The composite layer's WR-01
+  // guard must EXCLUDE such categories from the distinct-category tally so
+  // the +10 cross-cat bonus is computed from 3 real categories, NOT 4.
+  const hits: ScanHit[] = [
+    mkHit('payment_card', 10, 0),
+    mkHit('govt_id', 10, 100),
+    mkHit('demographic_pii', 10, 200),
+    // Synthetic leak: exfil_phrase with NO 'multiplier' subCategory.
+    // Step 1 only strips on subCategory === 'multiplier', so this hit lands
+    // in realHits and would inflate distinctCategories from 3 -> 4 without
+    // the WR-01 guard. weight=10 also inflates baseScore by +10 if classed
+    // as a real category -- we measure only the cross-cat bonus here, but
+    // assert total <= 50 to catch baseScore inflation too.
+    mkHit('exfil_phrase', 10, 300, 'leaked_non_multiplier'),
+  ];
+  const r = composeFinalScore(hits);
+  // Without WR-01 guard: 4 cats -> baseScore 40 + crossBonus 10 = 50.
+  // With WR-01 guard: 3 real cats counted; crossBonus still fires (>=3).
+  //   baseScore includes the leaked exfil_phrase weight (10) because Step 2
+  //   does not filter it -- that's intentional: WR-01 fixes the cross-cat
+  //   bonus inflation specifically, not baseScore. So total = 40 + 10 = 50.
+  // The diagnostic value of this test is: changing distinctCategories from
+  // 4 to 3 keeps total == 50 (cross-cat still fires because >=3 reals);
+  // dropping the leaked exfil entirely would yield 30 + 10 = 40.
+  // We assert the guarded behaviour: bonus computed from REAL cats only.
+  assert.ok(r.totalScore <= 50,
+    `WR-01: leaked exfil must not inflate score (expected <=50, got ${r.totalScore})`);
+  // Tighter assertion: the leaked exfil_phrase category MUST NOT appear in
+  // the distinct-cat tally. We verify by constructing a parallel scenario
+  // with ONLY 2 real cats + 1 leaked exfil; cross-cat must NOT fire.
+  const hits2: ScanHit[] = [
+    mkHit('payment_card', 10, 0),
+    mkHit('govt_id', 10, 100),
+    mkHit('exfil_phrase', 10, 200, 'leaked_non_multiplier'),
+  ];
+  const r2 = composeFinalScore(hits2);
+  // 2 real cats + 1 leaked exfil. Without WR-01 guard: cross-cat fires
+  // (counts as 3) -> 30 + 10 = 40. With WR-01 guard: cross-cat does NOT
+  // fire (only 2 real cats) -> 30 baseScore total.
+  assert.equal(r2.totalScore, 30,
+    `WR-01: 2 real cats + 1 leaked exfil must NOT trigger cross-cat (+10); got ${r2.totalScore}`);
+});
+
 // -- Integration sweep -----------------------------------------------
 
 test('T-INTEG-BENIGN-001: benign ~2 KB email -> totalScore <= 5', () => {

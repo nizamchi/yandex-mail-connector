@@ -47,6 +47,19 @@ const COMPANION_FRACTION = 0.25;     // 25% of real-hit weight per companion
 const DIMINISHING_RETURNS = 0.5;     // 2nd+ hit weight multiplier
 const PER_CATEGORY_CAP_FACTOR = 1.5; // cap at 1.5x w1
 
+// WR-01 defence-in-depth: categories that MUST NEVER appear in finalHits.
+// Patch 12 already strips exfil_phrase multiplier markers via the Step 1
+// subCategory==='multiplier' split, but a future drift -- e.g. a detector
+// emitting an exfil_phrase hit without subCategory='multiplier', or a Phase
+// 4 pre-composite injection bug -- would let that hit count as a distinct
+// real category and trigger the +10 cross-category bonus. We filter the
+// distinct-category set against this exclusion list so the bonus is robust
+// against detector-author drift, not just trusting Step 1 to be the only
+// guard.
+const SHOULD_NEVER_REACH_FINAL_HITS: ReadonlySet<string> = new Set([
+  'exfil_phrase',
+]);
+
 export function composeFinalScore(hits: ScanHit[]): CompositeResult {
   // Step 1: separate multiplier markers from real hits.
   const multipliers: ScanHit[] = [];
@@ -115,7 +128,27 @@ export function composeFinalScore(hits: ScanHit[]): CompositeResult {
   }
 
   // Step 4: cross-category bonus (+10 when >= 3 distinct real categories fire).
-  const distinctCategories = byCategory.size;
+  // WR-01 defence-in-depth: exclude SHOULD_NEVER_REACH_FINAL_HITS categories
+  // from the distinct-category count. Step 1 already strips multiplier
+  // markers via subCategory==='multiplier', but if a future bug ever lets an
+  // exfil_phrase hit leak through Step 1 (e.g. emitted without the multiplier
+  // subCategory), this guard keeps the +10 bonus computed from REAL
+  // categories only.
+  let distinctCategories = 0;
+  for (const cat of byCategory.keys()) {
+    if (!SHOULD_NEVER_REACH_FINAL_HITS.has(cat)) distinctCategories++;
+  }
+  if (process.env.YANDEX_SCAN_DEBUG === '1') {
+    let leaked = 0;
+    for (const h of realHits) {
+      if (SHOULD_NEVER_REACH_FINAL_HITS.has(h.category)) leaked++;
+    }
+    if (leaked > 0) {
+      process.stderr.write(
+        `[composite-scoring] WARN: ${leaked} stripped-category hit(s) leaked into realHits (expected 0 -- Patch 12 contract drift)\n`,
+      );
+    }
+  }
   const crossBonus = distinctCategories >= CROSS_CATEGORY_THRESHOLD ? CROSS_CATEGORY_BONUS : 0;
 
   // Step 5: sum + NaN/Infinity guard + clamp + round.
