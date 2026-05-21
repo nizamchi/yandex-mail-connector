@@ -58,6 +58,7 @@ import {
 } from './confirm.js';
 import { scanOutbound as runScan } from './outbound-scan.js';
 import { computeRiskScore } from './risk-score.js';
+import { loadPolicy as _loadPolicy } from './policy.js';
 import {
   riskFingerprint,
   consumeOverrideToken,
@@ -449,6 +450,13 @@ export const checkAllowlist: Stage = async (ctx) => {
 
 // Calls outbound-scan.scanOutbound on body+subject. Adds ctx.scanResult.
 export const scanOutbound: Stage = async (ctx) => {
+  // Phase 6 integration: scan + risk depend on policy.getPolicy(); in
+  // production index.ts calls loadPolicy() at startup. For test contexts
+  // that bypass index.ts (e.g. v2.0.0 H-2 ordering tests) we lazy-load
+  // here so the pipeline is self-sufficient. Idempotent: loadPolicy is
+  // a no-op after the first call.
+  try { _loadPolicy(); } catch { /* best-effort -- if policy load throws,
+    the scan/risk error will surface with a clearer message downstream. */ }
   const inp = ctx.input!;
   const result = runScan({
     body:    bodyText(inp),
@@ -531,6 +539,26 @@ export const riskAdaptiveConfirm: Stage = async (ctx) => {
   const fp = ctx.actionFingerprint!;
   const rfp = ctx.riskFingerprint!;
   if (r.tier === 'low') {
+    // v2.0.0 parity (T-H2-07): if the agent supplied a confirmation_token at
+    // low tier (e.g. they minted one out-of-band, or are replaying a previously
+    // minted token), we still burn it via stage 9.1 verifyCode. This preserves
+    // the v2.0.0 "every supplied token is burned" contract that several v2.0.0
+    // regression tests rely on. The silent-pass property of Phase 5 D8 still
+    // holds for the COMMON case (no token supplied at low tier).
+    if (inp.confirmation_token !== undefined) {
+      return {
+        kind: 'pass',
+        ctx: {
+          ...ctx,
+          confirmation: {
+            tier: 'low',
+            score: r.score,
+            reasons: r.reasons,
+            code: inp.confirmation_token,
+          },
+        },
+      };
+    }
     return { kind: 'pass', ctx };
   }
   if (r.tier === 'medium' || r.tier === 'high') {

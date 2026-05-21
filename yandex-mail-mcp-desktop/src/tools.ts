@@ -31,6 +31,11 @@ import { enforceSendGuards, recordSend, isAdvisory, is2FASender, isProtectedFold
 import { normalizeRecipients, validateNoSmuggling } from './recipients.js';
 import * as provenance from './provenance.js';
 import { sendEmailBaseSchema } from './send-schemas.js';
+import {
+  runPipeline,
+  type SendContext,
+  type PipelineResult,
+} from './send-pipeline.js';
 
 // Domain extraction helper used by guard audit records (D-RECIP-DOMAINS: never
 // log raw recipient addresses; domains-only for forensics correlation).
@@ -485,6 +490,154 @@ async function tryNotify(title: string, message: string): Promise<void> {
   } catch { /* opportunistic -- never block on absence */ }
 }
 
+// ── Phase 6 driver helpers (D4) -- keep handler body <= 60 LOC ────────
+
+function renderDryRunPlan(p: ParsedSendParams, _ctx: ToolCtx): HandlerResult {
+  const toNorm  = normalizeRecipients(p.to);
+  const ccNorm  = normalizeRecipients(p.cc);
+  const bccNorm = normalizeRecipients(p.bcc);
+  const payload: Record<string, unknown> = {
+    to: toNorm.normalized,
+    subject: p.subject,
+  };
+  if (ccNorm.normalized.length > 0)  payload.cc  = ccNorm.normalized;
+  if (bccNorm.normalized.length > 0) payload.bcc = bccNorm.normalized;
+  if (p.text !== undefined)        payload.text        = p.text;
+  if (p.html !== undefined)        payload.html        = p.html;
+  if (p.reply_to !== undefined)    payload.reply_to    = p.reply_to;
+  if (p.in_reply_to !== undefined) payload.in_reply_to = p.in_reply_to;
+  if (p.references !== undefined)  payload.references  = p.references;
+  const fp = actionFingerprint('send', payload);
+  const guardPayload = {
+    to: toNorm.normalized,
+    cc:  ccNorm.normalized.length  > 0 ? ccNorm.normalized  : undefined,
+    bcc: bccNorm.normalized.length > 0 ? bccNorm.normalized : undefined,
+  };
+  const guardVerdict = enforceSendGuards(guardPayload, _ctx.authLevel, fp);
+  const plan = buildSendPlan(p, fp, guardVerdict);
+  return {
+    content: [{ type: 'text', text: JSON.stringify(plan, null, 2) }],
+    structuredContent: plan as unknown as Record<string, unknown>,
+    isError: false,
+    _audit: {
+      recipients: p.to.map(a => a.split('@')[1] ?? a),
+      subject_hash: subjectHash(p.subject),
+      body_length: (p.text ?? p.html ?? '').length,
+      message_id: '<dry-run-no-message-id>',
+    },
+  };
+}
+
+async function renderPipelineResult(
+  result: PipelineResult,
+  ctx: ToolCtx,
+  rawParams: unknown,
+): Promise<HandlerResult> {
+  if (result.kind === 'success') {
+    const r = result.ctx.sendResult!;
+    const inp = result.ctx.input!;
+    const text = r.success
+      ? `Письмо отправлено. Message-ID: ${r.messageId ?? 'n/a'}`
+      : `Ошибка отправки: ${r.error}`;
+    return {
+      content: [{ type: 'text', text }],
+      structuredContent: r,
+      _audit: {
+        recipients: inp.to.map(a => a.split('@')[1] ?? a),
+        subject_hash: subjectHash(inp.subject),
+        body_length: (inp.text ?? inp.html ?? '').length,
+        message_id: r.messageId && r.messageId.length > 0
+          ? r.messageId
+          : '<send-failed-no-message-id>',
+      },
+    };
+  }
+  if (result.kind === 'block') {
+    const inp = result.ctx.input;
+    const reasonText = result.audit.reason ?? result.reason;
+    return {
+      content: [{ type: 'text', text: 'Send blocked: ' + reasonText }],
+      isError: true,
+      _audit: {
+        recipients: inp?.to.map(a => a.split('@')[1] ?? a) ?? [],
+        subject_hash: inp ? subjectHash(inp.subject) : '',
+        body_length: inp ? (inp.text ?? inp.html ?? '').length : 0,
+        message_id: '<blocked-no-message-id>',
+      },
+    };
+  }
+  // kind === 'pending' -- only confirmation_code is emitted today.
+  if (result.requires.kind !== 'confirmation_code') {
+    return { content: [{ type: 'text', text: 'Pending requirement unsupported' }], isError: true };
+  }
+  const inp = result.ctx.input!;
+  const fp = result.requires.actionFingerprint;
+  const expiresAt = result.requires.expiresAt;
+  if (ctx.serverContext.canElicit && ctx.serverContext.elicit) {
+    // Mint a fresh code (rotates the prior pipeline-minted code for the same fp).
+    const gen = generateCode(fp);
+    process.stderr.write(buildStderrBlock(inp, gen.code ?? '<no-code>'));
+    const sanitizedTo = inp.to.map(x => sanitizeForDisplay(x)).join(', ');
+    const elicitResult = await ctx.serverContext.elicit({
+      message:
+        `Send email?\n` +
+        `To: ${sanitizedTo}\n` +
+        `Subject: ${sanitizeForDisplay(inp.subject)}\n` +
+        `Body preview: ${wrapUntrusted(sanitizeForDisplay(previewBody(inp).first.slice(0, 200)))}`,
+      requestedSchema: {
+        type: 'object',
+        properties: { confirmed: { type: 'boolean', title: 'Send this email?' } },
+        required: ['confirmed'],
+      },
+    });
+    if (elicitResult.action === 'accept' && elicitResult.content?.confirmed === true) {
+      const replayParams = { ...(rawParams as Record<string, unknown>), confirmation_token: gen.code };
+      const replayCtx: SendContext = {
+        rawParams: replayParams,
+        authLevel: ctx.authLevel,
+        nowMs: Date.now(),
+      };
+      const replay = await runPipeline(replayCtx);
+      return renderPipelineResult(replay, ctx, replayParams);
+    }
+    return {
+      ...errorResult(new Error(`send cancelled (elicit action=${elicitResult.action})`)),
+      _audit: {
+        recipients: inp.to.map(a => a.split('@')[1] ?? a),
+        subject_hash: subjectHash(inp.subject),
+        body_length: (inp.text ?? inp.html ?? '').length,
+        message_id: '<blocked-no-message-id>',
+      },
+    };
+  }
+  // Path B: no elicit support. Mint a fresh code, write stderr, OS toast.
+  const gen = generateCode(fp);
+  process.stderr.write(buildStderrBlock(inp, gen.code ?? '<no-code>'));
+  const primary = inp.to[0] ? sanitizeForDisplay(inp.to[0]) : '(unknown)';
+  await tryNotify('yandex-mail-mcp', `Confirm send to ${primary}: ${gen.code ?? ''}`);
+  return {
+    content: [{
+      type: 'text',
+      text:
+        'Confirmation required. Verify the action plan in stderr/notification ' +
+        'and re-call yandex_send_email with confirmation_token=<6-digit code>. ' +
+        'Code expires in 300s.',
+    }],
+    structuredContent: {
+      requires_confirmation: true,
+      action_fingerprint: fp,
+      expires_at: expiresAt,
+    },
+    isError: false,
+    _audit: {
+      recipients: inp.to.map(a => a.split('@')[1] ?? a),
+      subject_hash: subjectHash(inp.subject),
+      body_length: (inp.text ?? inp.html ?? '').length,
+      message_id: '<blocked-no-message-id>',
+    },
+  };
+}
+
 // readonly array + Object.freeze at module bottom keeps the declarative
 // invariant enforceable: runtime mutation of TOOLS would throw in strict
 // mode (which esbuild emits by default). Defence-in-depth against any
@@ -937,325 +1090,32 @@ Args:
     requires: { authLevel: 2 },
     handler: async (params, ctx) => {
       try {
-        const p = sendEmailBaseSchema.parse(params);
-        if (p.text === undefined && p.html === undefined) {
-          throw new Error('Укажите хотя бы одно из полей: text или html');
-        }
-
-        // ── B-1 fix: parser-symmetric recipient normalization ───────
-        // Both the allowlist gate AND the SMTP layer must operate on the SAME
-        // flat, single-address-per-entry arrays. normalizeRecipients() parses
-        // each input through nodemailer's addressparser (the same parser SMTP
-        // delivery uses internally) so the address set the gate checks is
-        // guaranteed identical to the set nodemailer will deliver to. This
-        // closes the comma-smuggling bypass that allowed exfil recipients to
-        // slip past the gate (BLOCKER B-1, T-INT-03).
-        // Schema-layer refinement (sendEmailBaseSchema) rejects multi-address
-        // entries at the boundary; this normalization runs anyway as defence
-        // in depth and as the single source of truth for the rest of the
-        // handler (allowlist, audit, SMTP).
-        const toNorm  = normalizeRecipients(p.to);
-        const ccNorm  = normalizeRecipients(p.cc);
-        const bccNorm = normalizeRecipients(p.bcc);
-        const toFlat  = toNorm.normalized as string[];
-        const ccFlat  = ccNorm.normalized as string[];
-        const bccFlat = bccNorm.normalized as string[];
-
-        // ── Phase 5: Allowlist gate ──────────────────────────────────
-        // Runs BEFORE the dry_run / confirmation_token / SMTP path so that
-        // an untrusted recipient blocks the action immediately -- including
-        // BCC, which is the primary exfil vector (T-INT-03 / T-05-05).
-        // Only enforced at L1+; L0 cannot reach this tool (not registered).
-        if (ctx.authLevel >= 1) {
-          const recipients = [
-            ...toNorm.addresses,
-            ...ccNorm.addresses,
-            ...bccNorm.addresses,
-          ];
-
-          // H-1: in_reply_to auto-trust delegated to allowlist.autoTrustOnReply.
-          // Policy (per MILESTONE-v2.0.0-DEEP-REVIEW.md §H-1):
-          //   - Fires ONLY when findByMessageId resolves the message in the Sent
-          //     folder (prior-correspondence evidence). INBOX-source resolutions
-          //     are attacker-controllable metadata and emit allowlist_skip instead.
-          //   - Elevation is scope='session' -- in-memory only, NOT persisted to
-          //     allowlist.json. Blast radius: one process lifetime.
-          //   - YANDEX_AUTO_TRUST_REPLY=off disables the flow entirely.
-          // Doc-comment contract restored: in_reply_to does NOT bypass the recipient
-          // gate; the elevated entry passes the gate on the same call only when
-          // the user already had Sent-folder evidence of correspondence.
-          if (p.in_reply_to) {
-            try {
-              const found = await imap.findByMessageId(p.in_reply_to);
-              allowlist.autoTrustOnReply(found, {
-                onSkip: (reason) => {
-                  auditLog({
-                    action: 'allowlist_skip',
-                    status: 'denied',
-                    level: 'warn',
-                    ts: new Date().toISOString(),
-                    from_domain: found && found.from ? (found.from.split('@')[1] ?? '(none)') : '(none)',
-                    reason: 'auto_trust_reply,' + reason,
-                  });
-                },
-              });
-            } catch {
-              // Best-effort -- failure to look up the original message must
-              // not crash the send; recipient gate below is the real check.
-            }
+        // Phase 6 (D4): driver shrunk to <=60 LOC. All pipeline logic lives
+        // in send-pipeline.ts (10 stages, FROZEN D3 order). The handler does
+        // exactly four things:
+        //   1. Fork on dry_run -- skip the mutating pipeline, return a SendPlan
+        //      with the guards-pure verdict (Q1/Q2 contract).
+        //   2. Build the initial SendContext frame.
+        //   3. Call runPipeline.
+        //   4. Render the PipelineResult via renderPipelineResult (handles
+        //      elicit dialog re-runs, block / pending / success formatting).
+        // T-PIPE-H2-REORDER-01 (Task 8) is the runtime spy-based assertion of
+        // the H-2 invariant; source-grep tests in send-pipeline-ordering.test.ts
+        // are migrated to the pipeline (see 06-DEVIATIONS.md DEV-01).
+        const peek = sendEmailBaseSchema.safeParse(params);
+        if (peek.success && peek.data.dry_run === true) {
+          if (peek.data.text === undefined && peek.data.html === undefined) {
+            throw new Error('Укажите хотя бы одно из полей: text или html');
           }
-
-          const untrusted = recipients.filter(a => !allowlist.isAllowed(a));
-          if (untrusted.length > 0) {
-            const trusted = recipients.filter(a => allowlist.isAllowed(a));
-            const trustedStr   = trusted.length   ? trusted.map(sanitizeForDisplay).join(', ')   : '(none)';
-            const untrustedStr = untrusted.map(sanitizeForDisplay).join(', ');
-            // D-RECIP-DOMAINS: log DOMAINS only, never raw untrusted addresses
-            // (those are the exfil targets -- logging them verbatim would
-            // defeat the gate's purpose).
-            auditLog({
-              action: 'untrusted_block',
-              status: 'denied',
-              level: 'warn',
-              ts: new Date().toISOString(),
-              recipients: untrusted.map(a => a.split('@')[1] ?? a),
-              reason: 'trusted_count=' + trusted.length + ',level=' + ctx.authLevel,
-            });
-            return {
-              content: [{
-                type: 'text',
-                text:
-                  `Send blocked -- untrusted recipient(s).\n` +
-                  `Trusted (allowed): ${trustedStr}\n` +
-                  `Untrusted (blocked): ${untrustedStr}\n` +
-                  `To trust: npx yandex-mail-mcp-trust <addr>, then call yandex_trust_address.\n` +
-                  `Or send with in_reply_to=<message-id> if replying to existing thread.`,
-              }],
-              isError: true,
-              // Hook-2: blocked send produced no message -- explicit sentinel
-              // keeps the audit schema happy while signalling no real ID.
-              _audit: {
-                recipients: untrusted.map(a => a.split('@')[1] ?? a),
-                message_id: '<blocked-no-message-id>',
-              },
-            };
-          }
+          return renderDryRunPlan(peek.data, ctx);
         }
-
-        // Fingerprint over the SEND payload only -- not over dry_run /
-        // confirmation_token, which are control-plane fields. Strip them
-        // before canonicalization so the same logical send maps to the same fp
-        // whether the agent is in dry_run / token / direct mode.
-        //
-        // B-1 fix: substitute normalized recipient arrays so the fingerprint
-        // is invariant to display-name cosmetics and to whether the agent
-        // packed addresses into one string vs separate entries. dedup now
-        // catches both variants.
-        const {
-          dry_run: _dr,
-          confirmation_token: token,
-          to: _toIgnored, cc: _ccIgnored, bcc: _bccIgnored,
-          ...payloadRest
-        } = p;
-        void _toIgnored; void _ccIgnored; void _bccIgnored;
-        const payload = {
-          ...payloadRest,
-          to: toFlat,
-          ...(ccFlat.length ? { cc: ccFlat } : {}),
-          ...(bccFlat.length ? { bcc: bccFlat } : {}),
+        const initCtx: SendContext = {
+          rawParams: params,
+          authLevel: ctx.authLevel,
+          nowMs: Date.now(),
         };
-        const fp = actionFingerprint('send', payload as unknown as Record<string, unknown>);
-
-        // ── H-2 FIX: pure guards check FIRST ─────────────────
-        // Pipeline order is now
-        //   allowlist -> guards-pure -> [dry_run | verifyCode] -> smtp -> recordSend
-        // enforceSendGuards is pure (no state mutation); recordSend below is
-        // the SOLE state-mutation site, fired only on the success branch. We
-        // run guards BEFORE any code-burn so a guard violation NEVER consumes
-        // a user-approved confirmation token (see
-        // .planning/debug/h2-confirm-burned-before-guards.md).
-        // B-1 fix preserved: guards see the SAME normalized set as the
-        // allowlist gate and the SMTP layer.
-        const guardPayload = { to: toFlat, cc: ccFlat.length ? ccFlat : undefined, bcc: bccFlat.length ? bccFlat : undefined };
-        const guardResult = enforceSendGuards(guardPayload, ctx.authLevel, fp);
-
-        // (1) dry_run -- return SendPlan, NEVER send. Surface guards verdict
-        // (Q1 = yes: always; Q2 = no: never pre-issue a confirmation_token).
-        if (p.dry_run === true) {
-          const plan = buildSendPlan(p, fp, guardResult);
-          return {
-            content: [{ type: 'text', text: JSON.stringify(plan, null, 2) }],
-            structuredContent: plan as unknown as Record<string, unknown>,
-            isError: false,
-            _audit: {
-              recipients: p.to.map(a => a.split('@')[1] ?? a),
-              subject_hash: subjectHash(p.subject),
-              body_length: (p.text ?? p.html ?? '').length,
-              message_id: '<dry-run-no-message-id>',
-            },
-          };
-        }
-
-        // Sentinel _audit for the no-actual-send return paths below
-        // (guard-block, token-wrong, elicit-cancelled, requires-confirmation).
-        // Hook-2 requires message_id on every EMAIL_ACTIONS record; sentinels
-        // keep audit.ts from firing a schema-violation on legitimate gates.
-        const noSendAudit: HandlerAuditExtras = {
-          recipients: p.to.map(a => a.split('@')[1] ?? a),
-          subject_hash: subjectHash(p.subject),
-          body_length: (p.text ?? p.html ?? '').length,
-          message_id: '<blocked-no-message-id>',
-        };
-
-        // (2) guards verdict: hard-block at L1/L2 BEFORE any code burn or
-        // elicit prompt (Q3 = yes); warn-only at L3 advisory and fall through.
-        if (!guardResult.ok) {
-          const recipientDomains = p.to.map(domainOnly);
-          if (isAdvisory(ctx.authLevel)) {
-            // L3 (auto): warn-only, do NOT block. Audit BEFORE the send so the
-            // operator sees the advisory even if the send then errors.
-            auditLog({
-              action: 'yandex_send_email',
-              status: 'denied',
-              level: 'warn',
-              ts: new Date().toISOString(),
-              reason: guardResult.reason + '_L3_advisory',
-              recipients: recipientDomains,
-              from_domain: '(self)',
-            });
-            // fall through to verify/send path
-          } else {
-            // L1/L2: hard block. NOTE: no verifyCode call has happened yet --
-            // any user-supplied confirmation_token remains valid for a fresh
-            // submit once the window clears.
-            auditLog({
-              action: 'yandex_send_email',
-              status: 'denied',
-              level: 'warn',
-              ts: new Date().toISOString(),
-              reason: guardResult.reason,
-              recipients: recipientDomains,
-              from_domain: '(self)',
-            });
-            return {
-              content: [{ type: 'text', text: errorTextFor(guardResult) }],
-              isError: true,
-              _audit: {
-                recipients: recipientDomains,
-                subject_hash: subjectHash(p.subject),
-                body_length: (p.text ?? p.html ?? '').length,
-                message_id: '<blocked-no-message-id>',
-              },
-            };
-          }
-        }
-
-        // (3) confirmation_token provided -- verify and proceed on match.
-        if (token !== undefined) {
-          const v = verifyCode(fp, token);
-          if (v !== true) {
-            return { ...errorResult(new Error(verifyResultToError(v))), _audit: noSendAudit };
-          }
-          // fall through to send path
-        } else {
-          // (4) Neither dry_run nor token. Gate by elicitation capability.
-          // Reached only when guards.ok=true (or L3 advisory fell through);
-          // we never burn a code / surface elicit on a doomed send.
-          if (ctx.serverContext.canElicit && ctx.serverContext.elicit) {
-            // Pre-issue a fallback code so the agent can retry via token path
-            // if the elicit times out or the dialog is dismissed.
-            const { code, expiresAt } = generateCode(fp);
-            const sanitizedTo = p.to.map(x => sanitizeForDisplay(x)).join(', ');
-            const bodyPrev = previewBody(p);
-            const elicitMessage =
-              `Send email?\n` +
-              `To: ${sanitizedTo}\n` +
-              `Subject: ${sanitizeForDisplay(p.subject)}\n` +
-              `Body preview: ${wrapUntrusted(sanitizeForDisplay(bodyPrev.first.slice(0, 200)))}`;
-            // Belt-and-braces: also drop the code into stderr in case the
-            // client renders elicit but the user prefers the token path. Code
-            // is never echoed into MCP content[].
-            process.stderr.write(buildStderrBlock(p, code));
-            void expiresAt; // expiresAt is informational; not surfaced via elicit
-            const result = await ctx.serverContext.elicit({
-              message: elicitMessage,
-              requestedSchema: {
-                type: 'object',
-                properties: {
-                  confirmed: { type: 'boolean', title: 'Send this email?' },
-                },
-                required: ['confirmed'],
-              },
-            });
-            if (result.action === 'accept' && result.content?.confirmed === true) {
-              // M-1 fix: verifyCode return value MUST gate the send. If the elicit
-              // dialog hung past the 5-min TTL the code is 'expired'; if some race
-              // burned it elsewhere it is 'used'; we must not silently fall through
-              // to send under those conditions. Only proceed on `true`.
-              const v = verifyCode(fp, code);
-              if (v !== true) {
-                return { ...errorResult(new Error(`send blocked: confirmation code ${v} (elicit accepted but code no longer valid)`)), _audit: noSendAudit };
-              }
-            } else {
-              return { ...errorResult(new Error(`send cancelled (elicit action=${result.action})`)), _audit: noSendAudit };
-            }
-          } else {
-            // Path B: no elicitation. Issue code, write stderr block, attempt
-            // OS toast, return isError:false with requires_confirmation marker.
-            const { code, expiresAt } = generateCode(fp);
-            process.stderr.write(buildStderrBlock(p, code));
-            const primary = p.to[0] ? sanitizeForDisplay(p.to[0]) : '(unknown)';
-            await tryNotify('yandex-mail-mcp', `Confirm send to ${primary}: ${code}`);
-            return {
-              content: [{
-                type: 'text',
-                text:
-                  'Confirmation required. Verify the action plan in stderr/notification ' +
-                  'and re-call yandex_send_email with confirmation_token=<6-digit code>. ' +
-                  'Code expires in 300s.',
-              }],
-              structuredContent: {
-                requires_confirmation: true,
-                action_fingerprint: fp,
-                expires_at: expiresAt,
-              },
-              isError: false,
-              _audit: noSendAudit,
-            };
-          }
-        }
-
-        // ── Send path ────────────────────────────────────────
-        // B-1 fix: hand the NORMALIZED flat single-address arrays to nodemailer.
-        // Each entry is already exactly one bare address; addressparser on each
-        // entry returns exactly one address, so the gate-vs-SMTP set-equality
-        // invariant holds by construction.
-        const r = await sendEmail(creds(), {
-          to: toFlat,
-          cc: ccFlat.length ? ccFlat : undefined,
-          bcc: bccFlat.length ? bccFlat : undefined,
-          subject: p.subject, text: p.text, html: p.html,
-          replyTo: p.reply_to, inReplyTo: p.in_reply_to, references: p.references,
-        });
-        // Phase 7: recordSend fires ONLY on the success branch (after
-        // sendEmail resolved). Counter / dedup state mutates regardless of L3
-        // advisory pass-through, so subsequent calls see the prior send.
-        if (r.success) {
-          recordSend(guardPayload, fp);
-        }
-        const text = r.success
-          ? `Письмо отправлено. Message-ID: ${r.messageId ?? 'n/a'}`
-          : `Ошибка отправки: ${r.error}`;
-        return {
-          content: [{ type: 'text', text }],
-          structuredContent: r,
-          _audit: {
-            recipients: p.to.map(a => a.split('@')[1] ?? a),
-            subject_hash: subjectHash(p.subject),
-            body_length: (p.text ?? p.html ?? '').length,
-            message_id: r.messageId && r.messageId.length > 0 ? r.messageId : '<send-failed-no-message-id>',
-          },
-        };
+        const result = await runPipeline(initCtx);
+        return await renderPipelineResult(result, ctx, params);
       } catch (e) { return errorResult(e); }
     },
   },

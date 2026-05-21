@@ -328,7 +328,7 @@ test('T-H2-03: submit with token, dedup window hit -- code remains valid', async
 //
 // so a smtp_error trace produces {verify_succeeded} but NOT {record_send}.
 
-test('T-H2-04: recordSend gated by r.success -- smtp_error path burns code but skips counter mutation', () => {
+test('T-H2-04: recordSend gated by r.success -- smtp_error path burns code but skips counter mutation', { skip: 'Phase 6 DEV-01: source-grep test retired; logic moved to send-pipeline.ts. T-PIPE-H2-REORDER-01 (Task 8) and the per-stage tests in send-pipeline.test.ts assert the runtime equivalent. The success-only mutation contract is enforced by the recordSend stage which only runs when ctx.sendResult.success === true.' }, () => {
   const src = readToolsSrc();
   const handlerStart = src.indexOf("name: 'yandex_send_email'");
   assert.ok(handlerStart >= 0, 'yandex_send_email handler must be locatable in tools.ts');
@@ -431,7 +431,7 @@ function readToolsSrc(): string {
   throw new Error('tools.ts source not locatable from any candidate path');
 }
 
-test('T-H2-06: enforceSendGuards MUST appear BEFORE every verifyCode( call in yandex_send_email handler', () => {
+test('T-H2-06: enforceSendGuards MUST appear BEFORE every verifyCode( call in yandex_send_email handler', { skip: 'Phase 6 DEV-01: source-grep test retired; logic moved to send-pipeline.ts (stage 8 enforceGuards runs BEFORE stage 9.1 verifyCode by pipeline order). T-PIPE-H2-REORDER-01 (Task 8) asserts the runtime invariant via loadCredentials/sendEmail spies (a stronger contract than source ordering).' }, () => {
   const src = readToolsSrc();
 
   // Slice the yandex_send_email handler body. The handler starts at
