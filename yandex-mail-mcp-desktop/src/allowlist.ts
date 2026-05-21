@@ -190,7 +190,45 @@ function emptyFile(): AllowlistFile {
   };
 }
 
-export function loadAllowlist(): AllowlistFile {
+// Phase 6 (D10) migration discipline:
+//
+//   loadAllowlist() detects legacy entries (any entry missing one of the 3
+//   numeric metadata fields) and rewrites the file in place with a fresh
+//   HMAC signature. Migration is ONE-SHOT per file -- a second loadAllowlist
+//   sees fully-populated entries and skips migrateInPlace, producing a
+//   byte-equal file on subsequent reads (idempotency contract T-MIG-IDEMP).
+//
+//   Migration is fail-closed: if persist throws (disk error / corrupt
+//   secret), in-memory state is NOT cached. The next call retries from
+//   disk. Surface failure via the existing verifySignature startup gate.
+
+function isLegacyEntry(e: unknown): boolean {
+  if (typeof e !== 'object' || e === null) return true;
+  const o = e as Record<string, unknown>;
+  return !Number.isFinite(o['added'])
+      || !Number.isFinite(o['lastUsed'])
+      || !Number.isFinite(o['useCount']);
+}
+
+function migrateInPlace(file: AllowlistFile): { migratedCount: number; mutated: boolean } {
+  let migratedCount = 0;
+  for (const entry of file.entries) {
+    if (!isLegacyEntry(entry)) continue;
+    // entry has SOME pre-Phase-6 fields populated (address/scope/source/added_at)
+    // but is missing one or more of {added, lastUsed, useCount}.
+    const e = entry as unknown as Record<string, unknown>;
+    const parsed = typeof e['added_at'] === 'string' ? Date.parse(e['added_at'] as string) : NaN;
+    const ts = Number.isFinite(parsed) ? parsed : Date.now();
+    if (!Number.isFinite(e['added']))    e['added']    = ts;
+    if (!Number.isFinite(e['lastUsed'])) e['lastUsed'] = ts;
+    if (!Number.isFinite(e['useCount'])) e['useCount'] = 0;
+    if (e['source'] === undefined || e['source'] === null) e['source'] = 'legacy_migration';
+    migratedCount++;
+  }
+  return { migratedCount, mutated: migratedCount > 0 };
+}
+
+function loadAllowlistRaw(): AllowlistFile {
   const p = allowlistPath();
   if (!fs.existsSync(p)) return emptyFile();
   try {
@@ -212,6 +250,38 @@ export function loadAllowlist(): AllowlistFile {
   }
 }
 
+// Re-entrancy guard: migrateInPlace -> persist -> (future caller) loadAllowlist
+// must not retrigger migration on the same call stack. Per-process flag.
+let _migrationInProgress = false;
+
+export function loadAllowlist(): AllowlistFile {
+  const file = loadAllowlistRaw();
+  if (file.signature === 'corrupt') return file;
+  if (_migrationInProgress) return file;
+  // Phase 6 (D10): one-shot legacy migration on first load.
+  const { migratedCount, mutated } = migrateInPlace(file);
+  if (!mutated) return file;
+  _migrationInProgress = true;
+  try {
+    const secret = loadSecret();
+    file.signature = computeSignature(file, secret);
+    persist(file);
+    auditLog({
+      action: 'allowlist_migrated',
+      status: 'success',
+      level: 'info',
+      ts: new Date(Date.now()).toISOString(),
+      reason: 'count=' + migratedCount + ',source=phase6',
+    });
+  } catch {
+    // Fail-closed: leave on-disk file unchanged; next load retries.
+    // No in-memory cache to invalidate (loadAllowlist reads disk every call).
+  } finally {
+    _migrationInProgress = false;
+  }
+  return file;
+}
+
 function persist(file: AllowlistFile): void {
   atomicWrite(allowlistPath(), JSON.stringify(file, null, 2), 0o600);
 }
@@ -221,8 +291,16 @@ function persist(file: AllowlistFile): void {
 // verifySignature: NEVER throws on bad input. Returns:
 //   true  — fresh state (empty + never bootstrapped) OR signature matches.
 //   false — file exists but signature missing/wrong/corrupt; caller exits.
+//
+// IMPORTANT (Phase 6 D10 + tamper invariant): verifySignature reads the file
+// RAW -- it must NOT trigger migrateInPlace. Migration recomputes the
+// signature; if verify went through loadAllowlist, a tampered file with
+// legacy-shaped entries would be silently re-signed and pass verification.
+// Tamper detection therefore runs on the disk bytes, not on the migrated
+// shape. Migration only runs through loadAllowlist (called by isAllowed,
+// getTrustEntry, bumpUseCountBatch, etc.) AFTER startup verification.
 export function verifySignature(): boolean {
-  const file = loadAllowlist();
+  const file = loadAllowlistRaw();
   if (file.signature === 'corrupt') return false;
   // Fresh state: never bootstrapped, no entries, empty signature → OK.
   if (file.bootstrap_completed_at === null && file.entries.length === 0 && file.signature === '') {
@@ -522,6 +600,128 @@ export async function bootstrap(
     reason: 'count=' + added + ',source=sent_history',
   });
   return added;
+}
+
+// ── Phase 6 trust metadata API (D11/D13 + H-1/H-5) ────────────
+
+// getTrustEntry(address): returns the full AllowlistEntry for a trusted
+// address. Case-insensitive. Consults the session map first (H-1) so
+// auto-trusted session entries surface with scope='session' + useCount=0
+// (CONTEXT amendment H-2: session entries ALWAYS report useCount=0; the
+// "just auto-trusted" signal is timestamp-based, not count-based). Returns
+// undefined for untrusted addresses.
+export function getTrustEntry(address: string): AllowlistEntry | undefined {
+  const target = norm(address);
+  if (!target) return undefined;
+  // 1. Session map first (matches isAllowed's lookup order).
+  const session = sessionEntries.get(target);
+  if (session !== undefined) {
+    const parsed = Date.parse(session.added_at);
+    const ts = Number.isFinite(parsed) ? parsed : Date.now();
+    return {
+      address: target,
+      scope: 'session',
+      source: session.source,
+      added_at: session.added_at,
+      added: ts,
+      lastUsed: ts,
+      useCount: 0,
+    };
+  }
+  // 2. Persisted file (triggers migration if legacy).
+  const file = loadAllowlist();
+  if (file.signature === 'corrupt') return undefined;
+  return file.entries.find(e => e.address === target);
+}
+
+// bumpUseCount(address, nowMs): single-recipient convenience wrapper.
+// Persisted-scope: increments useCount + sets lastUsed, atomic re-sign+persist.
+// Session-scope: no-op (D13). Unknown addresses: no-op.
+// Multi-recipient sends MUST use bumpUseCountBatch (single atomic write).
+export function bumpUseCount(address: string, nowMs: number): void {
+  bumpUseCountBatch([address], nowMs);
+}
+
+// bumpUseCountBatch(addresses, nowMs) -- H-1 atomic mutation:
+//   Single load+sign+write cycle for all addresses. Session-scope entries
+//   are skipped (no disk mutation; D13 + H-2 amendment). Unknown addresses
+//   are silently no-op. Emits ONE summary audit per call (domain-only,
+//   CLAUDE.md privacy). On the all-unknown / all-session path, no audit
+//   fires (no signal worth recording).
+export function bumpUseCountBatch(addresses: readonly string[], nowMs: number): void {
+  if (!addresses || addresses.length === 0) return;
+  const seen = new Set<string>();
+  const normed: string[] = [];
+  for (const a of addresses) {
+    const n = norm(a);
+    if (!n || seen.has(n)) continue;
+    seen.add(n);
+    normed.push(n);
+  }
+  if (normed.length === 0) return;
+
+  const sessionAddrs: string[] = [];
+  const persistedAddrs: string[] = [];
+  for (const n of normed) {
+    if (sessionEntries.has(n)) sessionAddrs.push(n);
+    else persistedAddrs.push(n);
+  }
+
+  if (persistedAddrs.length === 0) return; // pure-session call: no-op, no audit.
+
+  const file = loadAllowlist();
+  if (file.signature === 'corrupt') {
+    throw new Error('bumpUseCountBatch: allowlist file is corrupt -- refusing to mutate.');
+  }
+  const bumpedDomains: string[] = [];
+  let bumped = 0;
+  for (const addr of persistedAddrs) {
+    const entry = file.entries.find(e => e.address === addr);
+    if (!entry) continue; // unknown -- no-op.
+    entry.useCount = (Number.isFinite(entry.useCount) ? entry.useCount : 0) + 1;
+    entry.lastUsed = nowMs;
+    bumped++;
+    const at = addr.indexOf('@');
+    bumpedDomains.push(at >= 0 ? addr.slice(at + 1) : '(none)');
+  }
+  if (bumped === 0) return; // all unknown.
+
+  const secret = loadSecret();
+  file.signature = computeSignature(file, secret);
+  persist(file);
+
+  auditLog({
+    action: 'allowlist_used',
+    status: 'success',
+    level: 'info',
+    ts: new Date(nowMs).toISOString(),
+    from_domain: bumpedDomains[0] ?? '(none)',
+    reason: 'recipients=' + bumped + ',session=' + sessionAddrs.length,
+  });
+}
+
+// _setEntryAddedForTests (H-5 test seam): backdates entry.added for an
+// existing persisted-scope address. Used by allowlist-fixture.ts to drive
+// 'new_trust' risk-signal assertions deterministically. PRODUCTION GUARD:
+// throws if NODE_ENV === 'production'. Throws if entry not found (test bug).
+export function _setEntryAddedForTests(address: string, addedMs: number): void {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('_setEntryAddedForTests called in production');
+  }
+  const target = norm(address);
+  if (!target) throw new Error('_setEntryAddedForTests: empty address');
+  const file = loadAllowlist();
+  if (file.signature === 'corrupt') {
+    throw new Error('_setEntryAddedForTests: allowlist file is corrupt');
+  }
+  const entry = file.entries.find(e => e.address === target);
+  if (!entry) {
+    throw new Error('_setEntryAddedForTests: entry not found: ' + target);
+  }
+  entry.added = addedMs;
+  const secret = loadSecret();
+  file.signature = computeSignature(file, secret);
+  persist(file);
 }
 
 // sweepPendingTrust: orphan-sweep called from index.ts startup. Removes a
