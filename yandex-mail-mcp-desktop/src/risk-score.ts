@@ -34,6 +34,7 @@
 
 import { getPolicy } from './policy.js';
 import type { ScanResult, ScanHit } from './outbound-scan.js';
+import type { RiskPolicy } from './policy-defaults.js';
 
 // -- Public types (CONTEXT D2/D3/D4/D8) ---------------------------
 
@@ -76,10 +77,169 @@ export interface RiskContext {
   recentSendCount: number;
 }
 
+// -- File-local helpers -------------------------------------------
+
+// Common shape for the 9 evaluators -- enables a single deterministic
+// iteration order in computeRiskScore (CONTEXT D5 canonical order).
+type SignalEvaluator = (ctx: RiskContext, policy: RiskPolicy) => RiskReason | null;
+
+// Sentinel for the addr placeholder when ctx.recipients is empty. D10
+// templates require a literal "(no recipient)" rather than undefined /
+// empty-string. Locked by T-RISK-EMPTY-RECIPIENTS-01.
+function pickAddr(ctx: RiskContext): string {
+  if (ctx.recipients.length === 0) return '(no recipient)';
+  return ctx.recipients[0];
+}
+
+// -- Per-signal evaluators (CONTEXT D5 canonical order) -----------
+//
+// All evaluators:
+//   - Take (ctx, policy), return RiskReason | null.
+//   - Do NOT mutate ctx (no in-place sort, no .push on sub-fields).
+//   - Use ONLY policy.weights.<signal>, policy.provenance_window_sec,
+//     policy.burst_window_sec, policy.burst_threshold.
+//   - Return null (NOT undefined, NOT { weight: 0 }) when the signal
+//     does not fire -- the composite step filters by `!== null`.
+
+// 1. new_trust -- predicate is STRICT-LT on the 7d window (D5 row 1).
+//    A trust entry added EXACTLY 7d ago does NOT fire (locked by
+//    T-RISK-NEW-TRUST-BOUNDARY-EQ-01); 7d-minus-1ms DOES fire (locked
+//    by T-RISK-NEW-TRUST-BOUNDARY-EDGE-01).
+function evalNewTrust(ctx: RiskContext, policy: RiskPolicy): RiskReason | null {
+  if (ctx.trustAddedAtMs === undefined) return null;
+  const ageMs = ctx.nowMs - ctx.trustAddedAtMs;
+  if (ageMs < 0) return null;            // future trustAddedAtMs -- defensive
+  if (ageMs >= 7 * 86400_000) return null;
+  const days = Math.floor(ageMs / 86400_000);
+  return {
+    signal: 'new_trust',
+    weight: policy.weights.new_trust,
+    detail: 'new trust: ' + pickAddr(ctx) + ' added ' + days + 'd ago',
+  };
+}
+
+// 2. first_use -- boolean firstUse passed by caller.
+function evalFirstUse(ctx: RiskContext, policy: RiskPolicy): RiskReason | null {
+  if (!ctx.firstUse) return null;
+  return {
+    signal: 'first_use',
+    weight: policy.weights.first_use,
+    detail: 'first send to ' + pickAddr(ctx),
+  };
+}
+
+// 3. just_auto_trusted -- session-scope trust just added this call (H-1).
+function evalJustAutoTrusted(ctx: RiskContext, policy: RiskPolicy): RiskReason | null {
+  if (!ctx.autoTrustedThisCall) return null;
+  return {
+    signal: 'just_auto_trusted',
+    weight: policy.weights.just_auto_trusted,
+    detail: 'trust auto-elevated this call for ' + pickAddr(ctx),
+  };
+}
+
+// 4. api_key_pattern -- Phase 2 top-level category. NOT a subCategory.
+function evalApiKeyPattern(ctx: RiskContext, policy: RiskPolicy): RiskReason | null {
+  const matches = ctx.scanResult.hits.filter(
+    (h: ScanHit) => h.category === 'api_key_pattern',
+  );
+  if (matches.length === 0) return null;
+  return {
+    signal: 'api_key_pattern',
+    weight: policy.weights.api_key_pattern,
+    detail: 'body contains ' + matches.length + ' api_key_pattern hit(s)',
+  };
+}
+
+// 5. base64_in_body -- B-1 CORRECTION per CONTEXT D5 amendment rev 1.
+//    Phase 2's src/scan/detectors/data-shapes.ts:313-320 emits base64
+//    hits under category 'data_shape_anomaly' with subCategory
+//    'base64_blob'. The string 'base64_blob' appears ONLY as a
+//    subCategory across the entire detector codebase -- NEVER as a
+//    top-level category. Phase 4 evaluator MUST match on h.subCategory.
+//    The signal id 'base64_in_body' is the policy-weight key and the
+//    Phase 4 signal id -- it is NOT a ScanHit field value.
+function evalBase64InBody(ctx: RiskContext, policy: RiskPolicy): RiskReason | null {
+  const matches = ctx.scanResult.hits.filter(
+    (h: ScanHit) => h.subCategory === 'base64_blob',
+  );
+  if (matches.length === 0) return null;
+  const totalSpan = matches.reduce(
+    (sum: number, h: ScanHit) => sum + (h.evidence.byteEnd - h.evidence.byteStart),
+    0,
+  );
+  // Defensive: byteStart === byteEnd (zero-span) yields totalSpan=0 ->
+  // approxChars=0 -- never NaN, never undefined, never negative. The
+  // signal still fires (boolean-presence semantics per D6). Locked by
+  // T-RISK-BASE64-ZEROSPAN-01.
+  const approxChars = Math.round(totalSpan / 10) * 10;
+  return {
+    signal: 'base64_in_body',
+    weight: policy.weights.base64_in_body,
+    detail:
+      'body contains ' +
+      matches.length +
+      ' base64 blob(s) (~' +
+      approxChars +
+      ' chars)',
+  };
+}
+
+// 6. post_read_send -- Phase 3 boolean. Window for display only.
+function evalPostReadSend(ctx: RiskContext, policy: RiskPolicy): RiskReason | null {
+  if (!ctx.postReadFlag) return null;
+  return {
+    signal: 'post_read_send',
+    weight: policy.weights.post_read_send,
+    detail: 'send within ' + policy.provenance_window_sec + 's of inbound read',
+  };
+}
+
+// 7. multi_recipient -- strict GT 5 (D5 row 7). 6 fires, 5 does not.
+function evalMultiRecipient(ctx: RiskContext, policy: RiskPolicy): RiskReason | null {
+  if (ctx.recipients.length <= 5) return null;
+  return {
+    signal: 'multi_recipient',
+    weight: policy.weights.multi_recipient,
+    detail: ctx.recipients.length + ' recipients (>5)',
+  };
+}
+
+// 8. large_body -- strict GT 50000 bytes (D5 row 8). 50000 does NOT fire.
+function evalLargeBody(ctx: RiskContext, policy: RiskPolicy): RiskReason | null {
+  if (ctx.bodySize <= 50_000) return null;
+  const approxKB = Math.round(ctx.bodySize / 1000);
+  return {
+    signal: 'large_body',
+    weight: policy.weights.large_body,
+    detail: 'body ~' + approxKB + ' KB (>50 KB)',
+  };
+}
+
+// 9. burst_pattern -- GTE policy.burst_threshold (D5 row 9).
+function evalBurstPattern(ctx: RiskContext, policy: RiskPolicy): RiskReason | null {
+  if (ctx.recentSendCount < policy.burst_threshold) return null;
+  return {
+    signal: 'burst_pattern',
+    weight: policy.weights.burst_pattern,
+    detail: ctx.recentSendCount + ' sends within ' + policy.burst_window_sec + 's',
+  };
+}
+
 // PMLF-RISK-01 public surface -- LOCKED per CONTEXT D2.
 export function computeRiskScore(ctx: RiskContext): RiskResult {
-  // Stub body. T-04-01-02 / T-04-01-03 fill the real logic. Silences
-  // unused parameter warnings while preserving the locked signature.
+  // Stub body -- T-04-01-03 replaces this with the real composition.
   void ctx;
+  void evalNewTrust;
+  void evalFirstUse;
+  void evalJustAutoTrusted;
+  void evalApiKeyPattern;
+  void evalBase64InBody;
+  void evalPostReadSend;
+  void evalMultiRecipient;
+  void evalLargeBody;
+  void evalBurstPattern;
+  const _evaluators: SignalEvaluator[] = [];
+  void _evaluators;
   return { score: 0, reasons: [], tier: 'low' as RiskTier };
 }
