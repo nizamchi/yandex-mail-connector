@@ -156,9 +156,19 @@ function atomicWriteJsonl(target: string, records: readonly OverrideTokenRecord[
 }
 
 // -- Fresh-read helper (REV 2 B-4 race guard) ---------------
-// Reads JSONL directly from disk, BYPASSING cache. Used only by the race
-// guard step 9a in consumeOverrideToken. On parse error returns []; the
-// original loadOverrideTokens path is the canonical corruption-detect site.
+// Reads JSONL directly from disk, BYPASSING cache. Used by the race guard
+// step 9 in consumeOverrideToken AND by the post-write re-read in
+// mintOverrideToken / consumeOverrideToken.
+//
+// REV 3 WR-01: on parse error we MUST recoverFatal -- symmetric with
+// loadOverrideTokens. The previous "return [] on parse error" policy was
+// a silent-data-loss vector: a corrupt line after a successful write
+// would empty the cache, and because `loaded === true` was already set
+// inside mint/consume, the next call would skip loadOverrideTokens and
+// see an empty cache forever -- every existing token becomes
+// reason='unknown' until process restart. recoverFatal mirrors the
+// loadOverrideTokens corruption-detect policy (recovery banner +
+// process.exit(1) via test-substitutable hooks).
 
 function _readJsonlFresh(): OverrideTokenRecord[] {
   const p = tokensPath();
@@ -172,15 +182,21 @@ function _readJsonlFresh(): OverrideTokenRecord[] {
   }
   const out: OverrideTokenRecord[] = [];
   const lines = raw.split('\n');
-  for (const line of lines) {
-    if (line.length === 0) continue;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === undefined || line.length === 0) continue;
+    let obj: unknown;
     try {
-      const obj = JSON.parse(line) as unknown;
-      if (validateRecord(obj)) out.push(obj);
-    } catch {
-      // Defer corruption detection to loadOverrideTokens; here we just skip.
-      return [];
+      obj = JSON.parse(line);
+    } catch (e) {
+      const err = e as Error;
+      // REV 3 WR-01: mirror loadOverrideTokens. Parse failure on a primitive
+      // used both as race guard AND as post-write re-read MUST be loud, not
+      // silent. Silent return [] previously masked corruption + emptied
+      // cache + dropped all future consumes to reason='unknown'.
+      recoverFatal('parse failed during fresh-read at line ' + (i + 1) + ': ' + err.message);
     }
+    if (validateRecord(obj)) out.push(obj);
   }
   return out;
 }

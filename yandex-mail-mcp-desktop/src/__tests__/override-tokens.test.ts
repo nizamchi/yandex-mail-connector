@@ -346,6 +346,54 @@ test('T-OVERRIDE-FINGERPRINT-PRIVACY-01: riskFingerprint function body has 0 bar
   assert.match(fp, /^[0-9a-f]{32}$/);
 });
 
+test('T-OVERRIDE-FRESH-PARSE-FATAL-01: _readJsonlFresh FATALs on parse error (symmetric with loadOverrideTokens) (REV 3 WR-01)', () => {
+  const restoreEnv = snapshotEnv();
+  const stateDir = tmpStateDir();
+  process.env.YANDEX_STATE_DIR = stateDir;
+  delete process.env.YANDEX_AUDIT_LOG;
+  resetAll();
+  const fatalSink = { calls: [] as { code: number }[], stderr: '' };
+  const undoFatal = _setFatalHooksForTests({
+    exit: ((code: number) => {
+      fatalSink.calls.push({ code });
+      throw new Error('__FATAL_EXIT_FROM_TEST__');
+    }) as (code: number) => never,
+    stderr: (msg: string) => { fatalSink.stderr += msg; },
+  });
+  try {
+    // 1. Write a valid JSONL via mint.
+    const { token } = mintOverrideToken(VALID_FP);
+    const p = path.join(stateDir, 'override-tokens.jsonl');
+    // 2. Corrupt the file mid-flight: append a non-JSON garbage line that
+    //    _readJsonlFresh will try to parse during consume's race-guard
+    //    re-read (Step 9). The valid record stays parseable, so the cache
+    //    load at the start of consume succeeds; the FATAL fires on the
+    //    fresh-read inside Step 9.
+    const validLine = fs.readFileSync(p, 'utf-8').trim();
+    fs.writeFileSync(p, validLine + '\n' + '{not json garbage' + '\n', { mode: 0o600 });
+    // 3. Consume -> consumeOverrideToken calls loadOverrideTokens (which
+    //    will also see the corruption and FATAL). The point of the test is
+    //    that the fresh-read primitive is now LOUD on parse errors -- the
+    //    earlier silent return [] is gone.
+    let threw = false;
+    try {
+      consumeOverrideToken(VALID_FP, token);
+    } catch (e) {
+      threw = true;
+      assert.equal((e as Error).message, '__FATAL_EXIT_FROM_TEST__');
+    }
+    assert.ok(threw, 'consume MUST hit the FATAL path when the JSONL has a parse-error line');
+    assert.ok(fatalSink.calls.length >= 1, 'FATAL exit hook must be invoked at least once');
+    assert.equal(fatalSink.calls[0]!.code, 1);
+    assert.match(fatalSink.stderr, /override-tokens\.jsonl/);
+    assert.match(fatalSink.stderr, /parse failed/);
+  } finally {
+    undoFatal();
+    restoreEnv();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test('T-OVERRIDE-EXPIRY-01: expired token returns {ok:false, reason:expired}', () => {
   const restoreEnv = snapshotEnv();
   const stateDir = tmpStateDir();
