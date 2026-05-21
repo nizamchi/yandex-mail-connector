@@ -226,20 +226,62 @@ function evalBurstPattern(ctx: RiskContext, policy: RiskPolicy): RiskReason | nu
   };
 }
 
+// CONTEXT D3 + D6. Non-finite input cannot occur given integer weights,
+// but guard defensively so a future policy with a fractional weight cannot
+// leak NaN into the tier mapper (NaN comparisons would always be false ->
+// tier would incorrectly drop to 'low').
+function clamp01_100(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 100) return 100;
+  return n;
+}
+
+// CONTEXT D7 boundary semantics:
+//   score < augment           -> low
+//   >= augment && < strict    -> medium
+//   >= strict  && < block     -> high
+//   >= block                  -> block
+// Half-open intervals -- score === augment maps to 'medium', score ===
+// block maps to 'block'. Locked by T-RISK-TIER-MEDIUM-01 + T-RISK-TIER-
+// BLOCK-01.
+function mapTier(score: number, t: RiskPolicy['thresholds']): RiskTier {
+  if (score >= t.block) return 'block';
+  if (score >= t.strict) return 'high';
+  if (score >= t.augment) return 'medium';
+  return 'low';
+}
+
 // PMLF-RISK-01 public surface -- LOCKED per CONTEXT D2.
 export function computeRiskScore(ctx: RiskContext): RiskResult {
-  // Stub body -- T-04-01-03 replaces this with the real composition.
-  void ctx;
-  void evalNewTrust;
-  void evalFirstUse;
-  void evalJustAutoTrusted;
-  void evalApiKeyPattern;
-  void evalBase64InBody;
-  void evalPostReadSend;
-  void evalMultiRecipient;
-  void evalLargeBody;
-  void evalBurstPattern;
-  const _evaluators: SignalEvaluator[] = [];
-  void _evaluators;
-  return { score: 0, reasons: [], tier: 'low' as RiskTier };
+  const policy = getPolicy();
+
+  // Evaluators in CONTEXT D5 canonical order. The array literal is the
+  // SINGLE source of truth for ordering; reasons[] mirrors it.
+  const evaluators: SignalEvaluator[] = [
+    evalNewTrust,
+    evalFirstUse,
+    evalJustAutoTrusted,
+    evalApiKeyPattern,
+    evalBase64InBody,
+    evalPostReadSend,
+    evalMultiRecipient,
+    evalLargeBody,
+    evalBurstPattern,
+  ];
+
+  const reasons: RiskReason[] = [];
+  let rawSum = 0;
+  for (const ev of evaluators) {
+    const r = ev(ctx, policy);
+    if (r === null) continue;
+    reasons.push(r);
+    rawSum += r.weight;
+  }
+
+  // D6 pure SUM. D3 clamp [0,100] + integer rounding.
+  const score = clamp01_100(Math.round(rawSum));
+  const tier = mapTier(score, policy.thresholds);
+
+  return { score, reasons, tier };
 }
