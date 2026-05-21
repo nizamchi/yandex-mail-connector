@@ -43,6 +43,23 @@ import { detectCredentialsFuzzy } from './scan/detectors/credentials.js';
 import { detectStructuralSecrets } from './scan/detectors/structural-secrets.js';
 import { detectCryptoWeb3 } from './scan/detectors/crypto-web3.js';
 
+// 02-03-07: named imports for the 5 keyword-pass detector modules
+// (categories 2.7-2.11). Side-effect imports register each detector at
+// module load; the explicit named imports here keep the dependency on
+// _reregisterAllDetectors() so that _resetForTests() -> reregister flow
+// works in tests.
+import './scan/detectors/medical.js';
+import './scan/detectors/classified-markings.js';
+import './scan/detectors/exfil-multipliers.js';
+import './scan/detectors/data-shapes.js';
+import './scan/detectors/demographic-pii.js';
+import { medicalDetector } from './scan/detectors/medical.js';
+import { classifiedMarkingsDetector } from './scan/detectors/classified-markings.js';
+import { exfilMultipliersDetector } from './scan/detectors/exfil-multipliers.js';
+import { dataShapesDetector } from './scan/detectors/data-shapes.js';
+import { demographicPiiDetector } from './scan/detectors/demographic-pii.js';
+import { composeFinalScore } from './scan/composite-scoring.js';
+
 // -- Public types -------------------------------------------------
 
 export interface ScanHit {
@@ -125,7 +142,14 @@ export function registerDetector(
 let applyCat24CompanionCheck: (pending: ScanHit[], realHits: ScanHit[]) => ScanHit[] =
   (pending, _realHits) => pending;   // 02-01 stub: pass-through identity
 
-let applyComposite: (hits: ScanHit[]) => { totalScore: number } =
+// 02-03-07: hook return-type widened per W-R2-2 carve-out documented in
+// 02-01-SUMMARY (the ONE permitted narrow type extension beyond 02-01's
+// FROZEN surface). The composite hook may optionally return `finalHits`
+// alongside `totalScore`. When `finalHits` is present, scanOutbound uses
+// it as the result `hits` array (after multiplier stripping per Patch 12);
+// otherwise the orchestrator falls back to `allHits` to preserve the 02-01
+// stub contract.
+let applyComposite: (hits: ScanHit[]) => { totalScore: number; finalHits?: ScanHit[] } =
   (hits) => ({ totalScore: Math.min(100, hits.reduce((s, h) => s + h.weight, 0)) }); // 02-01 stub: capped SUM
 
 // Test + 02-02 + 02-03 seams to swap stubs at runtime.
@@ -153,9 +177,21 @@ export function _reregisterAllDetectors(): void {
   registerDetector('credentials_fuzzy', detectCredentialsFuzzy, false);
   registerDetector('api_key_pattern', detectStructuralSecrets, true);
   registerDetector('crypto_seed', detectCryptoWeb3, true);
-  // 02-03 keyword-pass detectors append here.
-  // Also reinstall the cat-2.4 hook in case _resetForTests cleared it.
+  // 02-03 keyword-pass detectors (categories 2.7-2.11).
+  registerDetector('medical', medicalDetector, false);
+  registerDetector('classified_marking', classifiedMarkingsDetector, false);
+  registerDetector('exfil_phrase', exfilMultipliersDetector, false);
+  registerDetector('data_shape_anomaly', dataShapesDetector, false);
+  registerDetector('demographic_pii', demographicPiiDetector, false);
+  // Reinstall the cat-2.4 hook in case _resetForTests cleared it.
   _setCat24CompanionHook(applyCat24Companion);
+  // Reinstall the composite hook (02-03) -- the real composite-scoring math
+  // replaces the 02-01 simple-SUM stub. Adapter returns { totalScore,
+  // finalHits } per the widened return type (W-R2-2 / Patch 12 contract).
+  _setCompositeHook((hits) => {
+    const composite = composeFinalScore(hits);
+    return { totalScore: composite.totalScore, finalHits: composite.finalHits };
+  });
 }
 
 // 02-02-08: cat-2.4 companion-check hook.
@@ -429,10 +465,16 @@ export function scanOutbound(input: { body: string; subject?: string }): ScanRes
   const allHits = realHits.concat(promotedCat24);
 
   // Composite scoring via hook (02-03 fills; 02-01 stub = capped simple SUM).
-  const { totalScore } = applyComposite(allHits);
+  // W-R2-2 widening (02-03): the hook may return `finalHits` -- when present
+  // it replaces `allHits` for the result `hits` and the summary input. This
+  // lets composeFinalScore strip exfil multiplier markers (Patch 12) without
+  // touching the main loop body (L8 / Patch 2 FROZEN).
+  const composite = applyComposite(allHits);
+  const totalScore = composite.totalScore;
+  const resultHits = composite.finalHits ?? allHits;
 
-  const summary = buildSummary(allHits);
-  return { hits: allHits, totalScore, summary };
+  const summary = buildSummary(resultHits);
+  return { hits: resultHits, totalScore, summary };
 }
 
 // -- Test seam ----------------------------------------------------
