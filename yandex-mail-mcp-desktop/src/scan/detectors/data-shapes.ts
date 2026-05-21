@@ -35,7 +35,7 @@
 // Pure function over DetectorContext. No I/O.
 
 import type { DetectorContext, DetectorFn, ScanHit } from '../../outbound-scan.js';
-import { emitRedactedMatch, registerDetector } from '../../outbound-scan.js';
+import { emitRedactedMatch } from '../../outbound-scan.js';
 import { hasMixedScriptCyrillicLatin, MAX_HOMOGLYPH_HITS } from '../homoglyph-table.js';
 
 // Regexes -- all bounded, no nested unbounded quantifiers.
@@ -99,7 +99,26 @@ const BASE64_ENTROPY_FLOOR = 4.5;
 // tokens of length 3..40 (per L-HG-1). We tokenize the ORIGINAL body so
 // case-sensitive Cyrillic-vs-Latin discrimination is preserved -- the
 // preprocessor case-folds and would obscure the script signal.
-const TOKEN_BREAK_RE = /[\s.,;:!?()[\]{}<>"'`/\\|@#$%^&*+=~\-]+/u;
+//
+// `isBreakCodePoint` is a fast inline replacement for a `RegExp.test()`
+// per-character call. Char codes for ASCII whitespace + common punctuation
+// are checked first; non-ASCII whitespace (e.g. U+00A0 NBSP, U+2028 LSEP)
+// caught via a numeric switch.
+function isBreakCodePoint(cp: number): boolean {
+  // ASCII whitespace
+  if (cp === 0x20 || cp === 0x09 || cp === 0x0A || cp === 0x0D) return true;
+  // ASCII punctuation that separates tokens
+  if (cp === 0x21 || cp === 0x22 || cp === 0x23 || cp === 0x24 || cp === 0x25
+   || cp === 0x26 || cp === 0x27 || cp === 0x28 || cp === 0x29 || cp === 0x2A
+   || cp === 0x2B || cp === 0x2C || cp === 0x2D || cp === 0x2E || cp === 0x2F
+   || cp === 0x3A || cp === 0x3B || cp === 0x3C || cp === 0x3D || cp === 0x3E
+   || cp === 0x3F || cp === 0x40 || cp === 0x5B || cp === 0x5C || cp === 0x5D
+   || cp === 0x5E || cp === 0x60 || cp === 0x7B || cp === 0x7C || cp === 0x7D
+   || cp === 0x7E) return true;
+  // Common non-ASCII separators
+  if (cp === 0x00A0 || cp === 0x2028 || cp === 0x2029) return true;
+  return false;
+}
 const MAX_TOKEN_COUNT = 5000;  // D3 DoS guard
 
 // Translate ORIGINAL byte offset to NORMALIZED code-unit index (binary search).
@@ -143,14 +162,31 @@ export const dataShapesDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] 
   //
   // We scan the ORIGINAL body because the preprocessor strips these chars
   // during NFKC normalization (step 2 of preprocess.ts). Byte offsets come
-  // from Buffer.byteLength of the prefix slice.
-  const origBytePrefixCache = new Map<number, number>();
+  // from a single O(N) walk of the original that produces a cumulative
+  // UTF-8-byte prefix table -- O(1) lookup per match thereafter.
+  //
+  // Without this table, `Buffer.byteLength(original.slice(0, jsIdx))` is
+  // called per match, each O(N), turning hit-heavy 100 KB bodies into
+  // O(N*M) scans (T-PERF-01 measured 200+ ms before this optimisation).
+  const origByteAt = new Int32Array(original.length + 1);
+  {
+    let acc = 0;
+    for (let i = 0; i < original.length; i++) {
+      origByteAt[i] = acc;
+      const cp = original.charCodeAt(i);
+      // Surrogate pair: 4 bytes total; the second half adds 0.
+      if (cp < 0x80) acc += 1;
+      else if (cp < 0x800) acc += 2;
+      else if (cp >= 0xD800 && cp <= 0xDBFF) acc += 4; // high surrogate
+      else if (cp >= 0xDC00 && cp <= 0xDFFF) acc += 0; // low surrogate already counted
+      else acc += 3;
+    }
+    origByteAt[original.length] = acc;
+  }
   function origIndexToByte(jsIdx: number): number {
-    const cached = origBytePrefixCache.get(jsIdx);
-    if (cached !== undefined) return cached;
-    const b = Buffer.byteLength(original.slice(0, jsIdx), 'utf8');
-    origBytePrefixCache.set(jsIdx, b);
-    return b;
+    if (jsIdx <= 0) return 0;
+    if (jsIdx >= origByteAt.length) return origByteAt[origByteAt.length - 1];
+    return origByteAt[jsIdx];
   }
 
   // Zero-width: ONE hit per email regardless of count.
@@ -159,7 +195,7 @@ export const dataShapesDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] 
   m = ZERO_WIDTH_RE.exec(original);
   if (m !== null) {
     const byteStart = origIndexToByte(m.index);
-    const byteEnd = byteStart + Buffer.byteLength(m[0], 'utf8');
+    const byteEnd = origIndexToByte(m.index + m[0].length);
     const prefix4 = m[0].slice(0, 4);
     emitRedactedMatch('data_shape_anomaly', 'zero_width', byteStart, byteEnd, prefix4);
     hits.push({
@@ -175,7 +211,7 @@ export const dataShapesDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] 
   BIDI_OVERRIDE_RE.lastIndex = 0;
   while ((m = BIDI_OVERRIDE_RE.exec(original)) !== null) {
     const byteStart = origIndexToByte(m.index);
-    const byteEnd = byteStart + Buffer.byteLength(m[0], 'utf8');
+    const byteEnd = origIndexToByte(m.index + m[0].length);
     const prefix4 = m[0].slice(0, 4);
     emitRedactedMatch('data_shape_anomaly', 'bidi_override', byteStart, byteEnd, prefix4);
     hits.push({
@@ -191,7 +227,7 @@ export const dataShapesDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] 
   UNICODE_TAG_RE.lastIndex = 0;
   while ((m = UNICODE_TAG_RE.exec(original)) !== null) {
     const byteStart = origIndexToByte(m.index);
-    const byteEnd = byteStart + Buffer.byteLength(m[0], 'utf8');
+    const byteEnd = origIndexToByte(m.index + m[0].length);
     const prefix4 = m[0].slice(0, 4);
     emitRedactedMatch('data_shape_anomaly', 'unicode_tag', byteStart, byteEnd, prefix4);
     hits.push({
@@ -209,7 +245,7 @@ export const dataShapesDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] 
   MAGIC_BYTES_RE.lastIndex = 0;
   while ((m = MAGIC_BYTES_RE.exec(original)) !== null) {
     const byteStart = origIndexToByte(m.index);
-    const byteEnd = byteStart + Buffer.byteLength(m[0], 'utf8');
+    const byteEnd = origIndexToByte(m.index + m[0].length);
     const prefix4 = m[0].slice(0, 4);
     emitRedactedMatch('data_shape_anomaly', 'magic_bytes', byteStart, byteEnd, prefix4);
     hits.push({
@@ -249,7 +285,7 @@ export const dataShapesDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] 
       continue;
     }
     const byteStart = origIndexToByte(m.index);
-    const byteEnd = byteStart + Buffer.byteLength(matched, 'utf8');
+    const byteEnd = origIndexToByte(m.index + matched.length);
     const prefix4 = matched.slice(0, 4);
     emitRedactedMatch('data_shape_anomaly', 'base64_blob', byteStart, byteEnd, prefix4);
     hits.push({
@@ -267,7 +303,7 @@ export const dataShapesDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] 
   while ((m = HEX_BLOB_RE.exec(original)) !== null) {
     const matched = m[0];
     const byteStart = origIndexToByte(m.index);
-    const byteEnd = byteStart + Buffer.byteLength(matched, 'utf8');
+    const byteEnd = origIndexToByte(m.index + matched.length);
     const prefix4 = matched.slice(0, 4);
     emitRedactedMatch('data_shape_anomaly', 'hex_blob', byteStart, byteEnd, prefix4);
     hits.push({
@@ -291,14 +327,14 @@ export const dataShapesDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] 
   let tStart = -1;
   for (let i = 0; i <= original.length; i++) {
     const atEnd = i === original.length;
-    const ch = atEnd ? ' ' : original[i];
-    const isBreak = TOKEN_BREAK_RE.test(ch);
+    const cp = atEnd ? 0x20 : original.charCodeAt(i);
+    const isBreak = isBreakCodePoint(cp);
     if (isBreak) {
       if (tStart !== -1) {
         const tok = original.slice(tStart, i);
         if (hasMixedScriptCyrillicLatin(tok)) {
           const byteStart = origIndexToByte(tStart);
-          const byteEnd = byteStart + Buffer.byteLength(tok, 'utf8');
+          const byteEnd = origIndexToByte(tStart + tok.length);
           const prefix4 = tok.slice(0, 4);
           emitRedactedMatch('data_shape_anomaly', 'homoglyph_cyr_lat', byteStart, byteEnd, prefix4);
           hits.push({
@@ -333,4 +369,4 @@ export const dataShapesDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] 
   return hits;
 };
 
-registerDetector('data_shape_anomaly', dataShapesDetector, false);
+// Registration is performed by outbound-scan.ts _reregisterAllDetectors().

@@ -26,7 +26,7 @@
 // Pure function over DetectorContext.
 
 import type { DetectorContext, DetectorFn, ScanHit } from '../../outbound-scan.js';
-import { emitRedactedMatch, registerDetector } from '../../outbound-scan.js';
+import { emitRedactedMatch } from '../../outbound-scan.js';
 
 type Tier = 'severe' | 'standard' | 'mild';
 
@@ -112,6 +112,23 @@ export const classifiedMarkingsDetector: DetectorFn = (ctx: DetectorContext): Sc
   const original = ctx.matchedIn === 'body' ? ctx.originalBody : ctx.originalSubject;
   const originalByteLen = ctx.pp.originalByteLength;
 
+  // Cumulative byte-prefix table for original -- avoids O(N) Buffer.byteLength
+  // calls per match.
+  const origByteAt = new Int32Array(original.length + 1);
+  {
+    let acc = 0;
+    for (let i = 0; i < original.length; i++) {
+      origByteAt[i] = acc;
+      const cp = original.charCodeAt(i);
+      if (cp < 0x80) acc += 1;
+      else if (cp < 0x800) acc += 2;
+      else if (cp >= 0xD800 && cp <= 0xDBFF) acc += 4;
+      else if (cp >= 0xDC00 && cp <= 0xDFFF) acc += 0;
+      else acc += 3;
+    }
+    origByteAt[original.length] = acc;
+  }
+
   const hits: ScanHit[] = [];
 
   for (const spec of MARKINGS) {
@@ -136,10 +153,8 @@ export const classifiedMarkingsDetector: DetectorFn = (ctx: DetectorContext): Sc
         byteStart = map[idx] ?? 0;
         byteEnd = end < map.length ? map[end] : (map[map.length - 1] ?? originalByteLen);
       } else {
-        const sb = Buffer.byteLength(original.slice(0, idx), 'utf8');
-        const eb = sb + Buffer.byteLength(tok, 'utf8');
-        byteStart = sb;
-        byteEnd = eb;
+        byteStart = origByteAt[idx];
+        byteEnd = origByteAt[end];
       }
       const prefix4 = tok.slice(0, 4);
       const weight = spec.tier === 'severe' ? wSevere :
@@ -158,4 +173,4 @@ export const classifiedMarkingsDetector: DetectorFn = (ctx: DetectorContext): Sc
   return hits;
 };
 
-registerDetector('classified_marking', classifiedMarkingsDetector, false);
+// Registration is performed by outbound-scan.ts _reregisterAllDetectors().

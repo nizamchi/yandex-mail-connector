@@ -44,15 +44,10 @@ import { detectStructuralSecrets } from './scan/detectors/structural-secrets.js'
 import { detectCryptoWeb3 } from './scan/detectors/crypto-web3.js';
 
 // 02-03-07: named imports for the 5 keyword-pass detector modules
-// (categories 2.7-2.11). Side-effect imports register each detector at
-// module load; the explicit named imports here keep the dependency on
-// _reregisterAllDetectors() so that _resetForTests() -> reregister flow
-// works in tests.
-import './scan/detectors/medical.js';
-import './scan/detectors/classified-markings.js';
-import './scan/detectors/exfil-multipliers.js';
-import './scan/detectors/data-shapes.js';
-import './scan/detectors/demographic-pii.js';
+// (categories 2.7-2.11). Registration of each happens in
+// _reregisterAllDetectors() below -- module-load side-effect registration
+// would race with the parent module's `detectorRegistry` const initialization
+// (TDZ on the import cycle). Following the 02-02 pattern.
 import { medicalDetector } from './scan/detectors/medical.js';
 import { classifiedMarkingsDetector } from './scan/detectors/classified-markings.js';
 import { exfilMultipliersDetector } from './scan/detectors/exfil-multipliers.js';

@@ -211,21 +211,42 @@ export const medicalDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] => 
 
   // Collect "bundling anchor" normalized positions: ФИО / EN-name / ICD-10
   // / ОМС polis. Computed against the ORIGINAL body (case-sensitive for ФИО
-  // / EN-name). Translate matchEndByte to normalized index for proximity math.
+  // / EN-name). Translate JS index to byte offset via a cumulative-table
+  // built once (O(N)), then to normalized index via the existing map.
+  //
+  // Without the cumulative table, per-match Buffer.byteLength(original.slice(...))
+  // is O(N) -- and with many anchor matches in a long body, scanning becomes
+  // O(N*M). Pre-building the table is a small one-time cost (~100 KB int32 for
+  // a 100 KB body) that flatlines the perf.
+  const origByteAt = new Int32Array(original.length + 1);
+  {
+    let acc = 0;
+    for (let i = 0; i < original.length; i++) {
+      origByteAt[i] = acc;
+      const cp = original.charCodeAt(i);
+      if (cp < 0x80) acc += 1;
+      else if (cp < 0x800) acc += 2;
+      else if (cp >= 0xD800 && cp <= 0xDBFF) acc += 4;
+      else if (cp >= 0xDC00 && cp <= 0xDFFF) acc += 0;
+      else acc += 3;
+    }
+    origByteAt[original.length] = acc;
+  }
+  function origIndexToByte(jsIdx: number): number {
+    if (jsIdx <= 0) return 0;
+    if (jsIdx >= origByteAt.length) return origByteAt[origByteAt.length - 1];
+    return origByteAt[jsIdx];
+  }
+
   const anchors: number[] = [];
-  const origBytes = Buffer.from(original, 'utf8');
-  // Iterate ФИО matches in original text -- positions are JS code-unit
-  // indices in `original`, which we convert to byte offsets via Buffer slice.
   RU_FIO_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = RU_FIO_RE.exec(original)) !== null) {
-    const startByte = Buffer.byteLength(original.slice(0, m.index), 'utf8');
-    anchors.push(byteToNormIndex(map, startByte));
+    anchors.push(byteToNormIndex(map, origIndexToByte(m.index)));
   }
   EN_NAME_RE.lastIndex = 0;
   while ((m = EN_NAME_RE.exec(original)) !== null) {
-    const startByte = Buffer.byteLength(original.slice(0, m.index), 'utf8');
-    anchors.push(byteToNormIndex(map, startByte));
+    anchors.push(byteToNormIndex(map, origIndexToByte(m.index)));
   }
   // Note: ICD-10 + ОМС anchors collected after their own emission logic, so
   // bundling proximity to those anchors is detected too. Recorded at end of
@@ -364,6 +385,6 @@ export const medicalDetector: DetectorFn = (ctx: DetectorContext): ScanHit[] => 
   return hits;
 };
 
-// Registration side-effect (module-load).
-import { registerDetector } from '../../outbound-scan.js';
-registerDetector('medical', medicalDetector, false);
+// Registration is performed by outbound-scan.ts _reregisterAllDetectors().
+// Module-load side-effect registration would race with the parent module's
+// `detectorRegistry` const initialization (TDZ on the import cycle).

@@ -27,8 +27,8 @@
 // Pure function over DetectorContext.
 
 import type { DetectorContext, DetectorFn, ScanHit } from '../../outbound-scan.js';
-import { registerDetector } from '../../outbound-scan.js';
 // Note: does NOT import emitRedactedMatch -- multiplier markers are bookkeeping.
+// Registration is performed by outbound-scan.ts _reregisterAllDetectors().
 
 // Each token matched against ctx.pp.normalized (case-folded).
 const PHRASES: ReadonlyArray<string> = Object.freeze([
@@ -127,4 +127,4 @@ export const exfilMultipliersDetector: DetectorFn = (ctx: DetectorContext): Scan
   return hits;
 };
 
-registerDetector('exfil_phrase', exfilMultipliersDetector, false);
+// Registration is performed by outbound-scan.ts _reregisterAllDetectors().

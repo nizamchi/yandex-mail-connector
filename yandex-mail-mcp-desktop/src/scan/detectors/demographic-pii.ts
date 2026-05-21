@@ -30,7 +30,7 @@
 // Pure function over DetectorContext. No I/O. ASCII identifiers.
 
 import type { DetectorContext, DetectorFn, ScanHit } from '../../outbound-scan.js';
-import { emitRedactedMatch, registerDetector } from '../../outbound-scan.js';
+import { emitRedactedMatch } from '../../outbound-scan.js';
 
 // Russian mobile phone: +7 / 8 prefix + 10 digits with various separators.
 const RU_PHONE_RE = /(?:\+7|\b8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}\b/g;
@@ -69,6 +69,24 @@ export const demographicPiiDetector: DetectorFn = (ctx: DetectorContext): ScanHi
 
   const original = ctx.matchedIn === 'body' ? ctx.originalBody : ctx.originalSubject;
 
+  // Cumulative byte-prefix table for the original; avoids O(N) Buffer.byteLength
+  // calls per match (would otherwise blow the 50 ms perf budget on hit-heavy
+  // 100 KB bodies).
+  const origByteAt = new Int32Array(original.length + 1);
+  {
+    let acc = 0;
+    for (let i = 0; i < original.length; i++) {
+      origByteAt[i] = acc;
+      const cp = original.charCodeAt(i);
+      if (cp < 0x80) acc += 1;
+      else if (cp < 0x800) acc += 2;
+      else if (cp >= 0xD800 && cp <= 0xDBFF) acc += 4;
+      else if (cp >= 0xDC00 && cp <= 0xDFFF) acc += 0;
+      else acc += 3;
+    }
+    origByteAt[original.length] = acc;
+  }
+
   const hits: ScanHit[] = [];
   const emittedSpans: Array<[number, number]> = [];
 
@@ -81,8 +99,8 @@ export const demographicPiiDetector: DetectorFn = (ctx: DetectorContext): ScanHi
 
   function emit(subCategory: 'ru_phone' | 'dob' | 'personal_email',
                 jsIdx: number, matched: string): void {
-    const byteStart = Buffer.byteLength(original.slice(0, jsIdx), 'utf8');
-    const byteEnd = byteStart + Buffer.byteLength(matched, 'utf8');
+    const byteStart = origByteAt[jsIdx];
+    const byteEnd = origByteAt[jsIdx + matched.length];
     if (overlaps(byteStart, byteEnd)) return;
     emittedSpans.push([byteStart, byteEnd]);
     const prefix4 = matched.slice(0, 4);
@@ -120,4 +138,4 @@ export const demographicPiiDetector: DetectorFn = (ctx: DetectorContext): ScanHi
   return hits;
 };
 
-registerDetector('demographic_pii', demographicPiiDetector, false);
+// Registration is performed by outbound-scan.ts _reregisterAllDetectors().
