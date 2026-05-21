@@ -29,6 +29,7 @@ import { getStateDir } from './state-dir.js';
 import { auditLog, auditLogAction, EMAIL_ACTIONS, subjectHash } from './audit.js';
 import { enforceSendGuards, recordSend, isAdvisory, is2FASender, isProtectedFolder, type GuardResult } from './guards.js';
 import { normalizeRecipients, validateNoSmuggling } from './recipients.js';
+import * as provenance from './provenance.js';
 
 // Domain extraction helper used by guard audit records (D-RECIP-DOMAINS: never
 // log raw recipient addresses; domains-only for forensics correlation).
@@ -581,6 +582,19 @@ Args: folder (default "INBOX"), uid (integer UID письма).
             _audit: { folder, uid, message_id: '<not-found-no-message-id>' },
           };
         }
+        // PMLF-PROV-04: record read provenance (RAM-only, never persisted).
+        // SINGLE call site -- placed BEFORE the is2FASender branch diverges so
+        // both the 2FA-redacted return and the standard return inherit the
+        // same record-before-return guarantee. DO NOT place recordRead inside
+        // catch blocks, after auditLog (which can throw on disk-full / EROFS),
+        // or after side-effect-ful sync ops -- read-record discipline must be
+        // exception-safe (B-1 fix).
+        provenance.recordRead(
+          email.messageId && email.messageId.length > 0
+            ? email.messageId
+            : '<no-message-id-uid-' + uid + '>',
+          { folder, uid }
+        );
         // Phase 7: 2FA-sender redaction. PRIORITY: this short-circuit fires
         // BEFORE the Phase 5 untrusted-sender marker logic (information
         // disclosure is the higher-severity threat -- a 2FA code in LLM
@@ -710,6 +724,19 @@ Args:
         if (flagged === true)  query['flagged']   = true;
         if (flagged === false) query['unflagged'] = true;
         const emails = await imap.searchEmails(folder, query, max_results);
+        // PMLF-PROV-04: record each search result as a read (RAM-only).
+        // Synthetic msgid format encodes uid (richer than audit.ts Hook-2
+        // sentinel <not-found-no-message-id>) for Phase 4 disambiguation.
+        // Provenance.ts is intentionally not coupled to audit.ts exact
+        // format (D6 negative coupling). Per-iteration getPolicy() inside
+        // recordRead returns a cached frozen reference (O(1)), so 100
+        // search results = 100 O(1) lookups, not 100 fresh parses.
+        for (const e of emails) {
+          const msgid = e.messageId && e.messageId.length > 0
+            ? e.messageId
+            : '<search-no-message-id-uid-' + (e.uid ?? 'unknown') + '>';
+          provenance.recordRead(msgid, { folder, uid: e.uid });
+        }
         const text = emails.length
           ? `Найдено: ${emails.length}\n\n${fmtHeaders(emails)}`
           : 'Ничего не найдено.';
