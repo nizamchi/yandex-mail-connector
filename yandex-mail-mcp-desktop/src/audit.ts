@@ -108,6 +108,14 @@ export const AuditRecord = z.object({
   byteStart: z.number().int().nonnegative().optional(),
   byteEnd: z.number().int().nonnegative().optional(),
   prefix4_hash: z.string().regex(/^[0-9a-f]{8}$/).optional(),
+  // Phase 5 risk fields. ALL THREE optional() -- forward-compat with
+  // Phase 1/2/3/4 audit emissions that omit them. risk_reasons[] is the
+  // array of canonical signal IDs (NOT the human-readable .detail
+  // strings; those contain recipient addresses). Phase 5 confirm.ts
+  // strips .detail at the audit boundary.
+  risk_score: z.number().int().nonnegative().max(100).optional(),
+  risk_reasons: z.array(z.string()).optional(),
+  risk_tier: z.enum(['low','medium','high','block']).optional(),
 }).strict();
 
 export type AuditRecord = z.infer<typeof AuditRecord>;
