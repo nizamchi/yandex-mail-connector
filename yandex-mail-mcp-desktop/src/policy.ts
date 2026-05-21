@@ -382,3 +382,14 @@ export function _resetForTests(): void {
   loaded = false;
   secretCache = null;
 }
+
+// Test-only seam: replace the cached policy in-place. Used by Phase 2
+// outbound-scan integration tests (T-POLICY-01) to flip category enable
+// flags without round-tripping through the HMAC-signed risk-policy.json.
+// Production code paths MUST NOT call this -- they go through loadPolicy().
+// The supplied policy is deep-frozen before caching to preserve the
+// downstream immutability contract.
+export function _setPolicyForTests(policy: RiskPolicy): void {
+  cachedPolicy = freezePolicy(policy);
+  loaded = true;
+}
