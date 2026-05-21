@@ -116,6 +116,13 @@ export const AuditRecord = z.object({
   risk_score: z.number().int().nonnegative().max(100).optional(),
   risk_reasons: z.array(z.string()).optional(),
   risk_tier: z.enum(['low','medium','high','block']).optional(),
+  // REV 3 WR-02 (STRIDE Repudiation closure). Privacy-safe identifiers on
+  // override-token denied-consume audit records. SHA-256 prefix (16 hex)
+  // of the supplied token and the bound fingerprint so forensics can
+  // correlate attempts without revealing raw values. .optional() so
+  // existing emissions are unaffected (Phase 1/2/3/4/5 forward-compat).
+  token_id_hash: z.string().regex(/^[0-9a-f]{16}$/).optional(),
+  fingerprint_hash: z.string().regex(/^[0-9a-f]{16}$/).optional(),
 }).strict();
 
 export type AuditRecord = z.infer<typeof AuditRecord>;

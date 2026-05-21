@@ -26,7 +26,7 @@ import {
 } from '../override-tokens.js';
 import { _resetForTests as _resetStateDir } from '../state-dir.js';
 import { _resetForTests as _resetPolicy } from '../policy.js';
-import { _resetForTests as _resetAudit } from '../audit.js';
+import { _resetForTests as _resetAudit, _drainForTests as _drainAudit } from '../audit.js';
 
 // -- Helpers ------------------------------------------------
 
@@ -344,6 +344,109 @@ test('T-OVERRIDE-FINGERPRINT-PRIVACY-01: riskFingerprint function body has 0 bar
     50,
   );
   assert.match(fp, /^[0-9a-f]{32}$/);
+});
+
+// REV 3 WR-02 (STRIDE Repudiation closure): helper to read audit lines
+// produced inside override-tokens.ts. Mirrors confirm-risk-tier.test.ts.
+async function readAuditLines(auditPath: string): Promise<Record<string, unknown>[]> {
+  await _drainAudit();
+  if (!fs.existsSync(auditPath)) return [];
+  const raw = fs.readFileSync(auditPath, 'utf-8');
+  return raw.split('\n').filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+test('T-OVERRIDE-DENIED-AUDIT-USED-01: replay attempt emits one override_consume_denied audit with reason=used (REV 3 WR-02 STRIDE Repudiation)', async () => {
+  const restoreEnv = snapshotEnv();
+  const stateDir = tmpStateDir();
+  const auditPath = path.join(stateDir, 'audit.jsonl');
+  process.env.YANDEX_STATE_DIR = stateDir;
+  process.env.YANDEX_AUDIT_LOG = auditPath;
+  resetAll();
+  try {
+    const { token } = mintOverrideToken(VALID_FP);
+    const r1 = consumeOverrideToken(VALID_FP, token);
+    assert.equal(r1.ok, true);
+    const r2 = consumeOverrideToken(VALID_FP, token);
+    assert.equal(r2.ok, false);
+    if (r2.ok === false) assert.equal(r2.reason, 'used');
+    const records = await readAuditLines(auditPath);
+    const denied = records.filter(r => r.action === 'override_consume_denied');
+    assert.equal(denied.length, 1, 'exactly one denied audit on replay');
+    assert.equal(denied[0]!.status, 'denied');
+    assert.equal(denied[0]!.level, 'warn');
+    assert.equal(denied[0]!.reason, 'used');
+    // Privacy-safe identifiers: 16 hex chars (SHA-256 prefix), not raw values.
+    assert.match(denied[0]!.token_id_hash as string, /^[0-9a-f]{16}$/);
+    assert.match(denied[0]!.fingerprint_hash as string, /^[0-9a-f]{16}$/);
+    // Raw token MUST NOT appear in the audit line.
+    const rawLine = JSON.stringify(denied[0]);
+    assert.ok(!rawLine.includes(token), 'raw token must not leak into audit');
+    assert.ok(!rawLine.includes(VALID_FP), 'full fingerprint must not leak into audit');
+  } finally {
+    restoreEnv();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('T-OVERRIDE-DENIED-AUDIT-EXPIRED-01: expired token emits one denied audit reason=expired (REV 3 WR-02)', async () => {
+  const restoreEnv = snapshotEnv();
+  const stateDir = tmpStateDir();
+  const auditPath = path.join(stateDir, 'audit.jsonl');
+  process.env.YANDEX_STATE_DIR = stateDir;
+  process.env.YANDEX_AUDIT_LOG = auditPath;
+  resetAll();
+  try {
+    const { token } = mintOverrideToken(VALID_FP);
+    // Force the mint audit to flush before we rewrite the file.
+    await _drainAudit();
+    const p = path.join(stateDir, 'override-tokens.jsonl');
+    const rec = JSON.parse(fs.readFileSync(p, 'utf-8').trim()) as Record<string, unknown>;
+    rec.expires_at_ms = Date.now() - 1000;
+    rec.minted_at_ms = Date.now() - 60_000;
+    fs.writeFileSync(p, JSON.stringify(rec) + '\n', { mode: 0o600 });
+    _resetOverride();
+    const result = consumeOverrideToken(VALID_FP, token);
+    assert.equal(result.ok, false);
+    if (result.ok === false) assert.equal(result.reason, 'expired');
+    const records = await readAuditLines(auditPath);
+    const denied = records.filter(r => r.action === 'override_consume_denied');
+    assert.equal(denied.length, 1);
+    assert.equal(denied[0]!.reason, 'expired');
+    assert.equal(denied[0]!.status, 'denied');
+    assert.match(denied[0]!.token_id_hash as string, /^[0-9a-f]{16}$/);
+    assert.match(denied[0]!.fingerprint_hash as string, /^[0-9a-f]{16}$/);
+  } finally {
+    restoreEnv();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('T-OVERRIDE-DENIED-AUDIT-WRONG-FP-01: wrong fingerprint emits one denied audit reason=wrong_fingerprint (REV 3 WR-02)', async () => {
+  const restoreEnv = snapshotEnv();
+  const stateDir = tmpStateDir();
+  const auditPath = path.join(stateDir, 'audit.jsonl');
+  process.env.YANDEX_STATE_DIR = stateDir;
+  process.env.YANDEX_AUDIT_LOG = auditPath;
+  resetAll();
+  try {
+    const { token } = mintOverrideToken(VALID_FP);
+    const r = consumeOverrideToken(OTHER_FP, token);
+    assert.equal(r.ok, false);
+    if (r.ok === false) assert.equal(r.reason, 'wrong_fingerprint');
+    const records = await readAuditLines(auditPath);
+    const denied = records.filter(r => r.action === 'override_consume_denied');
+    assert.equal(denied.length, 1);
+    assert.equal(denied[0]!.reason, 'wrong_fingerprint');
+    assert.equal(denied[0]!.status, 'denied');
+    assert.match(denied[0]!.token_id_hash as string, /^[0-9a-f]{16}$/);
+    assert.match(denied[0]!.fingerprint_hash as string, /^[0-9a-f]{16}$/);
+    // The supplied (OTHER_FP) fingerprint MUST NOT appear in raw form.
+    const rawLine = JSON.stringify(denied[0]);
+    assert.ok(!rawLine.includes(OTHER_FP), 'full supplied fingerprint must not leak into audit');
+  } finally {
+    restoreEnv();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
 });
 
 test('T-OVERRIDE-FRESH-PARSE-FATAL-01: _readJsonlFresh FATALs on parse error (symmetric with loadOverrideTokens) (REV 3 WR-01)', () => {

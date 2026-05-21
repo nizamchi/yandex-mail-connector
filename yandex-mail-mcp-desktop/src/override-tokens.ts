@@ -316,6 +316,32 @@ export function mintOverrideToken(fingerprint: string): {
   return { token: rawToken, fingerprint, expiresAtMs };
 }
 
+// REV 3 WR-02 (STRIDE Repudiation closure): emit one audit record per
+// denied consume attempt. Uses SHA-256(input).slice(0,16) for both the
+// supplied token and the supplied fingerprint -- privacy-safe identifiers
+// that let forensics correlate replay/probe attempts without ever
+// revealing the raw token or full fingerprint hex. action is a NEW string
+// ('override_consume_denied') deliberately distinct from
+// 'override_token_consumed' (the success path), so a single grep over the
+// audit log differentiates success vs denial.
+function _auditDeniedConsume(
+  suppliedToken: string,
+  fingerprint: string,
+  reason: 'used' | 'expired' | 'wrong_fingerprint' | 'unknown',
+): void {
+  const tokenIdHash = createHash('sha256').update(suppliedToken).digest('hex').slice(0, 16);
+  const fingerprintHash = createHash('sha256').update(fingerprint).digest('hex').slice(0, 16);
+  auditLog({
+    action: 'override_consume_denied',
+    status: 'denied',
+    level: 'warn',
+    ts: new Date().toISOString(),
+    reason,
+    token_id_hash: tokenIdHash,
+    fingerprint_hash: fingerprintHash,
+  });
+}
+
 export function consumeOverrideToken(
   fingerprint: string,
   token: string,
@@ -324,6 +350,10 @@ export function consumeOverrideToken(
 
   // Step 2: hash supplied token.
   if (typeof token !== 'string' || token.length === 0) {
+    // Empty/non-string token -- audit with reason='unknown'. Use empty
+    // string as the suppliedToken for the hash (still privacy-safe; the
+    // forensic value is just "a denial happened against this fingerprint").
+    _auditDeniedConsume(typeof token === 'string' ? token : '', fingerprint, 'unknown');
     return { ok: false, reason: 'unknown' };
   }
   const suppliedHash = createHash('sha256').update(token).digest('hex').slice(0, 32);
@@ -348,6 +378,7 @@ export function consumeOverrideToken(
 
   // Step 4: not found -> unknown (tampered-token_hash branch).
   if (target === undefined) {
+    _auditDeniedConsume(token, fingerprint, 'unknown');
     return { ok: false, reason: 'unknown' };
   }
 
@@ -388,16 +419,19 @@ export function consumeOverrideToken(
     }
   }
   if (!fpOk) {
+    _auditDeniedConsume(token, fingerprint, 'wrong_fingerprint');
     return { ok: false, reason: 'wrong_fingerprint' };
   }
 
   // Step 7: single-use (intra-process check).
   if (target.used_at_ms !== null) {
+    _auditDeniedConsume(token, fingerprint, 'used');
     return { ok: false, reason: 'used' };
   }
 
   // Step 8: TTL check.
   if (Date.now() > target.expires_at_ms) {
+    _auditDeniedConsume(token, fingerprint, 'expired');
     return { ok: false, reason: 'expired' };
   }
 
@@ -424,11 +458,13 @@ export function consumeOverrideToken(
   }
   if (target2Idx === -1) {
     // Concurrent prune dropped the record (e.g. another writer reaped it).
+    _auditDeniedConsume(token, fingerprint, 'unknown');
     return { ok: false, reason: 'unknown' };
   }
   const target2 = records2[target2Idx] as OverrideTokenRecord;
   if (target2.used_at_ms !== null) {
     // Concurrent consumer won the race.
+    _auditDeniedConsume(token, fingerprint, 'used');
     return { ok: false, reason: 'used' };
   }
   target2.used_at_ms = Date.now();
