@@ -19,6 +19,7 @@
 
 import * as crypto from 'node:crypto';
 import { auditLog } from './audit.js';
+import type { RiskTier, RiskReason } from './risk-score.js';
 
 export type VerifyResult = true | 'expired' | 'used' | 'locked' | 'wrong';
 
@@ -107,22 +108,137 @@ export function actionFingerprint(action: string, params: Record<string, unknown
     .slice(0, 32);
 }
 
-export function generateCode(fingerprint: string): { code: string; expiresAt: number } {
+// Back-compat path (callers that do NOT pass opts.score): reconstruct the
+// score by SUM + clamp + round of reason weights. Acceptable for v2.1.0
+// because Phase 4 v2.1.0 score is itself pure SUM + clamp + round. Any
+// future Phase 4 revision that introduces diminishing returns or non-linear
+// aggregation MUST pass opts.score to preserve audit-truth fidelity (REV 2
+// W-1 / threat T-05-16).
+function estimateScoreFromReasons(rs: RiskReason[]): number {
+  const sum = rs.reduce((s, r) => s + (r.weight | 0), 0);
+  return Math.max(0, Math.min(100, Math.round(sum)));
+}
+
+// Phase 5 generateCode (D1, D2 rev 1 amended, D6, D8, D10, REV 2 W-1).
+//
+// Backwards compatibility (D8): a caller that omits opts entirely (v2.0.0
+// callers, Phase 1/2/3 callers) gets identical v2.0.0 behavior:
+//   - audit record has EXACTLY 5 keys (action/status/level/ts/reason);
+//     NO risk_score / risk_reasons / risk_tier emitted on 'low' tier.
+//   - return shape has { code, expiresAt, tier: 'low' } -- tier is NEW but
+//     defaults to 'low'; reasons[] is OMITTED (not undefined-as-key) on low.
+//   - stderr emission: NONE on low.
+//   - HMAC code TTL / lockout / fail threshold / reap grace: UNCHANGED.
+//
+// Block tier (D2 row 4): returns { code: null, expiresAt: 0, tier: 'block',
+//   reasons } and emits a denied/warn audit + risk_block stderr.
+//
+// REV 2 B-1/B-2: medium/high/block return shape includes reasons[] (frozen)
+// for the Phase 6 elicit consumer to render the prompt without an out-of-
+// band channel. Detail strings stay IN-PROCESS; the audit boundary still
+// receives signal IDs only (privacy carry from Phase 4 D10).
+export function generateCode(
+  fingerprint: string,
+  opts?: {
+    riskTier?: RiskTier;
+    reasons?: RiskReason[];
+    score?: number;
+  },
+): {
+  code: string | null;
+  expiresAt: number;
+  tier: RiskTier;
+  reasons?: readonly RiskReason[];
+} {
+  const tier: RiskTier = opts?.riskTier ?? 'low';
+  const reasons: RiskReason[] = opts?.reasons ?? [];
+  const explicitScore: number | undefined = opts?.score;
   const now = Date.now();
   reap(now);
+
+  // Score resolution: explicit score (Phase 4 truth) wins; otherwise
+  // estimate by SUM of reason weights (back-compat fallback).
+  const auditScore: number =
+    explicitScore !== undefined
+      ? Math.max(0, Math.min(100, Math.round(explicitScore)))
+      : estimateScoreFromReasons(reasons);
+
+  // BLOCK BRANCH: early-exit, no code minted (D2 row 4).
+  if (tier === 'block') {
+    auditLog({
+      action: 'code_generated',
+      status: 'denied',
+      level: 'warn',
+      ts: new Date().toISOString(),
+      reason: 'fp=' + fingerprint.slice(0, 8) + ',risk_block',
+      risk_score: auditScore,
+      risk_reasons: reasons.map(r => r.signal),
+      risk_tier: 'block',
+    });
+    process.stderr.write(
+      '[yandex-mail-mcp] risk_block: send refused. Run\n' +
+      '  yandex-mail-mcp-trust --high-risk-send=' + fingerprint + '\n' +
+      '  to mint a single-use override token (TTL 30 min).\n' +
+      '[yandex-mail-mcp] risk signals: ' + reasons.map(r => r.signal).join(', ') + '\n'
+    );
+    return {
+      code: null,
+      expiresAt: 0,
+      tier: 'block',
+      reasons: Object.freeze(reasons.slice()),
+    };
+  }
+
+  // Code mint (shared by low / medium / high).
   const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
   const expiresAt = now + CODE_TTL_MS;
   codes.set(fingerprint, { code, expiresAt, used: false });
-  // Audit AFTER state mutation. The 6-digit code is NEVER logged — only the
-  // 8-hex fingerprint prefix + TTL metadata.
+
+  // LOW BRANCH: v2.0.0 parity (D8). NO stderr, NO risk fields in audit,
+  // NO reasons in return shape.
+  if (tier === 'low') {
+    auditLog({
+      action: 'code_generated',
+      status: 'success',
+      level: 'info',
+      ts: new Date().toISOString(),
+      reason: 'fp=' + fingerprint.slice(0, 8) + ',ttl_sec=' + Math.round(CODE_TTL_MS / 1000),
+    });
+    return { code, expiresAt, tier: 'low' };
+  }
+
+  // MEDIUM / HIGH BRANCH: per-tier stderr + risk fields in audit + reasons echo.
+  // PRIVACY: signalIds map is canonical IDs only. reasons.detail NEVER passes
+  // through the audit boundary. The full reasons[] (with detail) is echoed in
+  // the return shape for the in-process Phase 6 elicit consumer (D2 rev 1).
+  const signalIds = reasons.map(r => r.signal);
+  if (tier === 'medium') {
+    process.stderr.write(
+      '[yandex-mail-mcp] medium-risk send -- review signals before approving: ' +
+      signalIds.join(', ') + '\n'
+    );
+  } else if (tier === 'high') {
+    process.stderr.write(
+      '[yandex-mail-mcp] high-risk send: please type the 6-digit code manually; do not paste.\n' +
+      '[yandex-mail-mcp] risk signals: ' + signalIds.join(', ') + '\n'
+    );
+  }
   auditLog({
     action: 'code_generated',
     status: 'success',
     level: 'info',
     ts: new Date().toISOString(),
     reason: 'fp=' + fingerprint.slice(0, 8) + ',ttl_sec=' + Math.round(CODE_TTL_MS / 1000),
+    risk_score: auditScore,
+    risk_reasons: signalIds,
+    risk_tier: tier,
   });
-  return { code, expiresAt };
+  return {
+    code,
+    expiresAt,
+    tier,
+    reasons: Object.freeze(reasons.slice()),
+  };
 }
 
 export function verifyCode(fingerprint: string, code: string): VerifyResult {
