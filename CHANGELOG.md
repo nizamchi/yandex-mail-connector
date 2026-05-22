@@ -7,6 +7,89 @@
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-05-22
+
+Layer 1.5 — PMLF (Progressive Multi-Layer Filter). Outbound-content-aware DLP
+layer over the v2.0.0 secure-ship baseline. Восемь фаз (Policy Module /
+Outbound Scanner / Provenance / Risk Scorer / Risk-Adaptive Confirmation /
+Send Pipeline Refactor / CLI Extensions / Documentation). Раздаётся через
+`npx -y github:nizamchi/yandex-mail-connector#v2.1.0`.
+
+### Добавлено
+
+- **Phase 1 — Policy Module.** `src/policy.ts` + `src/policy-defaults.ts`,
+  HMAC-signed `risk-policy.json` (`'policy:'` domain), anti-tamper на
+  `thresholds.block` (FATAL при понижении без `override_block_threshold:
+  true`), `YANDEX_POLICY_FILE` env override, first-launch defaults write.
+- **Phase 2 — Outbound Content Scanner (Layer A).** 11 detectors
+  (`payment_cards` / `ru_banking` / `govt_ids` / `credentials_fuzzy` /
+  `structural_secrets` / `crypto_web3` / `medical` / `classified_markings` /
+  `exfil_phrases` / `data_shapes` / `demographic_pii`), homoglyph
+  normalisation, NFKC preprocessing с byte-offset preservation, composite
+  scoring с clamp `[0,100]` + cross-category +10 bonus.
+- **Phase 3 — Provenance Tracking (Layer B).** RAM-only post-read tracking
+  через `src/provenance.ts`; window `provenance_window_sec` (default 30);
+  privacy invariant структурный (no `fs.writeFileSync`, no background timer).
+- **Phase 4 — Risk Scorer (Layer C).** `src/risk-score.ts` — композит из
+  9 сигналов (trust + content + provenance + volume + velocity), clamp
+  `[0,100]`, маппинг в 4 tier'а (none/medium/high/block).
+- **Phase 5 — Risk-Adaptive Confirmation (Layer D).** Per-tier dispatch в
+  `src/confirm.ts`; `src/override-tokens.ts` — HMAC-signed (`'override:'`
+  domain) одноразовые override-tokens с cross-process race guard
+  (fresh-read on consume, Zod shape gate); CLI `--high-risk-send=<fingerprint>`.
+- **Phase 6 — Send Pipeline Refactor.** 10-stage explicit `Stage[]` pipeline
+  в `src/send-pipeline.ts`; AllowlistEntry получает `{added, lastUsed,
+  useCount, source}` metadata с one-shot auto-migration; `yandex_send_email`
+  handler сжимается с ~218 inline LOC до 16-LOC driver.
+- **Phase 7 — CLI Extensions.** `yandex-mail-mcp-trust --policy
+  show/set/reset/edit`, `--recent`, `--list-trust`, `--revoke-trust`,
+  `--high-risk-send`; `src/recent-sends.ts` — 50-record forensics buffer;
+  `flushAudit` public export.
+- _Документация / Инфраструктура (Phase 8)._ `POLICY.md` (per-weight
+  rationale + tier UX + tuning + anti-tamper + recommended subagent
+  pattern); README "Layer 1.5" section; INSTALL.md PMLF env vars +
+  расширенный state map; documentation-drift gate (`T-DOC-DRIFT-01` +
+  `T-DOC-DRIFT-02` — fail при расхождении POLICY.md и `DEFAULT_POLICY`).
+
+### Изменено
+
+- `package.json` version: 2.0.0 → 2.1.0. Backward-compatible: v2.0.0 → v2.1.0
+  upgrade автоматический; first launch создаёт `risk-policy.json` с
+  дефолтами.
+- T-PERF-01-003 HARD cap widened с 10ms → 30ms (outbound-scan oversize-body
+  short-circuit benchmark). Standalone run всё ещё <5ms; widened для
+  абсорбции Windows parallel-load jitter, документированной в
+  `07-DEVIATIONS.md §D4`.
+- Bundle size (main `dist/yandex-mail-mcp.js`): 2,624,841 (v2.0.0 tag) →
+  **T-08-07 measured** bytes.
+
+### Безопасность
+
+- **HMAC domain separation** — `'policy:'` (Phase 1), `'override:'`
+  (Phase 5) добавляются к существующему `'allowlist:'` domain'у;
+  cross-domain replay rejected.
+- **Single-use override-tokens** (Phase 5) — JSONL-персистированные,
+  cross-process race guard через fresh-read on consume, timing-safe
+  `token_hash` lookup + `validateRecord` Zod shape gate.
+- **Composite outbound risk scoring** (Phase 2 + 4) — 11 content
+  detectors над send payload; tier-based confirmation (Phase 5) gates
+  medium/high tier'а.
+- **Anti-tamper на block-threshold lowering** (Phase 1) —
+  `override_block_threshold: true` требуется для понижения
+  `thresholds.block` ниже default.
+- **Provenance signal** (Phase 3) — `post_read_send` weight применяется
+  если отправитель прочитал inbound email и сразу отправляет в окне
+  `provenance_window_sec`; RAM-only, no disk persistence.
+
+### Исправлено
+
+- T-PERF-01-003 Windows parallel-load flake (Phase 8 T-08-06; HARD cap
+  widened 10ms → 30ms с документированным rationale).
+
+SHA-256 (см. release tag annotation):
+  dist/yandex-mail-mcp.js  <BUNDLE-SHA-MAIN>
+  dist/cli-trust.js        <BUNDLE-SHA-CLI>
+
 ## [2.0.0] - 2026-05-20
 
 Layer 1 — Secure Ship. Functional v1 hardened into a distributable
@@ -188,6 +271,7 @@ sender redaction, send dedup). Завершены 8 фаз + post-review hardeni
 - Флаг `isError` корректно проставляется в ответах MCP при сбое
   IMAP/SMTP-операций (раньше ошибки маскировались под успех).
 
-[Unreleased]: https://github.com/user/yandex-mail-connector/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/user/yandex-mail-connector/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/user/yandex-mail-connector/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/user/yandex-mail-connector/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/user/yandex-mail-connector/releases/tag/v1.0.0
