@@ -7,6 +7,57 @@
 
 ## [Unreleased]
 
+## [2.1.3] — 2026-05-22
+
+Polish-релиз поверх v2.1.2. Применены находки из официальной документации
+Claude Code по работе с MCP-серверами. Никакого изменения auth-логики,
+никакого изменения tool API, никакого изменения политики и risk-scoring.
+Полностью обратносовместим с v2.1.x. Раздаётся через
+`git clone + npm install --omit=dev --ignore-scripts + claude mcp add`
+(пути `npx -y github:...` ещё не работают — структурный фикс
+запланирован на v2.2.0).
+
+### Добавлено
+
+- **`instructions` на стороне MCP-сервера.** В конструктор `McpServer`
+  передаётся короткая прозаическая инструкция о том, когда использовать
+  этот сервер: «Yandex Mail connector — read, search, organise, and (with
+  explicit auth) send email from a Yandex account…». Это позволяет
+  Tool Search (Claude Code, deferred-loading by default) находить
+  инструменты по упоминанию «Yandex mail / Яндекс почта / inbox / sent /
+  drafts» без `alwaysLoad: true`. (новое поле, не было раньше).
+- **`_meta["anthropic/maxResultSizeChars"]` на `list_emails`,
+  `search_emails`, `get_email`.** Поднимает per-tool лимит вывода до
+  200 000 символов (по умолчанию Claude Code режет на ~25k tokens ≈
+  100k chars). Для бэндов с десятками заголовков или полных писем это
+  устраняет тихие truncation'ы. Поддержка `_meta` добавлена в
+  `ToolDef` interface + проброс в `server.registerTool`.
+
+### Исправлено
+
+- **Версия сервера синхронизирована с package.json.** Раньше в
+  `index.ts` было захардкожено `version: '2.0.0'` — конфликт с
+  `package.json.version` начиная с v2.1.0. Теперь `version: '2.1.3'`
+  и обновляется при каждом релизе (вручную, как и `bin/yandex-mail-mcp.js`
+  shebang).
+
+### Документация
+
+- **README.md** полностью переписан в части установки:
+  - `claude mcp add` как primary path для Claude Code CLI
+  - Таблица скоупов (`local` / `project` / `user`) с указанием куда пишется
+    конфиг (`~/.claude.json` vs `.mcp.json`)
+  - JSON-конфиг для Claude Desktop с `alwaysLoad: true` как явный
+    workaround если Tool Search не находит инструменты
+  - Уточнение типа токена: app password (16 строчных букв) **vs** OAuth
+    (`y0_AgAAA…` префикс) — это разные механизмы
+  - Warning о том что `npx -y github:...` пока не работает (package.json
+    в подкаталоге)
+- **INSTALL.md** переработан Шаг 3 → 4 → 5:
+  - Шаг 3 — установка бандла через `git clone + npm install --omit=dev --ignore-scripts`
+  - Шаг 4 — Claude Code (`claude mcp add`) как первый клиент
+  - Шаг 5 — выбор YANDEX_AUTH_LEVEL (бывший Шаг 4)
+
 ## [2.1.2] — 2026-05-22
 
 Hotfix-релиз: критическое исправление аутентификации. v2.0.0 / v2.1.0 /

@@ -2,8 +2,8 @@
 
 MCP-сервер для Яндекс.Почты с защитой опасных операций на стороне сервера.
 
-[![Версия](https://img.shields.io/badge/версия-2.1.1-blue)](CHANGELOG.md)
-[![Тесты](https://img.shields.io/badge/тесты-377_/_0_упавших-success)](#)
+[![Версия](https://img.shields.io/badge/версия-2.1.3-blue)](CHANGELOG.md)
+[![Тесты](https://img.shields.io/badge/тесты-371_/_0_упавших-success)](#)
 [![Уязвимости](https://img.shields.io/badge/npm_audit-0-success)](#)
 [![Лицензия](https://img.shields.io/badge/лицензия-MIT-lightgrey)](LICENSE)
 
@@ -59,21 +59,100 @@ MCP-сервер для подключения AI-ассистента (Claude D
 
 ## Быстрая установка
 
-В одну строку через `npx`:
+### 1. Пароль приложения от Яндекс.Почты
 
-```bash
-npx -y github:nizamchi/yandex-mail-connector#v2.1.1
+Создаётся в [настройках безопасности Яндекса](https://id.yandex.ru/security/app-passwords)
+для категории «Почта». Получишь строку из 16 строчных букв (например
+`abcdefghijklmnop`). **Это не OAuth-токен** — OAuth-токены начинаются с
+`y0_AgAAA…` и нужны только если у тебя зарегистрировано собственное
+Яндекс-приложение. Большинству нужен пароль приложения.
+
+### 2. Файл `token.json`
+
+В каталоге состояния (`%APPDATA%\yandex-mail-mcp\` на Windows,
+`~/.config/yandex-mail-mcp/` на macOS/Linux):
+
+```json
+{
+  "email": "you@yandex.ru",
+  "password": "abcdefghijklmnop"
+}
 ```
 
-Минимум, что нужно настроить:
+На Linux/macOS: `chmod 600 token.json`.
 
-1. **Пароль приложения от Яндекс.Почты** — создаётся в [настройках безопасности
-   Яндекса](https://id.yandex.ru/security/app-passwords).
-2. **Файл `token.json`** — JSON с твоим логином, паролем приложения и адресом.
-3. **Подключение в конфиг MCP-клиента** — один JSON-блок.
+> Для OAuth-варианта используется поле `access_token` вместо `password` —
+> подробнее в [INSTALL.md](INSTALL.md#oauth-alternative-advanced).
 
-Пошагово, для четырёх разных клиентов (Claude Desktop, Claude Code, Cursor,
-Codename Goose) — [INSTALL.md](INSTALL.md).
+### 3. Поставить бандл локально
+
+```bash
+git clone https://github.com/nizamchi/yandex-mail-connector.git
+cd yandex-mail-connector/yandex-mail-mcp-desktop
+npm install --omit=dev --ignore-scripts
+```
+
+Готовый бандл лежит в `dist/yandex-mail-mcp.js`. Абсолютный путь к нему
+понадобится в шаге 4.
+
+### 4. Подключить к MCP-клиенту
+
+**Claude Code CLI — рекомендуется:**
+
+```bash
+# scope=user: сервер доступен во всех проектах. Конфиг пишется в ~/.claude.json.
+claude mcp add yandex-mail --scope user \
+  -e YANDEX_AUTH_LEVEL=readonly \
+  -- node /абсолютный/путь/к/dist/yandex-mail-mcp.js
+```
+
+Скоупы (по [официальной документации Claude Code](https://docs.claude.com/en/docs/claude-code/mcp)):
+
+| Скоуп | Где хранится | Когда использовать |
+|---|---|---|
+| `local` *(по умолчанию)* | `~/.claude.json` под текущим проектом | Личный, один проект |
+| `project` | `.mcp.json` в корне проекта (в git) | Шарить с командой через git |
+| `user` | `~/.claude.json` глобально | Личный, все проекты — **типично для почты** |
+
+Перезапустить Claude Code (`/exit` и запуск заново), и инструменты
+`yandex_list_folders`, `yandex_list_emails`, `yandex_get_email` и др.
+будут доступны в чате.
+
+**Claude Desktop — JSON-конфиг:**
+
+Добавить блок в `claude_desktop_config.json` (`%APPDATA%\Claude\` или
+`~/Library/Application Support/Claude/`):
+
+```json
+{
+  "mcpServers": {
+    "yandex-mail": {
+      "command": "node",
+      "args": ["/абсолютный/путь/к/dist/yandex-mail-mcp.js"],
+      "env": { "YANDEX_AUTH_LEVEL": "readonly" }
+    }
+  }
+}
+```
+
+Перезапустить Claude Desktop полностью (Quit, не закрытие окна).
+
+> **Tool Search defer:** если используешь Claude Code и инструменты не
+> появляются автоматически в первом запросе — это нормальное поведение
+> Tool Search (по умолчанию MCP-инструменты загружаются по запросу). v2.1.3
+> добавил `instructions` на стороне сервера, и Tool Search должен находить
+> инструменты по упоминанию «почта / Яндекс / inbox». Если всё равно нет —
+> добавь `"alwaysLoad": true` в JSON-конфиг (только для Claude Desktop) или
+> ткни напрямую: «используй yandex_list_folders».
+
+Пошагово для четырёх клиентов (Claude Desktop, Claude Code, Cursor, Codex) —
+[INSTALL.md](INSTALL.md).
+
+> ⚠️ **`npx -y github:nizamchi/yandex-mail-connector#vX.Y.Z` пока не работает**
+> из-за того что `package.json` лежит в подкаталоге `yandex-mail-mcp-desktop/`,
+> а npm ожидает его в корне репо. Структурный фикс запланирован на v2.2.0.
+> Сейчас используй git-clone путь выше — это рекомендация официальной
+> документации Claude Code для personal MCP-серверов.
 
 ## Уровни доступа
 

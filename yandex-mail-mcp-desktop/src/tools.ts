@@ -176,6 +176,10 @@ export interface ToolDef {
     idempotentHint: boolean;
     openWorldHint: boolean;
   };
+  /** Optional MCP _meta passed through to registerTool. Used to raise the
+   *  per-tool result-size cap for tools that legitimately return large outputs
+   *  (e.g. `anthropic/maxResultSizeChars` on list/search/get-email). */
+  meta?: Record<string, unknown>;
   requires: { authLevel: AuthLevel; capabilities?: Capability[] };
   handler: (
     params: unknown,
@@ -685,6 +689,10 @@ Args: folder (default "INBOX"), page (default 1), page_size (1-100, default 20).
 Для чтения тела -- yandex_get_email по UID.`,
     inputSchema: listEmailsSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    // v2.1.3: raise per-tool output cap. Default Claude Code limit is ~25k tokens
+    // (~100k chars). A 20-email page with full envelopes/subjects easily exceeds
+    // that on chatty mailboxes — raise to 200k chars so headers aren't truncated.
+    meta: { 'anthropic/maxResultSizeChars': 200_000 },
     requires: { authLevel: 0 },
     handler: async (params, _ctx) => {
       try {
@@ -705,6 +713,9 @@ Args: folder (default "INBOX"), uid (integer UID письма).
 Тело обрезается на 8000 символах; флаг truncated=true если обрезано.`,
     inputSchema: getEmailSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    // v2.1.3: same rationale as list_emails — single full email body + headers
+    // can hit ~50k chars on rich messages. Cap raised to 200k to be safe.
+    meta: { 'anthropic/maxResultSizeChars': 200_000 },
     requires: { authLevel: 0 },
     handler: async (params, _ctx) => {
       try {
@@ -843,6 +854,8 @@ Args:
   max_results (1-100, default 20)`,
     inputSchema: searchEmailsSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    // v2.1.3: same rationale as list_emails — search can return up to 100 headers.
+    meta: { 'anthropic/maxResultSizeChars': 200_000 },
     requires: { authLevel: 0 },
     handler: async (params, _ctx) => {
       try {
@@ -1217,6 +1230,7 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
         description: def.description,
         inputSchema: def.inputSchema.shape,
         annotations: def.annotations,
+        ...(def.meta ? { _meta: def.meta } : {}),
       },
       (input: unknown) => def.handler(input, ctx),
     );

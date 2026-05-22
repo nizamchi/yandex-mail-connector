@@ -74,10 +74,59 @@ chmod 600 token.json
    (Docker, GitHub Actions). Альтернатива для OAuth: `YANDEX_OAUTH_TOKEN`
    + `YANDEX_EMAIL`.
 
-## Шаг 3: настройка MCP-клиента
+## Шаг 3: установка бандла
 
-Все четыре клиента используют один и тот же snippet с разным путём к
-config-файлу.
+Структурно `package.json` лежит в подкаталоге `yandex-mail-mcp-desktop/`, что
+блокирует `npx -y github:...`. До v2.2.0 (переезд в корень) — устанавливай
+руками через git clone:
+
+```bash
+git clone https://github.com/nizamchi/yandex-mail-connector.git
+cd yandex-mail-connector/yandex-mail-mcp-desktop
+npm install --omit=dev --ignore-scripts
+# готовый бандл лежит в dist/yandex-mail-mcp.js
+```
+
+`--ignore-scripts` нужен потому что у нас есть `prepare: npm run build`,
+который пытается пересобрать esbuild'ом — а dev-deps (включая esbuild) при
+`--omit=dev` не ставятся. Бандл уже собран и закоммичен в git, пересобирать
+не нужно.
+
+Запомни **абсолютный путь** к `dist/yandex-mail-mcp.js` — он понадобится в
+Шаге 4.
+
+## Шаг 4: настройка MCP-клиента
+
+### Claude Code (рекомендуется)
+
+Команда `claude mcp add` записывает конфиг по официальному пути
+`~/.claude.json` (а не в произвольный `mcp.json`).
+
+```bash
+# user scope: сервер доступен во всех проектах
+claude mcp add yandex-mail --scope user \
+  -e YANDEX_AUTH_LEVEL=readonly \
+  -- node /абсолютный/путь/к/dist/yandex-mail-mcp.js
+```
+
+Скоупы по [официальной документации Claude Code](https://docs.claude.com/en/docs/claude-code/mcp):
+
+| Скоуп | Где хранится | Когда использовать |
+|---|---|---|
+| `local` *(по умолчанию)* | `~/.claude.json` под текущим проектом | Личный, один проект |
+| `project` | `.mcp.json` в корне проекта (коммитится в git) | Шарить с командой |
+| `user` | `~/.claude.json` глобально | Личный, все проекты — типично для почты |
+
+После добавления — `/exit` в Claude Code и запустить заново. Инструменты
+`yandex_list_folders` / `yandex_list_emails` / `yandex_get_email` /
+`yandex_search_emails` / `yandex_get_special_folders` /
+`yandex_folder_status` появятся в чате.
+
+**Tool Search defer:** Claude Code по умолчанию откладывает загрузку MCP
+tools и подгружает их по запросу. v2.1.3 добавил `instructions` на сервер,
+чтобы Tool Search находил почту по упоминанию ключевых слов («Яндекс»,
+«почта», «inbox»). Если что-то не нашлось — попроси явно: «используй
+yandex_list_folders для просмотра папок».
 
 ### Claude Desktop
 
@@ -91,35 +140,35 @@ config-файлу.
 {
   "mcpServers": {
     "yandex-mail": {
-      "command": "npx",
-      "args": ["-y", "github:user/repo#v2.0.0"],
-      "env": { "YANDEX_AUTH_LEVEL": "readonly" }
+      "command": "node",
+      "args": ["/абсолютный/путь/к/dist/yandex-mail-mcp.js"],
+      "env": { "YANDEX_AUTH_LEVEL": "readonly" },
+      "alwaysLoad": true
     }
   }
 }
 ```
 
+`alwaysLoad: true` — отключает Tool Search defer и грузит инструменты сразу
+при старте клиента. Полезно если Claude Desktop не находит почтовые tools
+автоматически.
+
 Перезапустить Claude Desktop полностью (Quit, не закрытие окна). Пути в
 config — строго ASCII, без пробелов с кириллицей, чтобы не было сюрпризов
 с экранированием.
 
-### Claude Code
-
-Файл config: `~/.claude/mcp.json` (глобально) или `.mcp.json` в корне
-проекта (локально). Snippet тот же. Перезапустить терминал / переоткрыть
-Claude Code.
-
 ### Codex CLI
 
 Файл config: `~/.codex/mcp_servers.json` (или соответствующий config dir
-по docs Codex). Snippet тот же. Перезапустить CLI.
+по docs Codex). Snippet аналогичен Claude Desktop. Перезапустить CLI.
 
 ### Cursor
 
-Settings -> "Cursor Settings" -> найти `mcp.servers` (или `mcpServers` в
-JSON-режиме). Вставить тот же блок. Перезапустить Cursor.
+Settings → «Cursor Settings» → найти `mcp.servers` (или `mcpServers` в
+JSON-режиме). Вставить тот же блок что для Claude Desktop. Перезапустить
+Cursor.
 
-## Шаг 4: выбор YANDEX_AUTH_LEVEL
+## Шаг 5: выбор YANDEX_AUTH_LEVEL
 
 ### Choosing YANDEX_AUTH_LEVEL
 

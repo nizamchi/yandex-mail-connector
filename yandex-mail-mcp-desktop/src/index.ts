@@ -77,7 +77,26 @@ policy.loadPolicy();
 // the TTL has lapsed. Quiet -- only audits if a sweep happened.
 allowlist.sweepPendingTrust();
 
-const server = new McpServer({ name: 'yandex-mail-mcp', version: '2.0.0' });
+// `instructions` field (MCP spec, v2.1.3): hint to clients with Tool Search
+// (Claude Code in particular) about WHEN to surface this server's tools. Without
+// this, Claude Code defers MCP tools and may not load them until the user
+// explicitly asks for "list folders" etc. With instructions present, Tool Search
+// indexes the server description and surfaces tools when the user mentions
+// email-related intent. Plain prose, no markup, kept short — clients summarise
+// it to the model. See: docs.anthropic.com on Claude Code MCP Tool Search.
+const SERVER_INSTRUCTIONS = [
+  'Yandex Mail connector — read, search, organise, and (with explicit auth)',
+  'send email from a Yandex account via IMAP+SMTP. Use this server when the',
+  'user mentions Yandex mail, Яндекс почта, inbox, sent, drafts, spam,',
+  'folders, attachments, replies, forwarding, or any task involving',
+  '@yandex.ru / @ya.ru / @yandex.com mailboxes. Read-only by default;',
+  'destructive operations require server-issued one-time codes.',
+].join(' ');
+
+const server = new McpServer(
+  { name: 'yandex-mail-mcp', version: '2.1.3' },
+  { instructions: SERVER_INSTRUCTIONS },
+);
 
 // Mutable bag shared with every tool handler via ctx.serverContext. canElicit
 // starts false and is updated by the oninitialized hook below; elicit dispatches
