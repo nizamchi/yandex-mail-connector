@@ -1,15 +1,13 @@
-// cli-trust.ts — `yandex-mail-mcp-trust` bin entry.
+// cli-trust.ts -- `yandex-mail-mcp-trust` bin entry.
 //
-// Out-of-band trust-token issuer (D-CLI-IPC option a). Workflow:
-//   1. User runs `npx yandex-mail-mcp-trust bob@x.com [--scope=permanent]`.
-//   2. We prompt "Add 'bob@x.com' to yandex-mail-mcp allowlist? [y/N]:" via
-//      node:readline/promises. Only 'y'/'Y' proceeds.
-//   3. Generate trust_token = crypto.randomBytes(32).toString('hex')   (64 hex chars).
-//   4. Write {address, scope, trust_token, expires_at_ms} to
-//      `${getStateDir()}/pending-trust.json` (mode 0600, atomic, single slot).
-//      TTL = 5 minutes.
-//   5. Print the token on stdout (one line) so the user can paste it into
-//      chat, then a stderr usage hint.
+// Phase 5 origin: out-of-band trust-token issuer + high-risk-send override
+// minter (D-CLI-IPC option a). Phase 7 adds operator subcommands:
+//   --policy show|set|reset|edit       (PMLF-CLI-01)
+//   --recent [--risk] [--limit N]      (PMLF-CLI-02)
+//   --list-trust [--stale Nd] [--source X]   (PMLF-CLI-03)
+//   --revoke-trust <address>           (PMLF-CLI-04)
+//   --high-risk-send <fp>              (PMLF-CLI-05; existing)
+//   --yes                              (PMLF-CLI-06; non-interactive flag)
 //
 // Why a separate process instead of a chat tool: the MCP server is started by
 // Claude Desktop and lives only inside that client. An attacker (LLM-crafted
@@ -17,12 +15,18 @@
 // the user's machine and cannot read this CLI's stdout. The token is bound to
 // the user's terminal until the user copy-pastes it.
 //
-// pending-trust.json is single-slot by design: a second CLI invocation
-// overwrites the first. The previous pending becomes orphaned & expires
-// harmlessly (≤5min). The matching MCP tool yandex_trust_address deletes the
-// file after successful redemption (single-use).
+// Parser determinism (Rev-2 H1): the manual argv parser follows fixed rules
+// for flag forms, positional consumption, --yes ordering, multi-value
+// rejection, negative-number handling, unknown flags, empty argv, missing
+// values. See parseArgs() comments for the verbatim rule list and the
+// T-CLI-PARSER-EDGE-01 test case for the assertion harness.
 //
-// No `any`. ESM `.js` suffix.
+// Audit drain (Rev-2 B1): every subcommand that emits an auditLog enqueue
+// MUST exit via exitAfterAudit(code) so the audit writeChain drains before
+// process termination. Plain process.exit is used ONLY on read-only paths
+// (no audit emitted) and on parse-error paths (audit not yet enqueued).
+//
+// No `any`. ESM `.js` suffix. ASCII only.
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -32,81 +36,355 @@ import { randomBytes } from 'node:crypto';
 
 import { getStateDir } from './state-dir.js';
 import { mintOverrideToken } from './override-tokens.js';
+import { flushAudit, auditLog } from './audit.js';
+import {
+  loadPolicy,
+  writePolicy,
+  getPolicyPath,
+  RiskPolicySchema,
+  type RiskPolicy,
+} from './policy.js';
+import { DEFAULT_POLICY } from './policy-defaults.js';
+import {
+  revokeTrust,
+  _listTrusted,
+  isAllowed,
+  type AllowlistSource,
+} from './allowlist.js';
+import { readRecentSends } from './recent-sends.js';
+
+// -- CliArgs discriminated union (CONTEXT D2) ---------------
 
 type CliArgs =
-  | { mode: 'trust'; address: string; scope: 'permanent' | 'session' }
-  | { mode: 'high-risk-send'; fingerprint: string };
+  | { mode: 'trust'; address: string; scope: 'permanent' | 'session'; yes: boolean }
+  | { mode: 'high-risk-send'; fingerprint: string; yes: boolean }
+  | { mode: 'help' }
+  | { mode: 'policy-show' }
+  | { mode: 'policy-set'; key: string; value: string; yes: boolean }
+  | { mode: 'policy-reset'; yes: boolean }
+  | { mode: 'policy-edit'; yes: boolean }
+  | { mode: 'recent'; risk: boolean; limit: number }
+  | { mode: 'list-trust'; staleMs?: number; source?: AllowlistSource }
+  | { mode: 'revoke-trust'; address: string; yes: boolean };
 
 const TTL_MS = 5 * 60 * 1000;
 
-function parseArgs(argv: string[]): CliArgs {
-  // Phase 5 D13: --high-risk-send=<32-hex> is mutually exclusive with the
-  // positional address argument and the --scope flag.
-  let highRiskFp: string | undefined;
-  const otherArgs: string[] = [];
-  for (const a of argv) {
-    if (a.startsWith('--high-risk-send=')) {
-      const v = a.slice('--high-risk-send='.length);
-      if (!/^[0-9a-f]{32}$/.test(v)) {
-        process.stderr.write(
-          `[yandex-mail-mcp-trust] Invalid fingerprint: expected 32 hex characters, got '${v}'\n`,
-        );
-        process.exit(2);
-      }
-      highRiskFp = v;
-      continue;
-    }
-    otherArgs.push(a);
+const VALID_SOURCES: ReadonlyArray<AllowlistSource> = [
+  'sent_history',
+  'user_trust_token',
+  'auto_trust_reply',
+  'legacy_migration',
+];
+
+// -- Audit-drain helper (Rev-2 B1) --------------------------
+
+/**
+ * Drain the audit writeChain, then exit. Use this in any exit path that
+ * follows an auditLog(...) enqueue. Internally awaits the audit writeChain
+ * so the queued appendFile lands on disk before the process terminates.
+ * Plain process.exit(...) is still used on read-only exit paths (no audit
+ * emitted) and on parse-error paths (audit not yet enqueued).
+ */
+async function exitAfterAudit(code: number): Promise<never> {
+  await flushAudit();
+  process.exit(code);
+}
+
+// -- Platform test seam (Rev-2 B2) --------------------------
+
+// effectivePlatform(): returns YANDEX_FORCE_PLATFORM_FOR_TESTS if set to
+// 'win32' / 'linux' / 'darwin', else process.platform. Used in --policy
+// edit to make win32 / POSIX paths deterministic in tests. Test-only seam
+// -- production behaviour is process.platform via the fallback.
+function effectivePlatform(): string {
+  const forced = process.env.YANDEX_FORCE_PLATFORM_FOR_TESTS;
+  if (forced === 'win32' || forced === 'linux' || forced === 'darwin') {
+    return forced;
   }
-  if (highRiskFp !== undefined) {
-    if (otherArgs.length > 0) {
-      process.stderr.write(
-        `[yandex-mail-mcp-trust] --high-risk-send is mutually exclusive with <address> and --scope\n`,
-      );
-      process.exit(2);
+  return process.platform;
+}
+
+// -- Email validator (shared by trust + revoke-trust modes) -
+
+function validEmail(s: string): boolean {
+  // Cheap syntactic check -- RFC 5322 is intentionally not parsed here.
+  // Same as the IMAP envelope: addresses are treated as opaque tokens.
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+}
+
+// -- Parser ------------------------------------------------
+
+// Parser determinism rules (Rev-2 H1):
+//   - Flag form: `--foo bar` is canonical. `--foo=bar` accepted ONLY for
+//     legacy --high-risk-send=<hex> + --scope=<scope> (Phase 5 contract).
+//   - Boolean flags: --yes, --risk, --help take no value.
+//   - Positional consumption: after a mode-defining flag with positional
+//     shape, the NEXT non-flag token is the positional unconditionally
+//     (handles negative numbers in `--policy set foo -1`).
+//   - --yes ordering: may appear ANYWHERE in argv. Pre-scanned once.
+//   - Multi-value flags: NOT supported. `--source foo --source bar` ->
+//     exit 2 with `<flag>: specified more than once`.
+//   - Negative numbers: `--limit -5` parses to -5, fails range check;
+//     exit 2 with `--limit: must be 1..50, got -5`. NOT "unknown flag".
+//   - Unknown flag: exit 2 with `unknown flag: <token>` + `try --help`.
+//   - Empty argv: exit 2 with `no command specified; try --help`.
+//   - Missing value: `--limit` at end of argv -> exit 2 with
+//     `--limit: expected an integer value`.
+//   - Mixed-mode flags: e.g. `--policy show --recent` -> exit 2 with
+//     `mixed-mode flags not allowed; got --policy and --recent`.
+
+function die(msg: string, hint?: string): never {
+  process.stderr.write(msg + '\n');
+  if (hint !== undefined) process.stderr.write(hint + '\n');
+  process.exit(2);
+}
+
+const MODE_FLAGS = new Set([
+  '--help',
+  '--policy',
+  '--recent',
+  '--list-trust',
+  '--revoke-trust',
+  '--high-risk-send',
+]);
+
+function detectMode(argv: string[]): string | null {
+  const seen: string[] = [];
+  for (const a of argv) {
+    if (MODE_FLAGS.has(a)) seen.push(a);
+    if (a.startsWith('--high-risk-send=')) seen.push('--high-risk-send');
+  }
+  // Drop duplicates while preserving first-seen order.
+  const uniq = Array.from(new Set(seen));
+  if (uniq.length > 1) {
+    die(`mixed-mode flags not allowed; got ${uniq[0]} and ${uniq[1]}`);
+  }
+  if (uniq.length === 1) return uniq[0];
+  // Positional-only path: address-trust mode (Phase 5 backward compat).
+  for (const a of argv) {
+    if (!a.startsWith('-')) return '__positional__';
+  }
+  return null;
+}
+
+function preScanYes(argv: string[]): boolean {
+  return argv.includes('--yes');
+}
+
+// Strip --yes from argv so per-mode helpers do not have to handle it.
+function stripFlags(argv: string[], drop: ReadonlySet<string>): string[] {
+  return argv.filter(a => !drop.has(a));
+}
+
+function parseArgs(argv: string[]): CliArgs {
+  if (argv.length === 0) {
+    die('no command specified; try --help');
+  }
+  const mode = detectMode(argv);
+  if (mode === null) {
+    // All tokens were unknown flags.
+    for (const a of argv) {
+      if (a.startsWith('--')) die(`unknown flag: ${a}`, 'try --help');
     }
-    return { mode: 'high-risk-send', fingerprint: highRiskFp };
+    die('no command specified; try --help');
   }
 
-  const positional: string[] = [];
-  let scope: 'permanent' | 'session' = 'permanent';
-  for (const a of otherArgs) {
-    if (a.startsWith('--scope=')) {
-      const v = a.slice('--scope='.length);
-      if (v === 'permanent' || v === 'session') {
-        scope = v;
-      } else {
-        process.stderr.write(
-          `[yandex-mail-mcp-trust] Invalid scope '${v}'. Use --scope=permanent | --scope=session.\n` +
-          `[yandex-mail-mcp-trust] (scope='auto' is reserved for the in_reply_to flow and not allowed from CLI.)\n`,
-        );
-        process.exit(2);
+  const yes = preScanYes(argv);
+  const cleaned = stripFlags(argv, new Set(['--yes']));
+
+  switch (mode) {
+    case '--help':
+      return { mode: 'help' };
+    case '--policy':
+      return parsePolicyMode(cleaned, yes);
+    case '--recent':
+      return parseRecentMode(cleaned);
+    case '--list-trust':
+      return parseListTrustMode(cleaned);
+    case '--revoke-trust':
+      return parseRevokeTrustMode(cleaned, yes);
+    case '--high-risk-send':
+      return parseHighRiskSendMode(cleaned, yes);
+    case '__positional__':
+      return parseAddressMode(cleaned, yes);
+  }
+  /* istanbul ignore next */
+  die(`internal: unrecognised mode ${mode}`);
+}
+
+// --- per-mode parsers ---
+
+function parsePolicyMode(argv: string[], yes: boolean): CliArgs {
+  // argv has --policy somewhere; locate index, consume next token as
+  // subcmd, then per-subcmd positionals.
+  const idx = argv.indexOf('--policy');
+  const subcmd = argv[idx + 1];
+  if (subcmd === undefined || subcmd.startsWith('--')) {
+    die(`policy: expected one of show|set|reset|edit, got '${subcmd ?? ''}'`);
+  }
+  if (subcmd === 'show') {
+    return { mode: 'policy-show' };
+  }
+  if (subcmd === 'reset') {
+    return { mode: 'policy-reset', yes };
+  }
+  if (subcmd === 'edit') {
+    return { mode: 'policy-edit', yes };
+  }
+  if (subcmd === 'set') {
+    const key = argv[idx + 2];
+    const value = argv[idx + 3];
+    if (key === undefined || key.startsWith('--')) {
+      die('policy set: expected <key>');
+    }
+    if (value === undefined) {
+      die('policy set: expected <value>');
+    }
+    return { mode: 'policy-set', key, value, yes };
+  }
+  die(`policy: expected one of show|set|reset|edit, got '${subcmd}'`);
+}
+
+function parseRecentMode(argv: string[]): CliArgs {
+  let risk = false;
+  let limit = 20;
+  let sawLimit = false;
+  // Skip --recent itself; iterate the rest.
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--recent') continue;
+    if (a === '--risk') { risk = true; continue; }
+    if (a === '--limit') {
+      if (sawLimit) die('--limit: specified more than once');
+      sawLimit = true;
+      const v = argv[i + 1];
+      if (v === undefined || v.startsWith('--')) {
+        die('--limit: expected an integer value');
       }
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1 || n > 50) {
+        die(`--limit: must be 1..50, got ${v}`);
+      }
+      limit = n;
+      i++;
       continue;
     }
+    if (a.startsWith('--')) die(`unknown flag: ${a}`, 'try --help');
+    die(`unexpected positional: ${a}`);
+  }
+  return { mode: 'recent', risk, limit };
+}
+
+function parseListTrustMode(argv: string[]): CliArgs {
+  let staleMs: number | undefined;
+  let source: AllowlistSource | undefined;
+  let sawStale = false;
+  let sawSource = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--list-trust') continue;
+    if (a === '--stale') {
+      if (sawStale) die('--stale: specified more than once');
+      sawStale = true;
+      const v = argv[i + 1];
+      if (v === undefined || v.startsWith('--')) {
+        die('--stale: expected a value like 90d');
+      }
+      const m = /^([0-9]+)d$/.exec(v);
+      if (m === null) die(`--stale: expected Nd format, got '${v}'`);
+      const n = Number(m[1]);
+      if (!Number.isInteger(n) || n < 0) die(`--stale: invalid number '${v}'`);
+      staleMs = n * 86_400_000;
+      i++;
+      continue;
+    }
+    if (a === '--source') {
+      if (sawSource) die('--source: specified more than once');
+      sawSource = true;
+      const v = argv[i + 1];
+      if (v === undefined || v.startsWith('--')) {
+        die('--source: expected a value');
+      }
+      if (!VALID_SOURCES.includes(v as AllowlistSource)) {
+        die(`--source: expected one of ${VALID_SOURCES.join('|')}, got '${v}'`);
+      }
+      source = v as AllowlistSource;
+      i++;
+      continue;
+    }
+    if (a.startsWith('--')) die(`unknown flag: ${a}`, 'try --help');
+    die(`unexpected positional: ${a}`);
+  }
+  return { mode: 'list-trust', staleMs, source };
+}
+
+function parseRevokeTrustMode(argv: string[], yes: boolean): CliArgs {
+  const idx = argv.indexOf('--revoke-trust');
+  const address = argv[idx + 1];
+  if (address === undefined || address.startsWith('--')) {
+    die('revoke-trust: expected an address');
+  }
+  if (!validEmail(address)) {
+    die(`revoke-trust: invalid address: '${address}'`);
+  }
+  // Reject extra positionals.
+  for (let i = idx + 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) die(`unknown flag: ${a}`, 'try --help');
+    die(`unexpected positional: ${a}`);
+  }
+  return { mode: 'revoke-trust', address: address.toLowerCase(), yes };
+}
+
+function parseHighRiskSendMode(argv: string[], yes: boolean): CliArgs {
+  let fp: string | undefined;
+  for (const a of argv) {
+    if (a.startsWith('--high-risk-send=')) {
+      fp = a.slice('--high-risk-send='.length);
+    } else if (a === '--high-risk-send') {
+      // Space form. Locate next token.
+      const i = argv.indexOf(a);
+      fp = argv[i + 1];
+    }
+  }
+  if (fp === undefined) {
+    die('high-risk-send: expected <32-hex-fingerprint>');
+  }
+  if (!/^[0-9a-f]{32}$/.test(fp)) {
+    die(`high-risk-send: invalid fingerprint: '${fp}' (expected 32 hex chars)`);
+  }
+  return { mode: 'high-risk-send', fingerprint: fp, yes };
+}
+
+function parseAddressMode(argv: string[], yes: boolean): CliArgs {
+  let scope: 'permanent' | 'session' = 'permanent';
+  const positional: string[] = [];
+  for (const a of argv) {
+    if (a.startsWith('--scope=')) {
+      const v = a.slice('--scope='.length);
+      if (v === 'permanent' || v === 'session') { scope = v; continue; }
+      die(`Invalid scope '${v}'. Use --scope=permanent | --scope=session.`);
+    }
     if (a.startsWith('-')) {
-      process.stderr.write(`[yandex-mail-mcp-trust] Unknown flag: ${a}\n`);
-      process.exit(2);
+      die(`unknown flag: ${a}`, 'try --help');
     }
     positional.push(a);
   }
   if (positional.length !== 1) {
-    process.stderr.write(
-      '[yandex-mail-mcp-trust] Usage: yandex-mail-mcp-trust <address> [--scope=permanent|session]\n' +
-      '       yandex-mail-mcp-trust --high-risk-send=<32-hex-fingerprint>\n',
+    die(
+      'Usage: yandex-mail-mcp-trust <address> [--scope=permanent|session]\n' +
+      '       yandex-mail-mcp-trust --high-risk-send <32-hex-fingerprint>\n' +
+      '       yandex-mail-mcp-trust --help',
     );
-    process.exit(2);
   }
-  const address = positional[0] as string;
-  // Cheap syntactic check — RFC 5322 is intentionally not parsed here.
-  // Same as the IMAP envelope: addresses are treated as opaque tokens.
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(address)) {
-    process.stderr.write(`[yandex-mail-mcp-trust] Invalid address: '${address}'\n`);
-    process.exit(2);
+  const address = positional[0]!;
+  if (!validEmail(address)) {
+    die(`Invalid address: '${address}'`);
   }
-  return { mode: 'trust', address: address.toLowerCase(), scope };
+  return { mode: 'trust', address: address.toLowerCase(), scope, yes };
 }
+
+// -- Helpers --------------------------------------------------
 
 function atomicWrite(target: string, data: string, mode: number): void {
   const tmp = target + '.tmp';
@@ -122,7 +400,6 @@ function atomicWrite(target: string, data: string, mode: number): void {
 
 async function promptYesNo(question: string): Promise<boolean> {
   // CI / piped-stdin mode: if YANDEX_TRUST_ASSUME_YES is set we skip the prompt.
-  // This is intended for tests; documented as "do not set in interactive use".
   if (process.env.YANDEX_TRUST_ASSUME_YES === '1') return true;
   const rl = readline.createInterface({ input: stdin, output: stdout });
   try {
@@ -133,10 +410,62 @@ async function promptYesNo(question: string): Promise<boolean> {
   }
 }
 
-async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+// -- --help text (CONTEXT D14) -------------------------------
 
-  if (args.mode === 'high-risk-send') {
+function printHelp(): void {
+  const stateDir = getStateDir();
+  const lines: string[] = [
+    'yandex-mail-mcp-trust -- operator CLI for yandex-mail-mcp.',
+    '',
+    'Usage:',
+    '  yandex-mail-mcp-trust <address> [--scope=permanent|session]   [W]',
+    '      Mint a single-use trust_token for the given address.',
+    '',
+    '  yandex-mail-mcp-trust --high-risk-send <32-hex-fp> [--yes]    [W]',
+    '      Mint a single-use override token for a high-risk send.',
+    '',
+    '  yandex-mail-mcp-trust --policy show                           [R]',
+    '      Print the resolved risk policy as JSON.',
+    '',
+    '  yandex-mail-mcp-trust --policy set <key> <value> [--yes]      [W]',
+    '      Set one risk-policy leaf (e.g. thresholds.augment 25).',
+    '',
+    '  yandex-mail-mcp-trust --policy reset [--yes]                  [W]',
+    '      Reset risk-policy.json to bundled defaults.',
+    '',
+    '  yandex-mail-mcp-trust --policy edit                           [W]',
+    '      Open risk-policy.json in $EDITOR; re-validate + re-sign on save.',
+    '',
+    '  yandex-mail-mcp-trust --recent [--risk] [--limit N]           [R]',
+    '      Show last N successful sends (default 20; max 50).',
+    '      --risk filters to medium+ tiers.',
+    '',
+    '  yandex-mail-mcp-trust --list-trust [--stale Nd] [--source X]  [R]',
+    '      List allowlist entries with optional staleness / source filters.',
+    '',
+    '  yandex-mail-mcp-trust --revoke-trust <address> [--yes]        [W]',
+    '      Remove an entry from the allowlist.',
+    '',
+    '  yandex-mail-mcp-trust --help                                  [R]',
+    '      Print this help.',
+    '',
+    '[R] = read-only; [W] = mutates state. --yes skips interactive prompts.',
+    '',
+    'State directory: ' + stateDir,
+    '  risk-policy.json    -- policy + HMAC signature',
+    '  allowlist.json      -- TOFU recipients + HMAC signature',
+    '  recent-sends.jsonl  -- last 50 successful sends (forensics buffer)',
+    '  audit.jsonl         -- append-only forensics log',
+    '  secret.bin          -- per-install HMAC secret (0o600)',
+  ];
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+// -- Mode handlers -------------------------------------------
+
+async function handleHighRiskSend(args: { fingerprint: string; yes: boolean }): Promise<void> {
+  const skipPrompt = args.yes || process.env.YANDEX_TRUST_ASSUME_YES === '1';
+  if (!skipPrompt) {
     const ok = await promptYesNo(
       `Mint a single-use high-risk-send override for fingerprint ${args.fingerprint}? [y/N]: `,
     );
@@ -144,38 +473,73 @@ async function main(): Promise<void> {
       process.stderr.write('Aborted.\n');
       process.exit(1);
     }
-    const { token, expiresAtMs } = mintOverrideToken(args.fingerprint);
-    const minLeft = Math.round((expiresAtMs - Date.now()) / 60_000);
-    process.stdout.write(`override_token: ${token}\n`);
-    process.stderr.write(
-      `\n[yandex-mail-mcp-trust] Override expires in ${minLeft} min.\n` +
-      `[yandex-mail-mcp-trust] Paste the token when the MCP elicit prompt asks for it,\n` +
-      `[yandex-mail-mcp-trust] OR set YANDEX_OVERRIDE_TOKEN=<token> in your MCP server env and retry the send.\n`,
-    );
-    process.exit(0);
   }
+  const { token, expiresAtMs } = mintOverrideToken(args.fingerprint);
+  const minLeft = Math.round((expiresAtMs - Date.now()) / 60_000);
+  process.stdout.write(`override_token: ${token}\n`);
+  process.stderr.write(
+    `\n[yandex-mail-mcp-trust] Override expires in ${minLeft} min.\n` +
+    `[yandex-mail-mcp-trust] Paste the token when the MCP elicit prompt asks for it,\n` +
+    `[yandex-mail-mcp-trust] OR set YANDEX_OVERRIDE_TOKEN=<token> in your MCP server env and retry the send.\n`,
+  );
+  process.exit(0);
+}
 
-  const { address, scope } = args;
-  const ok = await promptYesNo(`Add '${address}' to yandex-mail-mcp allowlist? [y/N]: `);
-  if (!ok) {
-    process.stderr.write('Aborted.\n');
-    process.exit(1);
+async function handleTrust(args: { address: string; scope: 'permanent' | 'session'; yes: boolean }): Promise<void> {
+  const skipPrompt = args.yes || process.env.YANDEX_TRUST_ASSUME_YES === '1';
+  if (!skipPrompt) {
+    const ok = await promptYesNo(`Add '${args.address}' to yandex-mail-mcp allowlist? [y/N]: `);
+    if (!ok) {
+      process.stderr.write('Aborted.\n');
+      process.exit(1);
+    }
   }
-
   const trust_token = randomBytes(32).toString('hex');
   const expires_at_ms = Date.now() + TTL_MS;
-  const pending = { address, scope, trust_token, expires_at_ms };
+  const pending = { address: args.address, scope: args.scope, trust_token, expires_at_ms };
   const target = path.join(getStateDir(), 'pending-trust.json');
   atomicWrite(target, JSON.stringify(pending, null, 2), 0o600);
 
-  // Token on stdout (machine-friendly). Hint on stderr (human-friendly).
   process.stdout.write(`trust_token: ${trust_token}\n`);
   process.stderr.write(
     `\n[yandex-mail-mcp-trust] Now call:\n` +
-    `  yandex_trust_address({ address: "${address}", scope: "${scope}", trust_token: "${trust_token}" })\n` +
+    `  yandex_trust_address({ address: "${args.address}", scope: "${args.scope}", trust_token: "${trust_token}" })\n` +
     `[yandex-mail-mcp-trust] TTL: 5 minutes.\n`,
   );
   process.exit(0);
+}
+
+// --- main() ---
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+
+  switch (args.mode) {
+    case 'help':
+      printHelp();
+      process.exit(0);
+      break;
+    case 'trust':
+      await handleTrust(args);
+      break;
+    case 'high-risk-send':
+      await handleHighRiskSend(args);
+      break;
+    case 'policy-show':
+      throw new Error('not yet implemented in this task');
+    case 'policy-set':
+      throw new Error('not yet implemented in this task');
+    case 'policy-reset':
+      throw new Error('not yet implemented in this task');
+    case 'policy-edit':
+      throw new Error('not yet implemented in this task');
+    case 'recent':
+      throw new Error('not yet implemented in this task');
+    case 'list-trust':
+      throw new Error('not yet implemented in this task');
+    case 'revoke-trust':
+      throw new Error('not yet implemented in this task');
+  }
 }
 
 main().catch((e: unknown) => {
@@ -183,3 +547,19 @@ main().catch((e: unknown) => {
   process.stderr.write(`[yandex-mail-mcp-trust] error: ${err.message ?? String(e)}\n`);
   process.exit(1);
 });
+
+// Suppress "unused import" warnings for Task-6/7 imports that will be
+// consumed in subsequent commits. Tree-shaken by esbuild if untouched.
+void exitAfterAudit;
+void auditLog;
+void loadPolicy;
+void writePolicy;
+void getPolicyPath;
+void RiskPolicySchema;
+void DEFAULT_POLICY;
+void revokeTrust;
+void _listTrusted;
+void isAllowed;
+void readRecentSends;
+void effectivePlatform;
+void (null as unknown as RiskPolicy);
