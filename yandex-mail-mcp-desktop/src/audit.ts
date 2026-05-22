@@ -273,10 +273,24 @@ export function auditLogAction(
   auditLog({ action, status, level, ts, ...filtered });
 }
 
+/**
+ * Drain the audit writeChain. Awaits all queued appendFile operations so
+ * callers can guarantee on-disk durability before exiting the process.
+ *
+ * Public surface for the CLI (Phase 7). MUST be awaited after any
+ * auditLog()/auditLogAction() call followed by process.exit(...).
+ *
+ * Idempotent and safe to call at any time. Not a test seam -- this is a
+ * production API.
+ */
+export async function flushAudit(): Promise<void> {
+  await writeChain;
+}
+
 // -- Test seams (NOT for production callers) ---------------
 
 export async function _drainForTests(): Promise<void> {
-  await writeChain;
+  await flushAudit();
 }
 
 export function _resetForTests(): void {
