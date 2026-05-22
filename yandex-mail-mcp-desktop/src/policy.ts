@@ -195,7 +195,12 @@ interface PolicyFile {
   signature: string;
 }
 
-function writePolicy(policy: RiskPolicy): void {
+/**
+ * Public surface for the CLI (Phase 7). Caller MUST have already validated
+ * the policy via RiskPolicySchema.parse before calling. This function does
+ * NOT validate -- it signs and writes whatever it receives.
+ */
+export function writePolicy(policy: RiskPolicy): void {
   const secret = loadSecret();
   const file: PolicyFile = {
     policy,
