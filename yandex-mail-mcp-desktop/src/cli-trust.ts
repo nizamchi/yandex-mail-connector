@@ -47,7 +47,6 @@ import { DEFAULT_POLICY, type RiskPolicy } from './policy-defaults.js';
 import {
   revokeTrust,
   _listTrusted,
-  isAllowed,
   type AllowlistSource,
 } from './allowlist.js';
 import { readRecentSends } from './recent-sends.js';
@@ -412,50 +411,23 @@ async function promptYesNo(question: string): Promise<boolean> {
 // -- --help text (CONTEXT D14) -------------------------------
 
 function printHelp(): void {
-  const stateDir = getStateDir();
   const lines: string[] = [
-    'yandex-mail-mcp-trust -- operator CLI for yandex-mail-mcp.',
+    'yandex-mail-mcp-trust -- operator CLI.',
     '',
     'Usage:',
-    '  yandex-mail-mcp-trust <address> [--scope=permanent|session]   [W]',
-    '      Mint a single-use trust_token for the given address.',
+    '  <address> [--scope=permanent|session]      [W] mint trust_token',
+    '  --high-risk-send <32-hex> [--yes]          [W] mint override token',
+    '  --policy show                              [R] print risk policy JSON',
+    '  --policy set <key> <value> [--yes]         [W] set policy leaf',
+    '  --policy reset [--yes]                     [W] reset to defaults',
+    '  --policy edit                              [W] $EDITOR + re-sign',
+    '  --recent [--risk] [--limit N]              [R] last N sends',
+    '  --list-trust [--stale Nd] [--source X]     [R] allowlist filter',
+    '  --revoke-trust <address> [--yes]           [W] remove from allowlist',
+    '  --help                                     [R] this help',
     '',
-    '  yandex-mail-mcp-trust --high-risk-send <32-hex-fp> [--yes]    [W]',
-    '      Mint a single-use override token for a high-risk send.',
-    '',
-    '  yandex-mail-mcp-trust --policy show                           [R]',
-    '      Print the resolved risk policy as JSON.',
-    '',
-    '  yandex-mail-mcp-trust --policy set <key> <value> [--yes]      [W]',
-    '      Set one risk-policy leaf (e.g. thresholds.augment 25).',
-    '',
-    '  yandex-mail-mcp-trust --policy reset [--yes]                  [W]',
-    '      Reset risk-policy.json to bundled defaults.',
-    '',
-    '  yandex-mail-mcp-trust --policy edit                           [W]',
-    '      Open risk-policy.json in $EDITOR; re-validate + re-sign on save.',
-    '',
-    '  yandex-mail-mcp-trust --recent [--risk] [--limit N]           [R]',
-    '      Show last N successful sends (default 20; max 50).',
-    '      --risk filters to medium+ tiers.',
-    '',
-    '  yandex-mail-mcp-trust --list-trust [--stale Nd] [--source X]  [R]',
-    '      List allowlist entries with optional staleness / source filters.',
-    '',
-    '  yandex-mail-mcp-trust --revoke-trust <address> [--yes]        [W]',
-    '      Remove an entry from the allowlist.',
-    '',
-    '  yandex-mail-mcp-trust --help                                  [R]',
-    '      Print this help.',
-    '',
-    '[R] = read-only; [W] = mutates state. --yes skips interactive prompts.',
-    '',
-    'State directory: ' + stateDir,
-    '  risk-policy.json    -- policy + HMAC signature',
-    '  allowlist.json      -- TOFU recipients + HMAC signature',
-    '  recent-sends.jsonl  -- last 50 successful sends (forensics buffer)',
-    '  audit.jsonl         -- append-only forensics log',
-    '  secret.bin          -- per-install HMAC secret (0o600)',
+    '[R] read-only; [W] mutates. --yes skips prompts.',
+    'State dir: ' + getStateDir(),
   ];
   process.stdout.write(lines.join('\n') + '\n');
 }
@@ -642,22 +614,11 @@ async function handlePolicyReset(args: { yes: boolean }): Promise<void> {
 // -- --policy edit (D7 + Rev-2 B2) --------------------------
 
 function printEditHelpBlock(): void {
-  const p = getPolicyPath();
-  const lines: string[] = [
-    '--policy edit requires the $EDITOR environment variable to be set.',
-    '',
-    'On this platform $EDITOR is not configured. Either:',
-    '  1. Set $EDITOR and re-run, e.g.:',
-    '       set EDITOR=notepad     (cmd.exe)',
-    '       $env:EDITOR="notepad"  (PowerShell)',
-    '       export EDITOR=vi       (bash/zsh)',
-    '  2. Edit the file manually with any text editor:',
-    '       ' + p,
-    '     After editing run:  yandex-mail-mcp-trust --policy edit',
-    '     to re-validate and re-sign. (Schema-invalid files will be rejected.)',
-    '  3. Or use --policy set <key> <value> for single-leaf updates.',
-  ];
-  process.stdout.write(lines.join('\n') + '\n');
+  process.stdout.write(
+    '--policy edit requires $EDITOR. Set it (e.g. EDITOR=notepad / vi) and re-run,\n' +
+    'or edit the file manually: ' + getPolicyPath() + '\n' +
+    'then re-run --policy edit to re-validate + re-sign. Or use --policy set.\n',
+  );
 }
 
 async function handlePolicyEdit(_args: { yes: boolean }): Promise<void> {
@@ -734,6 +695,105 @@ async function handlePolicyEdit(_args: { yes: boolean }): Promise<void> {
   await exitAfterAudit(0);
 }
 
+// -- --recent (D11; read-only) ------------------------------
+
+function formatTier(t: 'low' | 'medium' | 'high' | 'block'): string {
+  // Pad tier marker to fixed-width 9 chars including brackets so the row
+  // columns line up. e.g. '[low]    ', '[medium] ', '[high]   ', '[block]  '.
+  const s = '[' + t + ']';
+  return s + ' '.repeat(Math.max(0, 9 - s.length));
+}
+
+function formatDomains(doms: string[]): string {
+  if (doms.length === 0) return '()';
+  if (doms.length <= 3) return '(' + doms.join(',') + ')';
+  return '(' + doms.slice(0, 3).join(',') + '+' + (doms.length - 3) + ')';
+}
+
+async function handleRecent(args: { risk: boolean; limit: number }): Promise<void> {
+  const all = readRecentSends();
+  if (all.length === 0) {
+    process.stderr.write('no sends recorded yet.\n');
+    process.exit(0);
+  }
+  let filtered = all;
+  if (args.risk) {
+    filtered = filtered.filter(r => r.risk_tier !== 'low');
+  }
+  if (filtered.length === 0) {
+    process.stderr.write('no matching sends.\n');
+    process.exit(0);
+  }
+  const sliced = filtered.slice(-args.limit);
+  for (const r of sliced) {
+    const tier = formatTier(r.risk_tier);
+    const msgid = r.message_id.slice(0, 32);
+    const doms = formatDomains(r.recipients_domains);
+    process.stdout.write(
+      `${tier} ${r.ts} msgid=${msgid} rcpts=${r.recipients_count} ${doms} score=${r.risk_score}\n`,
+    );
+  }
+  process.exit(0);
+}
+
+// -- --list-trust (D12; read-only) --------------------------
+
+async function handleListTrust(args: { staleMs?: number; source?: AllowlistSource }): Promise<void> {
+  const all = _listTrusted();
+  const now = Date.now();
+  let filtered = all;
+  if (args.staleMs !== undefined) {
+    const staleMs = args.staleMs;
+    filtered = filtered.filter(e => e.scope === 'permanent' && (now - e.lastUsed) > staleMs);
+  }
+  if (args.source !== undefined) {
+    const src = args.source;
+    filtered = filtered.filter(e => e.source === src);
+  }
+  if (filtered.length === 0) {
+    process.stderr.write('no matching entries.\n');
+    process.exit(0);
+  }
+  // Column-pad for readability. address up to 40, scope 9, source 17.
+  function pad(s: string, n: number): string {
+    return s.length >= n ? s : s + ' '.repeat(n - s.length);
+  }
+  for (const e of filtered) {
+    const addr = pad(e.address, 40);
+    const scope = pad(e.scope, 9);
+    const source = pad(e.source, 17);
+    const lastUsedIso = Number.isFinite(e.lastUsed)
+      ? new Date(e.lastUsed).toISOString()
+      : '(unknown)';
+    process.stdout.write(
+      `${addr} ${scope} ${source} lastUsed=${lastUsedIso} useCount=${e.useCount}\n`,
+    );
+  }
+  process.exit(0);
+}
+
+// -- --revoke-trust (D13) ----------------------------------
+
+async function handleRevokeTrust(args: { address: string; yes: boolean }): Promise<void> {
+  const skipPrompt = args.yes || process.env.YANDEX_TRUST_ASSUME_YES === '1';
+  if (!skipPrompt) {
+    const ok = await promptYesNo(`Revoke '${args.address}' from allowlist? [y/N]: `);
+    if (!ok) {
+      process.stderr.write('Aborted.\n');
+      process.exit(0);
+    }
+  }
+  const removed = revokeTrust(args.address);
+  if (removed) {
+    process.stdout.write(`revoked: ${args.address}\n`);
+    // revokeTrust emitted allowlist_revoke audit; drain before exit.
+    await exitAfterAudit(0);
+  } else {
+    process.stderr.write(`no entry for '${args.address}'\n`);
+    process.exit(0);
+  }
+}
+
 // --- main() ---
 
 async function main(): Promise<void> {
@@ -763,11 +823,14 @@ async function main(): Promise<void> {
       await handlePolicyEdit(args);
       break;
     case 'recent':
-      throw new Error('not yet implemented in this task');
+      await handleRecent(args);
+      break;
     case 'list-trust':
-      throw new Error('not yet implemented in this task');
+      await handleListTrust(args);
+      break;
     case 'revoke-trust':
-      throw new Error('not yet implemented in this task');
+      await handleRevokeTrust(args);
+      break;
   }
 }
 
@@ -777,9 +840,3 @@ main().catch((e: unknown) => {
   process.exit(1);
 });
 
-// Suppress "unused import" warnings for Task-7 imports that will be
-// consumed in subsequent commits. Tree-shaken by esbuild if untouched.
-void revokeTrust;
-void _listTrusted;
-void isAllowed;
-void readRecentSends;
