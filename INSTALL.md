@@ -5,10 +5,11 @@
 1. Зайти на https://passport.yandex.ru.
 2. "Управление аккаунтом" -> "Пароли и авторизация" -> "Пароли приложений".
 3. Создать пароль для "Почта" (IMAP/SMTP). Сохранить — Яндекс показывает
-   пароль только один раз.
-4. Использовать этот пароль как `access_token` в `token.json` ниже.
+   пароль только один раз. Получится строка из 16 строчных латинских букв
+   (например `abcdefghijklmnop`).
+4. Использовать этот пароль как поле `password` в `token.json` ниже.
 
-Альтернативу через OAuth см. в разделе "OAuth alternative (advanced)".
+OAuth — альтернативный путь, см. раздел "OAuth alternative (advanced)".
 
 ## Шаг 2: token.json
 
@@ -25,14 +26,28 @@ secret). Это работает для всех способов запуска
 переопределить через `YANDEX_STATE_DIR=/custom/path` — тогда `token.json`
 ищется по `$YANDEX_STATE_DIR/token.json`.
 
-Формат:
+Формат (v2.1.2+ — рекомендуемый с паролем приложения):
 
 ```json
 {
-  "access_token": "PASSWORD_OR_OAUTH_TOKEN",
-  "email": "you@yandex.ru"
+  "email": "you@yandex.ru",
+  "password": "abcdefghijklmnop"
 }
 ```
+
+Формат (OAuth — для тех у кого есть Яндекс OAuth-приложение):
+
+```json
+{
+  "email": "you@yandex.ru",
+  "access_token": "y0_AgAAA..."
+}
+```
+
+**Backward compatibility:** если у вас уже стоял token.json от v2.0/v2.1 с
+паролем приложения в поле `access_token` — сервер автоматически определит
+шейп по содержимому (16 строчных букв → пароль, `y0_...` → OAuth). Но при
+любом редактировании рекомендуется явно использовать поле `password`.
 
 На Unix обязательно:
 
@@ -54,8 +69,10 @@ chmod 600 token.json
    живёт в `~/.npm/_npx` и стирается между запусками).
 3. **CWD** (legacy): `<cwd>/token.json` — работает при ручном запуске из
    известного каталога. Для Claude Desktop / Cursor cwd непредсказуем.
-4. **Без файла:** environment variables `YANDEX_OAUTH_TOKEN` +
-   `YANDEX_EMAIL`. Подходит для ephemeral сред (Docker, GitHub Actions).
+4. **Без файла (рекомендуется):** environment variables
+   `YANDEX_APP_PASSWORD` + `YANDEX_EMAIL`. Подходит для ephemeral сред
+   (Docker, GitHub Actions). Альтернатива для OAuth: `YANDEX_OAUTH_TOKEN`
+   + `YANDEX_EMAIL`.
 
 ## Шаг 3: настройка MCP-клиента
 

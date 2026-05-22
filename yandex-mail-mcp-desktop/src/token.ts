@@ -13,15 +13,30 @@
  *      which is wiped on each invocation.
  *   4. <cwd>/token.json — legacy: works when manually invoked from a known cwd.
  *      Unreliable from Claude Desktop / Cursor MCP child processes.
- *   5. YANDEX_OAUTH_TOKEN + YANDEX_EMAIL env vars — fallback for ephemeral envs.
+ *   5. YANDEX_APP_PASSWORD or YANDEX_OAUTH_TOKEN + YANDEX_EMAIL env vars —
+ *      fallback for ephemeral envs.
  *
- * token.json format (same as disk):
- *   {
- *     "access_token": "y0_AgAAA...",
- *     "email": "you@yandex.ru",
- *     "imap_host": "imap.yandex.com",   // optional — override IMAP host
- *     "smtp_host": "smtp.yandex.com"    // optional — override SMTP host
- *   }
+ * token.json formats (v2.1.2+):
+ *
+ *   Yandex app password (RECOMMENDED — created at passport.yandex.ru):
+ *     {
+ *       "email": "you@yandex.ru",
+ *       "password": "abcdefghijklmnop",      // 16 lowercase letters
+ *       "imap_host": "imap.yandex.com",      // optional
+ *       "smtp_host": "smtp.yandex.com"       // optional
+ *     }
+ *
+ *   OAuth (legacy — only if you have a yandex OAuth app):
+ *     {
+ *       "email": "you@yandex.ru",
+ *       "access_token": "y0_AgAAA..."        // starts with y0_
+ *     }
+ *
+ *   Legacy single-field (v2.0/v2.1 compatibility) — auto-detected:
+ *     {
+ *       "email": "you@yandex.ru",
+ *       "access_token": "abcdefghijklmnop"    // 16 lowercase → routed as app password
+ *     }
  *
  * Env var overrides: YANDEX_IMAP_HOST, YANDEX_SMTP_HOST
  */
@@ -32,9 +47,29 @@ import { getStateDir } from './state-dir.js';
 
 export interface Credentials {
   email: string;
-  oauthToken: string;
+  /** Yandex app password (SASL PLAIN auth). Exactly one of password|oauthToken must be set. */
+  password?: string;
+  /** Yandex OAuth access_token (XOAUTH2 auth). Legacy path. Exactly one of password|oauthToken must be set. */
+  oauthToken?: string;
   imapHost?: string;
   smtpHost?: string;
+}
+
+/**
+ * Heuristic: detect whether a token-shaped string is a Yandex app password
+ * or an OAuth access token. Used for backward compatibility with users who
+ * stored an app password in the legacy "access_token" field per pre-v2.1.2
+ * INSTALL.md guidance.
+ *
+ *   - OAuth token: starts with `y0_` prefix (Yandex convention, ~80 chars)
+ *   - App password: exactly 16 lowercase letters (Yandex Passport generator)
+ *
+ * Default for ambiguous: OAuth (preserves v2.0/v2.1 behavior).
+ */
+function detectTokenKind(t: string): 'password' | 'oauth' {
+  if (t.startsWith('y0_')) return 'oauth';
+  if (/^[a-z]{16}$/.test(t)) return 'password';
+  return 'oauth';
 }
 
 // SEC-03 (T-02-01): host allowlist для защиты от env-poisoning. Оба `.com` и
@@ -142,31 +177,76 @@ export function loadCredentials(): Credentials {
     } catch (e) {
       throw new Error(`Failed to read token.json at ${tokenFile}: ${String(e)}`);
     }
-    // Validate required fields (no try — let it throw naturally with a clear message)
-    if (!raw.access_token || !raw.email) {
-      throw new Error('token.json must contain "access_token" and "email"');
+    if (!raw.email) {
+      throw new Error('token.json must contain "email"');
     }
+
+    // v2.1.2: support both "password" (Yandex app password, recommended) and
+    // "access_token" (OAuth, legacy). Exactly one of the two must be present.
+    // For backward compat with pre-v2.1.2 users who put their app password
+    // into the "access_token" field (per the misleading old INSTALL.md),
+    // detectTokenKind() routes the value to the correct auth path.
+    const explicitPwd = (raw.password ?? raw.pass) as string | undefined;
+    const legacyTok   = raw.access_token as string | undefined;
+
+    if (explicitPwd && legacyTok) {
+      throw new Error(
+        'token.json must contain either "password" OR "access_token", not both. ' +
+        'Use "password" for Yandex app passwords (recommended) or "access_token" for OAuth tokens.',
+      );
+    }
+    if (!explicitPwd && !legacyTok) {
+      throw new Error(
+        'token.json must contain one of: "password" (Yandex app password, recommended) | ' +
+        '"access_token" (OAuth token, legacy).',
+      );
+    }
+
     const creds: Credentials = {
-      email:      raw.email as string,
-      oauthToken: raw.access_token as string,
-      imapHost:   raw.imap_host as string | undefined,
-      smtpHost:   raw.smtp_host as string | undefined,
+      email:    raw.email as string,
+      imapHost: raw.imap_host as string | undefined,
+      smtpHost: raw.smtp_host as string | undefined,
     };
+    if (explicitPwd) {
+      creds.password = explicitPwd;
+    } else if (legacyTok) {
+      // Heuristic: route based on token shape
+      if (detectTokenKind(legacyTok) === 'password') {
+        creds.password = legacyTok;
+      } else {
+        creds.oauthToken = legacyTok;
+      }
+    }
     validateHost(creds.imapHost, 'imap');
     validateHost(creds.smtpHost, 'smtp');
     return creds;
   }
 
-  // 2. Env var fallback
-  const token = process.env.YANDEX_OAUTH_TOKEN;
-  const email = process.env.YANDEX_EMAIL;
-  if (token && email) {
+  // 2. Env var fallback — both YANDEX_APP_PASSWORD (new) and YANDEX_OAUTH_TOKEN
+  //    (legacy) are accepted. Exactly one must be set together with YANDEX_EMAIL.
+  const envPwd   = process.env.YANDEX_APP_PASSWORD;
+  const envToken = process.env.YANDEX_OAUTH_TOKEN;
+  const email    = process.env.YANDEX_EMAIL;
+  if (email && (envPwd || envToken)) {
+    if (envPwd && envToken) {
+      throw new Error(
+        'Set either YANDEX_APP_PASSWORD or YANDEX_OAUTH_TOKEN, not both.',
+      );
+    }
     const creds: Credentials = {
       email,
-      oauthToken: token,
-      imapHost:   process.env.YANDEX_IMAP_HOST,
-      smtpHost:   process.env.YANDEX_SMTP_HOST,
+      imapHost: process.env.YANDEX_IMAP_HOST,
+      smtpHost: process.env.YANDEX_SMTP_HOST,
     };
+    if (envPwd) {
+      creds.password = envPwd;
+    } else if (envToken) {
+      if (detectTokenKind(envToken) === 'password') {
+        creds.password = envToken;
+      } else {
+        creds.oauthToken = envToken;
+      }
+    }
     validateHost(creds.imapHost, 'imap');
     validateHost(creds.smtpHost, 'smtp');
     return creds;
@@ -181,7 +261,7 @@ export function loadCredentials(): Credentials {
   const lines = [
     'Yandex Mail credentials not found.',
     '',
-    'Option 1 (recommended) -- create token.json in the state directory:',
+    'Option 1 (RECOMMENDED) -- Yandex app password in token.json:',
   ];
   if (preferredDir) {
     lines.push(`  ${path.join(preferredDir, 'token.json')}`);
@@ -189,13 +269,20 @@ export function loadCredentials(): Credentials {
     lines.push('  <state_dir>/token.json  (state_dir unavailable; check $YANDEX_STATE_DIR)');
   }
   lines.push(
-    '  { "access_token": "y0_AgAAA...", "email": "you@yandex.ru" }',
+    '  { "email": "you@yandex.ru", "password": "abcdefghijklmnop" }',
     '',
-    'Option 2 -- point to an arbitrary path via env:',
+    '  Create the 16-letter app password at passport.yandex.ru ->',
+    '  "Passwords and authorization" -> "App passwords" -> "Mail".',
+    '',
+    'Option 2 -- OAuth token (legacy, only if you have a Yandex OAuth app):',
+    '  { "email": "you@yandex.ru", "access_token": "y0_AgAAA..." }',
+    '',
+    'Option 3 -- point to an arbitrary path via env:',
     '  YANDEX_TOKEN_FILE=/path/to/token.json',
     '',
-    'Option 3 -- ephemeral env vars (CI / containers):',
-    '  YANDEX_OAUTH_TOKEN=y0_AgAAA...  YANDEX_EMAIL=you@yandex.ru',
+    'Option 4 -- ephemeral env vars (CI / containers):',
+    '  YANDEX_APP_PASSWORD=abcdefghijklmnop  YANDEX_EMAIL=you@yandex.ru',
+    '  (or YANDEX_OAUTH_TOKEN=y0_AgAAA...  YANDEX_EMAIL=...  for OAuth)',
   );
   throw new Error(lines.join('\n'));
 }

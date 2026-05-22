@@ -46,7 +46,9 @@ function makeClient(creds: Credentials): ImapFlow {
     host: creds.imapHost ?? IMAP_HOST,
     port: IMAP_PORT,
     secure: true,
-    auth: { user: creds.email, accessToken: creds.oauthToken },
+    auth: creds.password
+      ? { user: creds.email, pass: creds.password }
+      : { user: creds.email, accessToken: creds.oauthToken! },
     logger: false,
   });
 }

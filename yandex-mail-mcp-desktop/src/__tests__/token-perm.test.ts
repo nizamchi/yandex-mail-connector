@@ -61,7 +61,7 @@ function spyExit(): ExitSpy {
   };
 }
 
-function makeTokenFile(mode: number): { dir: string; tokenPath: string; cleanup: () => void; prevCwd: string } {
+function makeTokenFile(mode: number): { dir: string; tokenPath: string; cleanup: () => void; prevCwd: string; prevEnv: string | undefined } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ymm-perm-'));
   const tokenPath = path.join(dir, 'token.json');
   fs.writeFileSync(
@@ -74,12 +74,20 @@ function makeTokenFile(mode: number): { dir: string; tokenPath: string; cleanup:
   }
   const prevCwd = process.cwd();
   process.chdir(dir);
+  // Pin token discovery to this temp file explicitly so the test does not
+  // accidentally pick up a real <state_dir>/token.json on the developer's
+  // machine (which takes precedence over cwd).
+  const prevEnv = process.env.YANDEX_TOKEN_FILE;
+  process.env.YANDEX_TOKEN_FILE = tokenPath;
   return {
     dir,
     tokenPath,
     prevCwd,
+    prevEnv,
     cleanup: () => {
       process.chdir(prevCwd);
+      if (prevEnv === undefined) delete process.env.YANDEX_TOKEN_FILE;
+      else process.env.YANDEX_TOKEN_FILE = prevEnv;
       try { fs.unlinkSync(tokenPath); } catch { /* ignore */ }
       try { fs.rmdirSync(dir); } catch { /* ignore */ }
     },

@@ -22,7 +22,9 @@ export async function sendEmail(
     host: creds.smtpHost ?? 'smtp.yandex.com',
     port: 465,
     secure: true,
-    auth: { type: 'OAuth2', user: creds.email, accessToken: creds.oauthToken },
+    auth: creds.password
+      ? { user: creds.email, pass: creds.password }
+      : { type: 'OAuth2', user: creds.email, accessToken: creds.oauthToken! },
   });
   try {
     const info = await transport.sendMail({

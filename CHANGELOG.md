@@ -7,6 +7,60 @@
 
 ## [Unreleased]
 
+## [2.1.2] — 2026-05-22
+
+Hotfix-релиз: критическое исправление аутентификации. v2.0.0 / v2.1.0 /
+v2.1.1 жёстко требовали OAuth XOAUTH2-аутентификации (`auth.accessToken` в
+imapflow / `auth.type='OAuth2'` в nodemailer), но `INSTALL.md` рекомендовал
+класть в поле `access_token` **пароль приложения** Яндекса (16 строчных
+букв). Сервер падал с `unsupported challenge` при попытке IMAP-логина —
+пользователи не могли подключиться. Раздаётся через
+`npx -y github:nizamchi/yandex-mail-connector#v2.1.2`.
+
+### Исправлено
+
+- **App password как primary auth-путь.** `token.json` теперь поддерживает
+  два поля:
+  - `password` — пароль приложения Яндекса (16 строчных букв, SASL PLAIN)
+  - `access_token` — OAuth-токен (XOAUTH2, для тех у кого есть OAuth-приложение Яндекса)
+
+  `loadCredentials` парсит оба формата. `imap.ts` и `smtp.ts` ветвят
+  `auth` объект в зависимости от того что задано. Среды переменных тоже
+  поддерживают обе формы: `YANDEX_APP_PASSWORD` (новая) или
+  `YANDEX_OAUTH_TOKEN` (legacy).
+- **Backward compatibility heuristic.** Если у пользователя уже стоит
+  v2.0/v2.1 token.json с паролем приложения в поле `access_token` — сервер
+  определяет шейп по содержимому:
+  - 16 строчных букв `[a-z]{16}` → SASL PLAIN (пароль приложения)
+  - `y0_...` префикс → XOAUTH2 (OAuth token)
+  - ambiguous → XOAUTH2 (preserve v2.0/v2.1 behavior)
+- **Защита от обоих полей одновременно.** Если в token.json указаны и
+  `password` и `access_token` — `loadCredentials` бросает ошибку с
+  явным сообщением. Single-source-of-truth для credential.
+- **Test isolation в `token-perm.test.ts`.** Тесты permCheck использовали
+  cwd-discovery и проваливались если у разработчика стоял реальный
+  `<state_dir>/token.json` (приоритет выше). Тесты теперь явно пиннят
+  путь через `YANDEX_TOKEN_FILE` env var.
+
+### Документация
+
+- **INSTALL.md обновлён.** Шаг 1 теперь явно описывает что пароль
+  приложения = 16 строчных букв, и что это нужно класть в поле
+  `password`. OAuth — отдельная альтернативная секция. Env vars
+  тоже задокументированы (YANDEX_APP_PASSWORD / YANDEX_OAUTH_TOKEN).
+- **token.ts docstring** обновлён с двумя примерами token.json (password,
+  OAuth) и legacy compat-блоком.
+
+### Безопасность
+
+- **Никаких изменений в threat model.** Это исправление UX-блокера, не
+  security-фикса. Все рейтеры/гарды/policy/audit/HMAC-подпись/allowlist
+  работают идентично v2.1.1 (тесты подтверждают: 371/377 pass, 6 skip
+  unix-only, 0 fail).
+- **Рекомендация ротировать пароль приложения** если он попал в
+  логи/чаты при тестировании. Старый пароль отозвать в
+  passport.yandex.ru → "Пароли приложений" → нужный → удалить.
+
 ## [2.1.1] — 2026-05-22
 
 Косметический patch-релиз поверх v2.1.0. Только мелкие исправления качества
