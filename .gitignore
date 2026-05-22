@@ -54,3 +54,6 @@ override-tokens.jsonl
 CLAUDE.md
 MILESTONE-DEEP-REVIEW-PROMPT.md
 .github/REPO-SETUP.md
+# Устаревшие документы первой версии (заменены на README/INSTALL/POLICY)
+overview.html
+yandex_mail_mcp_guide.docx
