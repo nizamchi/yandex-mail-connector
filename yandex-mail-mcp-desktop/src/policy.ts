@@ -102,18 +102,40 @@ export const RiskPolicySchema = z.object({
 let cachedPolicy: RiskPolicy | null = null;
 let loaded: boolean = false;
 let secretCache: Buffer | null = null;
+// M-3 (v2.1.1 cosmetic): freeze the resolved policy file path at loadPolicy()
+// entry. Once non-null, getPolicyPath() returns the captured value -- env
+// changes mid-session no longer divert callers to a different file than the
+// one whose policy is cached. Documented invariant: env variables are read
+// ONCE at startup; mid-session env mutation is a no-op (matches the
+// auth.ts:getAuthLevel() discipline). Tests flip env between cases and call
+// _resetForTests() which clears this slot, so they keep working.
+let resolvedPolicyPath: string | null = null;
 
 // ── Path resolution ───────────────────────────────────────────
 // SINGLE source of truth for the policy file path. All file I/O in this
 // module (read in loadPolicy, write in writePolicy) routes through here.
-// No env-var caching -- every call re-reads process.env.YANDEX_POLICY_FILE
-// so tests can flip the env between cases.
+//
+// M-3 (v2.1.1 cosmetic): the path is frozen at loadPolicy() entry into
+// `resolvedPolicyPath`. Before loadPolicy() runs, getPolicyPath() reads env
+// live (tests rely on this to flip env between cases). After loadPolicy()
+// runs, getPolicyPath() returns the captured value -- env mutation by an
+// LLM or a later process.env assignment is a no-op at the policy path
+// boundary. Mirrors auth.ts:getAuthLevel() startup-freeze discipline.
 //
 // Behavior matrix (D4):
 //   YANDEX_POLICY_FILE unset    -> <state-dir>/risk-policy.json (auto-create on missing).
 //   YANDEX_POLICY_FILE=<path>   -> path.resolve(<path>) (throw on missing -- mirrors token.ts M-2).
 
 export function getPolicyPath(): string {
+  if (resolvedPolicyPath !== null) return resolvedPolicyPath;
+  return _resolvePolicyPathFresh();
+}
+
+// M-3 (v2.1.1 cosmetic): internal resolver. Always reads env -- bypasses the
+// freeze. Used by loadPolicy() and writePolicy() which are the AUTHORITY that
+// sets the frozen path. External callers go through getPolicyPath() which
+// honours the freeze.
+function _resolvePolicyPathFresh(): string {
   const explicit = process.env.YANDEX_POLICY_FILE;
   if (explicit !== undefined && explicit.length > 0) {
     return path.resolve(explicit);
@@ -213,7 +235,9 @@ export function writePolicy(policy: RiskPolicy): void {
     policy,
     signature: signPolicy(policy, secret),
   };
-  atomicWrite(getPolicyPath(), JSON.stringify(file, null, 2), 0o600);
+  // M-3: writePolicy bypasses the freeze; it's the authority that may write
+  // to a refreshed state-dir during loadPolicy's first-launch branch.
+  atomicWrite(_resolvePolicyPathFresh(), JSON.stringify(file, null, 2), 0o600);
 }
 
 // ── FATAL recovery with test-substitutable hook seam (B-2) ─────
@@ -271,7 +295,10 @@ function freezePolicy(p: RiskPolicy): RiskPolicy {
 export function loadPolicy(): RiskPolicy {
   const explicit = process.env.YANDEX_POLICY_FILE;
   const usingExplicit = explicit !== undefined && explicit.length > 0;
-  const filePath = getPolicyPath();
+  // M-3: loadPolicy is the authority that sets the frozen path. It MUST
+  // re-resolve from env (bypassing any prior freeze) so a test that flips
+  // state-dir without calling _resetForTests still gets the right file.
+  const filePath = _resolvePolicyPathFresh();
 
   if (!fs.existsSync(filePath)) {
     if (usingExplicit) {
@@ -291,6 +318,7 @@ export function loadPolicy(): RiskPolicy {
     );
     cachedPolicy = freezePolicy(DEFAULT_POLICY);
     loaded = true;
+    resolvedPolicyPath = filePath; // M-3: freeze the path now that we have a loaded policy
     return cachedPolicy;
   }
 
@@ -374,11 +402,13 @@ export function loadPolicy(): RiskPolicy {
     );
     cachedPolicy = freezePolicy(DEFAULT_POLICY);
     loaded = true;
+    resolvedPolicyPath = filePath; // M-3: freeze the path on anti-tamper fallback too
     return cachedPolicy;
   }
 
   cachedPolicy = freezePolicy(policy);
   loaded = true;
+  resolvedPolicyPath = filePath; // M-3: freeze the path on the verified-load success path
   return cachedPolicy;
 }
 
@@ -393,6 +423,7 @@ export function _resetForTests(): void {
   cachedPolicy = null;
   loaded = false;
   secretCache = null;
+  resolvedPolicyPath = null; // M-3: tests flip YANDEX_POLICY_FILE between cases
 }
 
 // Test-only seam: replace the cached policy in-place. Used by Phase 2

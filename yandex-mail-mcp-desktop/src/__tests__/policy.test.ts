@@ -304,6 +304,41 @@ test('T-ENV-01: env_override_path_used -- YANDEX_POLICY_FILE points at custom pa
   }
 });
 
+// M-3 (v2.1.1 cosmetic): once loadPolicy() resolves the policy file path, it
+// is frozen for the process lifetime. Subsequent env mutation (e.g. by an
+// LLM tool call that touches process.env) does not divert getPolicyPath()
+// to a different file than the one whose policy is cached.
+test('T-ENV-FREEZE-01: getPolicyPath() is frozen after loadPolicy() (M-3)', () => {
+  const dir = mkTmpStateDir();
+  try {
+    // Initial load -- env unset -> default <state-dir>/risk-policy.json.
+    delete process.env.YANDEX_POLICY_FILE;
+    loadPolicy();
+    const frozenPath = getPolicyPath();
+    assert.equal(frozenPath, path.join(dir, 'risk-policy.json'));
+
+    // Mutate the env mid-session; getPolicyPath() must still return the
+    // frozen path (no divergence between cached policy and reported path).
+    process.env.YANDEX_POLICY_FILE = path.join(dir, 'should-not-be-used.json');
+    try {
+      assert.equal(getPolicyPath(), frozenPath, 'env mutation must not divert getPolicyPath()');
+    } finally {
+      delete process.env.YANDEX_POLICY_FILE;
+    }
+
+    // After _resetForTests(), the freeze is cleared (tests need to flip env).
+    _resetForTests();
+    process.env.YANDEX_POLICY_FILE = path.join(dir, 'now-this-one.json');
+    try {
+      assert.equal(getPolicyPath(), path.resolve(path.join(dir, 'now-this-one.json')));
+    } finally {
+      delete process.env.YANDEX_POLICY_FILE;
+    }
+  } finally {
+    cleanupTmpStateDir(dir);
+  }
+});
+
 test('T-ENV-02: env_override_missing_path_throws -- typo surfaces, no silent fallback', () => {
   const dir = mkTmpStateDir();
   try {
