@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: build + test (Node ${{ matrix.node }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18', '20', '22']
+        os: [ubuntu-latest]
+        include:
+          # Sanity Windows leg on the LTS — but only one node version to keep
+          # the matrix small. Most platform-specific issues we hit live in
+          # token-perm tests which are unix-only anyway.
+          - node: '20'
+            os: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: yandex-mail-mcp-desktop/package-lock.json
+
+      - name: Install (with devDeps so esbuild is available)
+        working-directory: yandex-mail-mcp-desktop
+        # Cannot use `npm ci` here — the lockfile may be ahead of CI Node minor
+        # version. Use plain install with --ignore-scripts to skip `prepare`
+        # (which itself runs `npm run build` — we run that explicitly below
+        # so the failure surface is clearer).
+        run: npm install --ignore-scripts
+
+      - name: npm audit (prod deps only)
+        working-directory: yandex-mail-mcp-desktop
+        # Fail the build if any HIGH/CRITICAL vuln lands in production deps.
+        # Dev-only vulns (esbuild past CVE history etc.) handled separately
+        # via `npm audit` without --omit=dev which we DO NOT block on yet —
+        # too noisy in transient dev-tool issues.
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Build bundle
+        working-directory: yandex-mail-mcp-desktop
+        run: npm run build
+
+      - name: Run tests
+        working-directory: yandex-mail-mcp-desktop
+        run: npm test
+
+      - name: Smoke health check (--check)
+        working-directory: yandex-mail-mcp-desktop
+        # Use a fresh tempdir as state-dir so we get a clean "no token" result.
+        # Expected exit code: 1 (token not found) — we use `|| true` and assert
+        # that the output contains the expected banner.
+        run: |
+          node dist/yandex-mail-mcp.js --check 2>&1 | tee /tmp/check.out || true
+          grep -q "yandex-mail-mcp health check" /tmp/check.out
+        shell: bash
+        env:
+          YANDEX_STATE_DIR: ${{ runner.temp }}/ymc-ci-state
+
+  # Build artifact-only job, just to confirm the shipped bundle hasn't drifted
+  # from the committed source. Cheap; one platform/node.
+  bundle-drift:
+    name: bundle drift check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: yandex-mail-mcp-desktop/package-lock.json
+      - name: Install
+        working-directory: yandex-mail-mcp-desktop
+        run: npm install --ignore-scripts
+      - name: Rebuild bundle
+        working-directory: yandex-mail-mcp-desktop
+        run: npm run build
+      - name: Compare against committed dist
+        # If npm run build produces a different bundle than what's checked in,
+        # surface a warning but DON'T fail — esbuild minify output isn't
+        # byte-stable across Node minor versions. This is informational only.
+        # Once esbuild ships deterministic minify (#1234) we can flip to a
+        # hard failure.
+        working-directory: yandex-mail-mcp-desktop
+        run: |
+          if ! git diff --quiet dist/; then
+            echo "::warning::Committed dist/ differs from freshly built bundle."
+            echo "Diff summary:"
+            git diff --stat dist/
+          else
+            echo "Bundle matches committed dist/ exactly."
+          fi

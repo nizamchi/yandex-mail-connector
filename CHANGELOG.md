@@ -7,9 +7,67 @@
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-05-22
+
+Minor-релиз. Пять новых функций для UX и эксплуатации + смена лицензии с MIT
+на PolyForm Noncommercial 1.0.0. Никаких изменений auth/security модели.
+Раздаётся через `git clone + npm install --omit=dev --ignore-scripts`
+(npx-from-github ещё не работает, см. структурный issue).
+
+### ⚠️ Смена лицензии — MIT → PolyForm Noncommercial 1.0.0
+
+Распространение коннектора теперь регулируется **PolyForm Noncommercial
+License 1.0.0** ([polyformproject.org](https://polyformproject.org/licenses/noncommercial/1.0.0/)) — стандартная, написанная юристами лицензия специально для софта, который остаётся
+бесплатным для личного и некоммерческого использования, но требует отдельной
+платной лицензии для коммерческой перепродажи / встраивания в SaaS / использования
+внутри for-profit компании для её коммерческой деятельности.
+
+**Что разрешено бесплатно:**
+- Личное использование, домашние проекты, обучение, исследования
+- Некоммерческие организации (благотворительные, образовательные, гос. институты)
+- Изучение, модификация, форки в некоммерческих целях
+
+**Что теперь требует коммерческой лицензии:**
+- Перепродажа коннектора / сервисов на его основе третьим лицам
+- Встраивание в платный коммерческий продукт
+- Использование внутри коммерческой компании для её коммерческих целей
+
+Контакт для коммерческой лицензии: `nizamidrisov98@gmail.com`.
+
+Существующие форки/копии до этого коммита остаются под прежним MIT — это
+стандартная практика смены лицензии вперёд по таймлайну (так делают Redis,
+Elastic, MongoDB, Sentry и многие другие).
+
+Полный текст лицензии в [LICENSE](LICENSE). Развёрнутое объяснение мотивации
+в секции «Лицензия» в [README.md](README.md).
+
 ### Добавлено
 
-- **`/ymc-config` slash-команда** для Claude Code. Файл `.claude/commands/ymc-config.md`. Юзер копирует в `~/.claude/commands/` один раз; после этого `/ymc-config` показывает интерактивный пикер уровней доступа (стрелочки + Enter, как у GSD) и пишет выбор в `~/.claude.json`. Перезапуск Claude Code после смены — обязателен (TOCTOU защита). Документация в README + INSTALL Шаг 4.5.
+- **`--check` CLI flag в бандле.** `node dist/yandex-mail-mcp.js --check` запускает
+  non-authenticating health-check за ~3 секунды: проверяет наличие token.json (и
+  определяет тип учётных данных — app password / OAuth / heuristic detection),
+  существование state-dir, валидность подписи allowlist, parseability policy-файла,
+  TLS-reachability `imap.yandex.com:993` и `smtp.yandex.com:465`. **Не делает IMAP
+  LOGIN** — не оставляет следов «новый вход в аккаунт» в Яндексе. Exit code 0 если
+  все 7 чеков прошли, 1 если хоть один упал, 2 на внутреннюю ошибку. Реализация
+  в `src/check-config.ts`.
+- **MCP tool `yandex_health_check`** (L0, readonly). Та же диагностика, но
+  возвращается JSON'ом изнутри MCP-сессии. Полезно для агента: при «у меня
+  что-то не работает» — вызвать первым, понять состояние без коннекта к Яндексу.
+- **`bin/install-slash.js` cross-platform helper.** Копирует
+  `.claude/commands/*.md` в `~/.claude/commands/` (создаёт каталог если нет;
+  работает на Windows/macOS/Linux). Флаги: `--force` (перезаписать), `--uninstall`.
+  Используется как `node yandex-mail-mcp-desktop/bin/install-slash.js`.
+- **`/ymc-update` slash-команда** для Claude Code. Файл `.claude/commands/ymc-update.md`. Проверяет есть ли на GitHub более свежая версия (`git fetch + rev-parse origin/main`), показывает changelog между HEAD и origin/main, с подтверждением юзера делает `git pull --ff-only` + `npm install --omit=dev --ignore-scripts`. **Не пушит ничего**, **не делает `git reset --hard`**, не запускает postinstall-скрипты (защита от supply-chain). Если working tree грязный — отказывается, просит закоммитить/stash.
+- **GitHub Actions CI workflow** (`.github/workflows/ci.yml`). На каждый push в `main` и каждый PR — `npm install` + `npm audit --omit=dev --audit-level=high` + `npm run build` + `npm test` + smoke-test `--check`. Матрица: Node 18/20/22 на Ubuntu + Node 20 на Windows. Отдельный job «bundle drift check» сравнивает закоммиченный `dist/` со свежесобранным (информационный warning, не fail).
+- **`/ymc-config` slash-команда** для Claude Code. Файл `.claude/commands/ymc-config.md`. После установки через install-slash — `/ymc-config` в Claude Code открывает интерактивный пикер уровней доступа (4 варианта стрелочками + Enter, как у GSD), записывает выбор в `~/.claude.json`. Перезапуск Claude Code после смены — обязателен (TOCTOU защита). Документация в README + INSTALL.
+
+### Исправлено
+
+- **Server version sync.** Раньше в `src/index.ts` было захардкожено `version:
+  '2.0.0'` в McpServer-конструкторе, рассинхронизация с `package.json.version`
+  начиная с v2.1.0. Теперь обе строки указывают на 2.2.0 и обновляются при каждом
+  релизе.
 
 ## [2.1.3] — 2026-05-22
 

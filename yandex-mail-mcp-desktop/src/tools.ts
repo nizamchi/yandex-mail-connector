@@ -26,6 +26,7 @@ import { generateCode, verifyCode, actionFingerprint, type VerifyResult } from '
 import type { AuthLevel, Capability } from './auth.js';
 import * as allowlist from './allowlist.js';
 import { getStateDir } from './state-dir.js';
+import * as policy from './policy.js';
 import { auditLog, auditLogAction, EMAIL_ACTIONS, subjectHash } from './audit.js';
 import { enforceSendGuards, recordSend, isAdvisory, is2FASender, isProtectedFolder, type GuardResult } from './guards.js';
 import { normalizeRecipients, validateNoSmuggling } from './recipients.js';
@@ -254,6 +255,7 @@ function wrapWithAudit(def: ToolDef): ToolDef {
 // SDK performs against inputSchema before invoking the handler.
 
 const listFoldersSchema = z.object({}).strict();
+const healthCheckSchema = z.object({}).strict();
 const folderStatusSchema = z.object({
   folder: z.string().describe('IMAP путь папки, напр. "INBOX", "Sent"'),
 }).strict();
@@ -647,6 +649,97 @@ async function renderPipelineResult(
 // mode (which esbuild emits by default). Defence-in-depth against any
 // future code that might try to push extra entries after import.
 const TOOLS_RAW: ToolDef[] = [
+  // 0. Health check (L0) — server-side self-diagnostic. v2.1.4. Does NOT touch
+  // IMAP/SMTP. Returns the same set of facts that `node bundle --check` prints
+  // to stderr at startup, but accessible from inside an MCP session. Useful
+  // for an agent verifying the connector is healthy before doing actual work.
+  {
+    name: 'yandex_health_check',
+    title: 'Состояние коннектора',
+    description: 'Self-diagnostic: версия, auth level, state-dir, token.json (тип учётных данных), allowlist signature, policy file. НЕ обращается к IMAP/SMTP — для сетевой проверки запусти `node dist/yandex-mail-mcp.js --check`. Используй когда нужно понять что не работает или что используется по умолчанию.',
+    inputSchema: healthCheckSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    requires: { authLevel: 0 },
+    handler: async (_params, ctx) => {
+      const report: Record<string, unknown> = {
+        server_version: '2.2.0',
+        auth_level: ctx.authLevel,
+        capabilities: Array.from(ctx.capabilities),
+        platform: process.platform,
+        node: process.version,
+      };
+
+      // state-dir
+      try { report.state_dir = getStateDir(); }
+      catch (e) { report.state_dir = { error: e instanceof Error ? e.message : String(e) }; }
+
+      // token shape (does NOT call loadCredentials — that throws on missing;
+      // here we want to report state, not gate on it)
+      try {
+        const stateDir = getStateDir();
+        const tokenPath = (process.env.YANDEX_TOKEN_FILE && process.env.YANDEX_TOKEN_FILE.length > 0)
+          ? process.env.YANDEX_TOKEN_FILE
+          : `${stateDir}/token.json`;
+        if (fs.existsSync(tokenPath)) {
+          const raw = JSON.parse(fs.readFileSync(tokenPath, 'utf8')) as Record<string, unknown>;
+          let kind: string;
+          if (raw.password || raw.pass) kind = 'app_password (explicit field)';
+          else if (typeof raw.access_token === 'string' && raw.access_token.startsWith('y0_')) kind = 'oauth';
+          else if (typeof raw.access_token === 'string' && /^[a-z]{16}$/.test(raw.access_token)) kind = 'app_password (legacy field, heuristic)';
+          else kind = 'unknown';
+          report.token = { found: true, path: tokenPath, kind, email: raw.email ?? null };
+        } else {
+          // fallback to env vars
+          if (process.env.YANDEX_APP_PASSWORD && process.env.YANDEX_EMAIL) {
+            report.token = { found: true, source: 'env', kind: 'app_password', email: process.env.YANDEX_EMAIL };
+          } else if (process.env.YANDEX_OAUTH_TOKEN && process.env.YANDEX_EMAIL) {
+            report.token = { found: true, source: 'env', kind: 'oauth', email: process.env.YANDEX_EMAIL };
+          } else {
+            report.token = { found: false, hint: 'no token.json and no YANDEX_APP_PASSWORD/YANDEX_OAUTH_TOKEN env' };
+          }
+        }
+      } catch (e) {
+        report.token = { error: e instanceof Error ? e.message : String(e) };
+      }
+
+      // allowlist
+      try {
+        const apath = allowlist.getAllowlistPath();
+        if (fs.existsSync(apath)) {
+          const valid = allowlist.verifySignature();
+          let count = 0;
+          try {
+            const raw = JSON.parse(fs.readFileSync(apath, 'utf8')) as { entries?: unknown[] };
+            if (Array.isArray(raw.entries)) count = raw.entries.length;
+          } catch { /* ignore — keep count=0 */ }
+          report.allowlist = { path: apath, signature_valid: valid, trusted_count: count };
+        } else {
+          report.allowlist = { path: apath, exists: false, hint: 'created on first L1+ start' };
+        }
+      } catch (e) {
+        report.allowlist = { error: e instanceof Error ? e.message : String(e) };
+      }
+
+      // policy
+      try {
+        const ppath = policy.getPolicyPath();
+        if (fs.existsSync(ppath)) {
+          // Parse JSON only; signature check at this layer would require
+          // a new public API in policy.ts. Report exists+JSON-parseable.
+          JSON.parse(fs.readFileSync(ppath, 'utf8'));
+          report.policy = { path: ppath, exists: true, parseable: true };
+        } else {
+          report.policy = { path: ppath, exists: false, hint: 'bootstrapped on first startup' };
+        }
+      } catch (e) {
+        report.policy = { error: e instanceof Error ? e.message : String(e) };
+      }
+
+      const text = JSON.stringify(report, null, 2);
+      return { content: [{ type: 'text', text }], structuredContent: report };
+    },
+  },
+
   // 1. List folders (L0)
   {
     name: 'yandex_list_folders',

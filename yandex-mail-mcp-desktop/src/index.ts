@@ -7,6 +7,26 @@ import * as policy from './policy.js';
 import * as imap from './imap.js';
 import { auditLog } from './audit.js';
 import { resolveProtectedFolders } from './guards.js';
+import { runHealthCheck } from './check-config.js';
+
+// `--check` mode (v2.1.4): run a non-authenticating health check (token shape,
+// state dir, allowlist signature, policy JSON, IMAP/SMTP TLS reachability) and
+// exit. Must come BEFORE any module-level side effects below
+// (allowlist.verifySignature can process.exit(1) on tamper; policy.loadPolicy
+// can recoverFatal+exit). The check itself uses the same modules but in a
+// non-fatal mode.
+if (process.argv.includes('--check') || process.argv.includes('--check-config')) {
+  runHealthCheck()
+    .then(code => process.exit(code))
+    .catch(err => {
+      process.stderr.write(`[yandex-mail] health check fatal: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(2);
+    });
+} else {
+  startServer();
+}
+
+function startServer(): void {
 
 // Resolve auth level ONCE at startup. After this point the value never changes
 // for the life of the process -- re-reading env mid-run would be a TOCTOU
@@ -94,7 +114,7 @@ const SERVER_INSTRUCTIONS = [
 ].join(' ');
 
 const server = new McpServer(
-  { name: 'yandex-mail-mcp', version: '2.1.3' },
+  { name: 'yandex-mail-mcp', version: '2.2.0' },
   { instructions: SERVER_INSTRUCTIONS },
 );
 
@@ -198,3 +218,5 @@ main().catch(err => {
   process.stderr.write(`[yandex-mail] Fatal: ${String(err)}\n`);
   process.exit(1);
 });
+
+} // close startServer()

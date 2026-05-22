@@ -1,6 +1,6 @@
 {
   "name": "yandex-mail-mcp-desktop",
-  "version": "2.1.3",
+  "version": "2.2.0",
   "description": "MCP server for Yandex Mail — Claude Desktop (stdio)",
   "main": "dist/index.js",
   "bin": {
@@ -11,6 +11,7 @@
     "dist/",
     "README.md"
   ],
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=18"
   },
