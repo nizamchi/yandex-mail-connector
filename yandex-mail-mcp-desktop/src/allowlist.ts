@@ -489,22 +489,103 @@ export function autoTrustOnReply(
   } catch { /* must not crash a send */ }
 }
 
+// revokeTrust(address): Phase 7 PMLF-CLI-04 -- removes an entry from both
+// the persisted file (if present) and the session map (if present). Returns
+// true iff some entry existed and was removed. Audit emitted on any removal
+// (caller must await flushAudit before process.exit to ensure durability).
+// Case-insensitive via norm(). Physical delete only (no soft-delete field,
+// per CONTEXT D13).
+export function revokeTrust(address: string): boolean {
+  const target = norm(address);
+  if (!target) return false;
+
+  // 1. Session map first.
+  const sessionRemoved = sessionEntries.delete(target);
+
+  // 2. Persisted file.
+  let persistedRemoved = false;
+  let capturedScope: AllowlistScope | undefined;
+  let capturedSource: AllowlistSource | undefined;
+  const file = loadAllowlist();
+  if (file.signature === 'corrupt') {
+    throw new Error('revokeTrust: allowlist file is corrupt -- refusing to mutate.');
+  }
+  const idx = file.entries.findIndex(e => e.address === target);
+  if (idx >= 0) {
+    capturedScope = file.entries[idx].scope;
+    capturedSource = file.entries[idx].source;
+    file.entries.splice(idx, 1);
+    const secret = loadSecret();
+    file.signature = computeSignature(file, secret);
+    persist(file);
+    persistedRemoved = true;
+  }
+
+  if (!persistedRemoved && !sessionRemoved) return false;
+
+  auditLog({
+    action: 'allowlist_revoke',
+    status: 'success',
+    level: 'info',
+    ts: new Date().toISOString(),
+    from_domain: target.split('@')[1] ?? '(none)',
+    reason: 'scope=' + (capturedScope ?? 'session') +
+            ',source=' + (capturedSource ?? 'session_inmem'),
+  });
+
+  return persistedRemoved || sessionRemoved;
+}
+
 // _listTrusted (H-1 §Q1): returns every trusted entry across BOTH the
 // persisted file and the in-memory session set, with a clear scope marker so
 // a future UX (yandex_trust_address --list, or a tool that surfaces trust
 // state) can warn users that scope='session' grants evaporate on restart.
 // Test seam: also used by auto-trust-reply.test.ts T-H1-04 to verify
 // visibility of session entries.
-export function _listTrusted(): Array<{ address: string; scope: AllowlistScope; source: AllowlistSource; added_at: string }> {
-  const out: Array<{ address: string; scope: AllowlistScope; source: AllowlistSource; added_at: string }> = [];
+//
+// Phase 7 widened return shape; backward-compat (additive fields).
+// Session entries report useCount=0 (CONTEXT amendment H-2) and lastUsed =
+// Date.parse(meta.added_at) with Date.now() fallback (mirror getTrustEntry).
+export function _listTrusted(): Array<{
+  address: string;
+  scope: AllowlistScope;
+  source: AllowlistSource;
+  added_at: string;
+  lastUsed: number;
+  useCount: number;
+}> {
+  const out: Array<{
+    address: string;
+    scope: AllowlistScope;
+    source: AllowlistSource;
+    added_at: string;
+    lastUsed: number;
+    useCount: number;
+  }> = [];
   const file = loadAllowlist();
   if (file.signature !== 'corrupt') {
     for (const e of file.entries) {
-      out.push({ address: e.address, scope: e.scope, source: e.source, added_at: e.added_at });
+      out.push({
+        address: e.address,
+        scope: e.scope,
+        source: e.source,
+        added_at: e.added_at,
+        lastUsed: e.lastUsed,
+        useCount: e.useCount,
+      });
     }
   }
   for (const [address, meta] of sessionEntries) {
-    out.push({ address, scope: 'session', source: meta.source, added_at: meta.added_at });
+    const parsed = Date.parse(meta.added_at);
+    const lastUsed = Number.isFinite(parsed) ? parsed : Date.now();
+    out.push({
+      address,
+      scope: 'session',
+      source: meta.source,
+      added_at: meta.added_at,
+      lastUsed,
+      useCount: 0,
+    });
   }
   return out;
 }
@@ -719,6 +800,27 @@ export function _setEntryAddedForTests(address: string, addedMs: number): void {
     throw new Error('_setEntryAddedForTests: entry not found: ' + target);
   }
   entry.added = addedMs;
+  const secret = loadSecret();
+  file.signature = computeSignature(file, secret);
+  persist(file);
+}
+
+// _setEntryLastUsedForTests (Phase 7 test seam): backdates entry.lastUsed
+// for an existing persisted-scope address. Used by --list-trust --stale Nd
+// tests to make staleness deterministic. PRODUCTION GUARD: throws if
+// NODE_ENV === 'production'. No-op if entry not found (mirror existing
+// test-seam convention for graceful test fixtures).
+export function _setEntryLastUsedForTests(address: string, lastUsedMs: number): void {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('_setEntryLastUsedForTests called in production');
+  }
+  const target = norm(address);
+  if (!target) return;
+  const file = loadAllowlist();
+  if (file.signature === 'corrupt') return;
+  const entry = file.entries.find(e => e.address === target);
+  if (!entry) return;
+  entry.lastUsed = lastUsedMs;
   const secret = loadSecret();
   file.signature = computeSignature(file, secret);
   persist(file);
