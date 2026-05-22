@@ -42,9 +42,8 @@ import {
   writePolicy,
   getPolicyPath,
   RiskPolicySchema,
-  type RiskPolicy,
 } from './policy.js';
-import { DEFAULT_POLICY } from './policy-defaults.js';
+import { DEFAULT_POLICY, type RiskPolicy } from './policy-defaults.js';
 import {
   revokeTrust,
   _listTrusted,
@@ -509,6 +508,232 @@ async function handleTrust(args: { address: string; scope: 'permanent' | 'sessio
   process.exit(0);
 }
 
+// -- --policy show (read-only) ------------------------------
+
+async function handlePolicyShow(): Promise<void> {
+  // loadPolicy triggers first-launch write if missing (Phase 1 D5). We print
+  // the resolved policy object (NOT the on-disk wrapper -- T-07-10: never
+  // surface the .signature field).
+  const policy = loadPolicy();
+  process.stdout.write(JSON.stringify(policy, null, 2) + '\n');
+  process.exit(0);
+}
+
+// -- --policy set <key> <value> (D5) ------------------------
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function navigateDotted(
+  obj: Record<string, unknown>,
+  segments: string[],
+): { container: Record<string, unknown>; leafKey: string } | null {
+  if (segments.length === 0) return null;
+  let cur: Record<string, unknown> = obj;
+  for (let i = 0; i < segments.length - 1; i++) {
+    const next = cur[segments[i]!];
+    if (!isPlainObject(next)) return null;
+    cur = next;
+  }
+  return { container: cur, leafKey: segments[segments.length - 1]! };
+}
+
+async function handlePolicySet(args: { key: string; value: string; yes: boolean }): Promise<void> {
+  const skipPrompt = args.yes || process.env.YANDEX_TRUST_ASSUME_YES === '1';
+  if (!skipPrompt) {
+    const ok = await promptYesNo(
+      `Apply set '${args.key}=${args.value}' to risk-policy.json? [y/N]: `,
+    );
+    if (!ok) {
+      process.stderr.write('Aborted.\n');
+      process.exit(0);
+    }
+  }
+
+  // Deep-clone current resolved policy.
+  const next = JSON.parse(JSON.stringify(loadPolicy())) as RiskPolicy;
+  const segments = args.key.split('.');
+
+  // Navigate in parallel on DEFAULT_POLICY to infer the leaf type.
+  // DEFAULT_POLICY is the source of truth for "is this path known?".
+  const defaultClone = DEFAULT_POLICY as unknown as Record<string, unknown>;
+  const defaultNav = navigateDotted(defaultClone, segments);
+  if (defaultNav === null
+      || !(defaultNav.leafKey in defaultNav.container)) {
+    die(`policy set: unknown key '${args.key}'`);
+  }
+  const existingDefault = defaultNav.container[defaultNav.leafKey];
+
+  const writeNav = navigateDotted(next as unknown as Record<string, unknown>, segments);
+  if (writeNav === null) {
+    // Should not happen given the default navigation passed -- defensive.
+    die(`policy set: unknown key '${args.key}'`);
+  }
+
+  // Coerce based on EXISTING default type.
+  let coerced: unknown;
+  if (typeof existingDefault === 'number') {
+    const n = Number(args.value);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+      die(`policy set: '${args.key}' expects a non-negative integer, got '${args.value}'`);
+    }
+    coerced = n;
+  } else if (typeof existingDefault === 'boolean') {
+    if (args.value === 'true') coerced = true;
+    else if (args.value === 'false') coerced = false;
+    else die(`policy set: '${args.key}' expects 'true' or 'false', got '${args.value}'`);
+  } else if (typeof existingDefault === 'string' || Array.isArray(existingDefault)) {
+    die(`policy set: '${args.key}' is a ${Array.isArray(existingDefault) ? 'list' : 'string'}; use --policy edit`);
+  } else {
+    die(`policy set: '${args.key}' is a nested object; use --policy edit`);
+  }
+
+  writeNav.container[writeNav.leafKey] = coerced;
+
+  // Validate the WHOLE clone.
+  const parsed = RiskPolicySchema.safeParse(next);
+  if (!parsed.success) {
+    process.stderr.write('policy set: schema validation failed:\n');
+    for (const issue of parsed.error.issues) {
+      process.stderr.write('  ' + issue.path.join('.') + ': ' + issue.message + '\n');
+    }
+    process.exit(2);
+  }
+
+  writePolicy(parsed.data);
+
+  process.stdout.write(`policy updated: ${args.key} = ${JSON.stringify(coerced)}\n`);
+  process.stderr.write('Restart MCP server to apply (policy is load-once per session).\n');
+
+  auditLog({
+    action: 'policy_set',
+    status: 'success',
+    level: 'info',
+    ts: new Date().toISOString(),
+    reason: 'key=' + args.key,
+  });
+  await exitAfterAudit(0);
+}
+
+// -- --policy reset (D6) ------------------------------------
+
+async function handlePolicyReset(args: { yes: boolean }): Promise<void> {
+  const skipPrompt = args.yes || process.env.YANDEX_TRUST_ASSUME_YES === '1';
+  if (!skipPrompt) {
+    const ok = await promptYesNo('Reset risk-policy.json to defaults? [y/N]: ');
+    if (!ok) {
+      process.stderr.write('Aborted.\n');
+      process.exit(0);
+    }
+  }
+  writePolicy(DEFAULT_POLICY);
+  process.stdout.write('policy reset to defaults.\n');
+  process.stderr.write('Restart MCP server to apply (policy is load-once per session).\n');
+  auditLog({
+    action: 'policy_reset',
+    status: 'success',
+    level: 'info',
+    ts: new Date().toISOString(),
+  });
+  await exitAfterAudit(0);
+}
+
+// -- --policy edit (D7 + Rev-2 B2) --------------------------
+
+function printEditHelpBlock(): void {
+  const p = getPolicyPath();
+  const lines: string[] = [
+    '--policy edit requires the $EDITOR environment variable to be set.',
+    '',
+    'On this platform $EDITOR is not configured. Either:',
+    '  1. Set $EDITOR and re-run, e.g.:',
+    '       set EDITOR=notepad     (cmd.exe)',
+    '       $env:EDITOR="notepad"  (PowerShell)',
+    '       export EDITOR=vi       (bash/zsh)',
+    '  2. Edit the file manually with any text editor:',
+    '       ' + p,
+    '     After editing run:  yandex-mail-mcp-trust --policy edit',
+    '     to re-validate and re-sign. (Schema-invalid files will be rejected.)',
+    '  3. Or use --policy set <key> <value> for single-leaf updates.',
+  ];
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+async function handlePolicyEdit(_args: { yes: boolean }): Promise<void> {
+  // Rev-2 B2: normalise EDITOR -- empty-string identical to undefined on
+  // every platform.
+  const isWin32 = effectivePlatform() === 'win32';
+  const rawEditor = (process.env.EDITOR ?? '').trim();
+  const editor: string | null = rawEditor.length > 0
+    ? rawEditor
+    : (isWin32 ? null : 'vi');
+
+  // TTY guard BEFORE any spawn. Editor spawns with stdio: 'inherit'; a
+  // non-TTY stdin would hang vi forever.
+  if (!process.stdin.isTTY) {
+    process.stderr.write('--policy edit requires an interactive TTY\n');
+    process.exit(2);
+  }
+
+  if (editor === null) {
+    // Win32 + no editor: print the help-block, exit 0. NO audit (no
+    // mutation). T-CLI-08a coverage.
+    printEditHelpBlock();
+    process.exit(0);
+  }
+
+  // Spawn editor synchronously.
+  const cp = await import('node:child_process');
+  const r = cp.spawnSync(editor, [getPolicyPath()], { stdio: 'inherit' });
+  if (r.status !== 0) {
+    process.stderr.write('editor exited non-zero\n');
+    process.exit(1);
+  }
+
+  // Re-read + re-validate. Rev-2 M4: tolerate bare-vs-wrapper.
+  let raw: string;
+  try {
+    raw = fs.readFileSync(getPolicyPath(), 'utf8');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`policy edit: cannot re-read file: ${msg}\n`);
+    process.exit(1);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`policy edit: file is not valid JSON: ${msg}\n`);
+    process.stderr.write('file NOT re-signed (left as edited)\n');
+    process.exit(1);
+  }
+  const policyObj = (parsed && typeof parsed === 'object' && 'policy' in parsed)
+    ? (parsed as { policy: unknown }).policy
+    : parsed;
+  const v = RiskPolicySchema.safeParse(policyObj);
+  if (!v.success) {
+    process.stderr.write('policy edit: schema validation failed:\n');
+    for (const issue of v.error.issues) {
+      process.stderr.write('  ' + issue.path.join('.') + ': ' + issue.message + '\n');
+    }
+    process.stderr.write('file NOT re-signed (left as edited)\n');
+    process.exit(1);
+  }
+
+  writePolicy(v.data);
+  process.stdout.write('policy saved + re-signed. Restart MCP server to apply.\n');
+
+  auditLog({
+    action: 'policy_edit',
+    status: 'success',
+    level: 'info',
+    ts: new Date().toISOString(),
+  });
+  await exitAfterAudit(0);
+}
+
 // --- main() ---
 
 async function main(): Promise<void> {
@@ -526,13 +751,17 @@ async function main(): Promise<void> {
       await handleHighRiskSend(args);
       break;
     case 'policy-show':
-      throw new Error('not yet implemented in this task');
+      await handlePolicyShow();
+      break;
     case 'policy-set':
-      throw new Error('not yet implemented in this task');
+      await handlePolicySet(args);
+      break;
     case 'policy-reset':
-      throw new Error('not yet implemented in this task');
+      await handlePolicyReset(args);
+      break;
     case 'policy-edit':
-      throw new Error('not yet implemented in this task');
+      await handlePolicyEdit(args);
+      break;
     case 'recent':
       throw new Error('not yet implemented in this task');
     case 'list-trust':
@@ -548,18 +777,9 @@ main().catch((e: unknown) => {
   process.exit(1);
 });
 
-// Suppress "unused import" warnings for Task-6/7 imports that will be
+// Suppress "unused import" warnings for Task-7 imports that will be
 // consumed in subsequent commits. Tree-shaken by esbuild if untouched.
-void exitAfterAudit;
-void auditLog;
-void loadPolicy;
-void writePolicy;
-void getPolicyPath;
-void RiskPolicySchema;
-void DEFAULT_POLICY;
 void revokeTrust;
 void _listTrusted;
 void isAllowed;
 void readRecentSends;
-void effectivePlatform;
-void (null as unknown as RiskPolicy);
