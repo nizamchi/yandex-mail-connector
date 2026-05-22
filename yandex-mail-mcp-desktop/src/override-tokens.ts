@@ -359,20 +359,23 @@ export function consumeOverrideToken(
   const suppliedHash = createHash('sha256').update(token).digest('hex').slice(0, 32);
 
   // Step 3: find by token_hash in cache (in-memory).
+  // WR-04 (v2.1.1 cosmetic): the prior `a.length === b.length && a.length > 0`
+  // guard was dead-code. validateRecord guarantees r.token_hash is exactly
+  // 32 hex chars (16 bytes); suppliedHash is sha256(token).slice(0,32) on a
+  // non-empty token (pre-checked above). Both buffers are therefore always
+  // 16 bytes. The try/catch retained as belt-and-braces against any future
+  // buffer-encoding surprise -- if timingSafeEqual ever throws, we skip.
   let target: OverrideTokenRecord | undefined;
   for (const r of cache) {
-    // timingSafeEqual on hex byte buffers (constant-time equality).
     const a = Buffer.from(r.token_hash, 'hex');
     const b = Buffer.from(suppliedHash, 'hex');
-    if (a.length === b.length && a.length > 0) {
-      try {
-        if (timingSafeEqual(a, b)) {
-          target = r;
-          break;
-        }
-      } catch {
-        // length mismatch / bad buffer -- skip.
+    try {
+      if (timingSafeEqual(a, b)) {
+        target = r;
+        break;
       }
+    } catch {
+      // Defensive: skip on any buffer surprise.
     }
   }
 
@@ -440,20 +443,20 @@ export function consumeOverrideToken(
   // window between intra-process and cross-process consumers.
   const records2 = _readJsonlFresh();
   let target2Idx = -1;
+  // WR-04 (v2.1.1 cosmetic): see Step 3 comment -- length guard dropped.
+  // _readJsonlFresh runs validateRecord so all token_hash buffers are 16 bytes.
   for (let i = 0; i < records2.length; i++) {
     const r = records2[i];
     if (r === undefined) continue;
     const a = Buffer.from(r.token_hash, 'hex');
     const b = Buffer.from(suppliedHash, 'hex');
-    if (a.length === b.length && a.length > 0) {
-      try {
-        if (timingSafeEqual(a, b)) {
-          target2Idx = i;
-          break;
-        }
-      } catch {
-        // skip
+    try {
+      if (timingSafeEqual(a, b)) {
+        target2Idx = i;
+        break;
       }
+    } catch {
+      // Defensive: skip on any buffer surprise.
     }
   }
   if (target2Idx === -1) {
