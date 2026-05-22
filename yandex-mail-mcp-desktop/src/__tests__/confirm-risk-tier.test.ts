@@ -41,6 +41,9 @@ import type { RiskReason, RiskTier } from '../risk-score.js';
 
 // -- Helpers ------------------------------------------------
 
+// IN-04 (v2.1.1 cosmetic): _tmpCounter is module-scoped and increments across
+// the whole file. Watch-mode does not reset it between runs -- collision is
+// nonetheless impossible because the dir name also embeds Date.now().
 let _tmpCounter = 0;
 function makeSandbox(): { stateDir: string; auditPath: string } {
   _tmpCounter++;

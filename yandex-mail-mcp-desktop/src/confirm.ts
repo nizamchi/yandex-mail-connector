@@ -306,6 +306,11 @@ export function verifyCode(fingerprint: string, code: string): VerifyResult {
   // a-w-a-i-t) between the read of entry.used and the write entry.used = true.
   // Task 2 grep-checks this function body for that token.
   // auditLog is sync (void return; enqueues internally) — safe to call here.
+  // IN-01 (v2.1.1 cosmetic): the dashed-spelling convention above MUST be
+  // preserved across the entire function body. The grep gate strips only
+  // single-line `//` comments; if a future maintainer wraps this warning in
+  // a `/* ... */` block comment, the gate would falsely flag the function
+  // as defective. Keep this as // comments using dashed spellings only.
   if (entry.used) return 'used';
   entry.used = true;
   auditLog({

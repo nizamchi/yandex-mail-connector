@@ -44,6 +44,15 @@
 //   substitutable hooks. Tampered token_hash is a different branch -- that
 //   yields lookup-miss -> {ok:false, reason:'unknown'} with NO fatal exit.
 //
+// Audit boundary (WR-05 clarification, v2.1.1 cosmetic):
+//   This module emits audit records ONLY via direct `auditLog(...)` calls,
+//   never via `auditLogAction`. `auditLogAction` is the tools.ts wrapper that
+//   auto-injects `level` based on `status`; bypassing it here means each call
+//   site sets `level` explicitly ('info' on success, 'warn' on denied). The
+//   prior "0 auditLogAction calls (privacy isolation)" wording could be
+//   misread as "no audit emission at all" -- that is false. The correct read
+//   is: override-tokens.ts owns its own level discipline at the boundary.
+//
 // No `any`. ESM `.js` suffix on internal imports. ASCII-only.
 
 import * as fs from 'node:fs';
@@ -203,6 +212,11 @@ function _readJsonlFresh(): OverrideTokenRecord[] {
 
 // -- Record validation --------------------------------------
 
+// IN-03 (v2.1.1 cosmetic): hex regexes are case-sensitive lowercase by design.
+// Node's `crypto.createHash('sha256').digest('hex')` always returns lowercase
+// hex per the Node spec. The regexes below enforce that. A hand-edited JSONL
+// containing uppercase hex would be rejected as a schema violation and trigger
+// loadOverrideTokens -> recoverFatal -- correct strict behaviour.
 function validateRecord(obj: unknown): obj is OverrideTokenRecord {
   if (typeof obj !== 'object' || obj === null) return false;
   const r = obj as Record<string, unknown>;

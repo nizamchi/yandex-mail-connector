@@ -438,6 +438,13 @@ function printHelp(): void {
 
 // -- Mode handlers -------------------------------------------
 
+// IN-02 (v2.1.1 cosmetic): this handler is intentionally NOT rate-limited.
+// A scripted loop (`for i in $(seq 1 100); do ... --high-risk-send=<fp>; done`)
+// could mint 100 valid override tokens against the same fingerprint, each
+// single-use. WR-03 now supersedes prior unconsumed tokens for the same
+// fingerprint at mint time, which bounds the live-token count to 1.
+// Rate-limiting at the CLI layer remains a v2.2.0 candidate (operator-tunable
+// daily mint cap) -- out of cosmetic-cleanup scope.
 async function handleHighRiskSend(args: { fingerprint: string; yes: boolean }): Promise<void> {
   const skipPrompt = args.yes || process.env.YANDEX_TRUST_ASSUME_YES === '1';
   if (!skipPrompt) {

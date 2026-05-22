@@ -33,6 +33,9 @@ import { _resetForTests as _resetAudit, _drainForTests as _drainAudit } from '..
 const VALID_FP = 'abcdef0123456789abcdef0123456789';
 const OTHER_FP = '0123456789abcdef0123456789abcdef';
 
+// IN-04 (v2.1.1 cosmetic): _tmpCounter is module-scoped; not reset between
+// watch-mode runs. Collision is still impossible because Date.now() is in
+// the dir name too. Documented for future test-infra refactors.
 let _tmpCounter = 0;
 function tmpStateDir(): string {
   _tmpCounter++;
