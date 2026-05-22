@@ -75,6 +75,7 @@ import {
 import * as allowlist from './allowlist.js';
 import { normalizeRecipients as normRcpt } from './recipients.js';
 import { auditLog, subjectHash } from './audit.js';
+import { appendRecentSend } from './recent-sends.js';
 import {
   sendEmailBaseSchema,
   type ValidatedInput,
@@ -832,6 +833,28 @@ export const recordSend: Stage = async (ctx) => {
   };
   guardsRecordSend(payload, ctx.actionFingerprint!);
   allowlist.bumpUseCountBatch(r.all, ctx.nowMs);
+  // Phase 7 PMLF-CLI-02: append to <state-dir>/recent-sends.jsonl for the
+  // `yandex-mail-mcp-trust --recent` reader. Best-effort -- a forensics-
+  // buffer failure MUST NOT crash a send (matches audit.ts enqueue
+  // invariant). Runs only after sendResult.success was checked at the top
+  // of recordSend. Rev-2 M2 patch: risk_score clamped to [0, 100] at the
+  // call site so future risk-tier changes that push scores above 100 are
+  // capped (the schema's .max(100) stays as defence against hand-edits).
+  try {
+    const inp2 = ctx.input!;
+    appendRecentSend({
+      version: 1,
+      ts: nowIso(ctx),
+      message_id: ctx.sendResult!.messageId ?? '(no-id)',
+      recipients_count: r.all.length,
+      recipients_domains: Array.from(new Set(r.all.map(domainOf))).sort(),
+      subject_hash: subjectHash(inp2.subject),
+      body_length: bodyBytes(inp2),
+      risk_tier: ctx.confirmation?.tier ?? 'low',
+      risk_score: Math.min(ctx.confirmation?.score ?? 0, 100),
+      action_fingerprint: (ctx.actionFingerprint ?? '').slice(0, 8),
+    });
+  } catch { /* never crash a send -- recent-sends is forensics-only */ }
   return { kind: 'pass', ctx };
 };
 
