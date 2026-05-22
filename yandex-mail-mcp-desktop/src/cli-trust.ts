@@ -220,16 +220,12 @@ function parsePolicyMode(argv: string[], yes: boolean): CliArgs {
   if (subcmd === undefined || subcmd.startsWith('--')) {
     die(`policy: expected one of show|set|reset|edit, got '${subcmd ?? ''}'`);
   }
-  if (subcmd === 'show') {
-    return { mode: 'policy-show' };
-  }
-  if (subcmd === 'reset') {
-    return { mode: 'policy-reset', yes };
-  }
-  if (subcmd === 'edit') {
-    return { mode: 'policy-edit', yes };
-  }
-  if (subcmd === 'set') {
+  // Determine how many positionals each subcmd consumes; everything after
+  // that must be rejected (parser-determinism rule, MD-01).
+  let consumed: number;
+  if (subcmd === 'show' || subcmd === 'reset' || subcmd === 'edit') {
+    consumed = idx + 1;
+  } else if (subcmd === 'set') {
     const key = argv[idx + 2];
     const value = argv[idx + 3];
     if (key === undefined || key.startsWith('--')) {
@@ -238,9 +234,20 @@ function parsePolicyMode(argv: string[], yes: boolean): CliArgs {
     if (value === undefined) {
       die('policy set: expected <value>');
     }
-    return { mode: 'policy-set', key, value, yes };
+    consumed = idx + 3;
+  } else {
+    die(`policy: expected one of show|set|reset|edit, got '${subcmd}'`);
   }
-  die(`policy: expected one of show|set|reset|edit, got '${subcmd}'`);
+  for (let i = consumed + 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) die(`unknown flag: ${a}`, 'try --help');
+    die(`unexpected positional: ${a}`);
+  }
+  if (subcmd === 'show') return { mode: 'policy-show' };
+  if (subcmd === 'reset') return { mode: 'policy-reset', yes };
+  if (subcmd === 'edit') return { mode: 'policy-edit', yes };
+  // subcmd === 'set' — key/value already validated above.
+  return { mode: 'policy-set', key: argv[idx + 2]!, value: argv[idx + 3]!, yes };
 }
 
 function parseRecentMode(argv: string[]): CliArgs {

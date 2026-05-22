@@ -463,3 +463,18 @@ test('T-CLI-PARSER-EDGE-01 (H1): parser determinism rules', () => {
     );
   } finally { cleanupTmpStateDir(dir); }
 });
+
+// -- T-CLI-PARSER-POLICY-EXTRA-01 (MD-01): --policy show extra positionals --
+
+test('T-CLI-PARSER-POLICY-EXTRA-01 (MD-01): --policy show extra exits 2', () => {
+  if (skipIfNoBundle()) return;
+  const dir = mkTmpStateDir();
+  try {
+    const r = runCli(dir, { args: ['--policy', 'show', 'junk'] });
+    assert.equal(r.status, 2, `expected 2; got ${r.status}\nstderr:\n${r.stderr}`);
+    assert.ok(
+      r.stderr.includes('unexpected positional: junk'),
+      `stderr verbatim mismatch:\n${r.stderr}`,
+    );
+  } finally { cleanupTmpStateDir(dir); }
+});
