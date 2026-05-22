@@ -217,27 +217,14 @@ function parsePolicyMode(argv: string[], yes: boolean): CliArgs {
   // subcmd, then per-subcmd positionals.
   const idx = argv.indexOf('--policy');
   const subcmd = argv[idx + 1];
-  if (subcmd === undefined || subcmd.startsWith('--')) {
+  const known = subcmd === 'show' || subcmd === 'set'
+    || subcmd === 'reset' || subcmd === 'edit';
+  if (!known) {
     die(`policy: expected one of show|set|reset|edit, got '${subcmd ?? ''}'`);
   }
-  // Determine how many positionals each subcmd consumes; everything after
-  // that must be rejected (parser-determinism rule, MD-01).
-  let consumed: number;
-  if (subcmd === 'show' || subcmd === 'reset' || subcmd === 'edit') {
-    consumed = idx + 1;
-  } else if (subcmd === 'set') {
-    const key = argv[idx + 2];
-    const value = argv[idx + 3];
-    if (key === undefined || key.startsWith('--')) {
-      die('policy set: expected <key>');
-    }
-    if (value === undefined) {
-      die('policy set: expected <value>');
-    }
-    consumed = idx + 3;
-  } else {
-    die(`policy: expected one of show|set|reset|edit, got '${subcmd}'`);
-  }
+  // Reject extra positionals (parser-determinism rule, MD-01).
+  // 'set' consumes 2 extra (key, value); others consume 0.
+  const consumed = subcmd === 'set' ? idx + 3 : idx + 1;
   for (let i = consumed + 1; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) die(`unknown flag: ${a}`, 'try --help');
@@ -246,8 +233,12 @@ function parsePolicyMode(argv: string[], yes: boolean): CliArgs {
   if (subcmd === 'show') return { mode: 'policy-show' };
   if (subcmd === 'reset') return { mode: 'policy-reset', yes };
   if (subcmd === 'edit') return { mode: 'policy-edit', yes };
-  // subcmd === 'set' — key/value already validated above.
-  return { mode: 'policy-set', key: argv[idx + 2]!, value: argv[idx + 3]!, yes };
+  // subcmd === 'set'
+  const key = argv[idx + 2];
+  const value = argv[idx + 3];
+  if (key === undefined || key.startsWith('--')) die('policy set: expected <key>');
+  if (value === undefined) die('policy set: expected <value>');
+  return { mode: 'policy-set', key, value, yes };
 }
 
 function parseRecentMode(argv: string[]): CliArgs {
@@ -342,19 +333,25 @@ function parseRevokeTrustMode(argv: string[], yes: boolean): CliArgs {
 }
 
 function parseHighRiskSendMode(argv: string[], yes: boolean): CliArgs {
+  // MD-02 parser-determinism: reject duplicate --high-risk-send.
   let fp: string | undefined;
-  for (const a of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    let v: string | undefined;
     if (a.startsWith('--high-risk-send=')) {
-      fp = a.slice('--high-risk-send='.length);
+      v = a.slice('--high-risk-send='.length);
     } else if (a === '--high-risk-send') {
-      // Space form. Locate next token.
-      const i = argv.indexOf(a);
-      fp = argv[i + 1];
+      v = argv[++i];
+      if (v === undefined || v.startsWith('--')) {
+        die('high-risk-send: expected <32-hex-fingerprint>');
+      }
+    } else {
+      continue;
     }
+    if (fp !== undefined) die('--high-risk-send: specified more than once');
+    fp = v;
   }
-  if (fp === undefined) {
-    die('high-risk-send: expected <32-hex-fingerprint>');
-  }
+  if (fp === undefined) die('high-risk-send: expected <32-hex-fingerprint>');
   if (!/^[0-9a-f]{32}$/.test(fp)) {
     die(`high-risk-send: invalid fingerprint: '${fp}' (expected 32 hex chars)`);
   }

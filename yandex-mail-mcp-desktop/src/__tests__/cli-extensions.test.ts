@@ -478,3 +478,23 @@ test('T-CLI-PARSER-POLICY-EXTRA-01 (MD-01): --policy show extra exits 2', () => 
     );
   } finally { cleanupTmpStateDir(dir); }
 });
+
+// -- T-CLI-PARSER-HRS-DUP-01 (MD-02): --high-risk-send specified twice --
+
+test('T-CLI-PARSER-HRS-DUP-01 (MD-02): --high-risk-send specified twice exits 2', () => {
+  if (skipIfNoBundle()) return;
+  const dir = mkTmpStateDir();
+  try {
+    const r = runCli(dir, {
+      args: [
+        '--high-risk-send=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        '--high-risk-send=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      ],
+    });
+    assert.equal(r.status, 2, `expected 2; got ${r.status}\nstderr:\n${r.stderr}`);
+    assert.ok(
+      r.stderr.includes('--high-risk-send: specified more than once'),
+      `stderr verbatim mismatch:\n${r.stderr}`,
+    );
+  } finally { cleanupTmpStateDir(dir); }
+});
