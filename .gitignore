@@ -41,6 +41,14 @@ pending-trust.json
 secret.bin
 **/secret.bin
 
+# Layer 1.5 runtime state (never committed)
+risk-policy.json
+**/risk-policy.json
+recent-sends.jsonl
+**/recent-sends.jsonl
+override-tokens.jsonl
+**/override-tokens.jsonl
+
 # GSD runtime state
 .planning/STATE.local.md
 .planning/HANDOFF.json
