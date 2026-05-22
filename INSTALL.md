@@ -15,11 +15,11 @@
 **Рекомендуемое расположение** — рядом с остальным state (allowlist, audit,
 secret). Это работает для всех способов запуска, включая `npx`:
 
-| Платформа | Путь к state-каталогу |
-|---|---|
-| Windows | `%APPDATA%\yandex-mail-mcp\token.json` |
-| Linux | `$XDG_CONFIG_HOME/yandex-mail-mcp/token.json` (или `~/.config/yandex-mail-mcp/token.json`) |
-| macOS | `~/.config/yandex-mail-mcp/token.json` |
+| Платформа | Путь к state-каталогу | Файлы в каталоге |
+|---|---|---|
+| Windows | `%APPDATA%\yandex-mail-mcp\` | `token.json`, `risk-policy.json`, `override-tokens.jsonl`, `recent-sends.jsonl`, `allowlist.json`, `audit.jsonl`, `secret.bin`, `pending-trust.json` |
+| Linux | `$XDG_CONFIG_HOME/yandex-mail-mcp/` (или `~/.config/yandex-mail-mcp/`) | те же |
+| macOS | `~/.config/yandex-mail-mcp/` | те же |
 
 Каталог создаётся автоматически при первом запуске сервера. Можно
 переопределить через `YANDEX_STATE_DIR=/custom/path` — тогда `token.json`
@@ -156,6 +156,18 @@ env как обычно.
 | `YANDEX_STRIP_HTML`                  | `true`                                 | Стрипать HTML из email body перед отдачей в LLM context       |
 | `YANDEX_ALLOWLIST_BOOTSTRAP_LIMIT`   | `200`                                  | Сколько Sent адресов прочитать при первом bootstrap allowlist  |
 | `YANDEX_STRICT_FILE_PERMS`           | unset                                  | `=true` — process.exit(1) на token.json mode != 600 (Unix)    |
+
+### Layer 1.5 PMLF — risk-policy + override-token knobs
+
+Появились в v2.1.0. См. [POLICY.md](POLICY.md) для подробностей про каждый weight / threshold / category.
+
+| Var | Default | Назначение | Когда менять |
+|-----|---------|------------|--------------|
+| `YANDEX_POLICY_FILE` | `<state-dir>/risk-policy.json` | Путь к HMAC-подписанной risk-policy.json | Сменить только если разносите state по нескольким каталогам |
+| `YANDEX_OVERRIDE_TOKEN` | `<state-dir>/override-tokens.jsonl` | Путь к JSONL с одноразовыми override-токенами для block-tier send | Тот же случай — раздельный state path |
+| `YANDEX_SCAN_DEBUG` | unset | `=1` — verbose stderr из outbound scanner (детали скоринга, перформанс) | Включить для post-incident debug; выключить обратно для prod (PII risk в stderr) |
+| `YANDEX_TRUST_ASSUME_YES` | unset | `=1` — `yandex-mail-mcp-trust` мутаторы пропускают интерактивный confirm | Только для CI / scripted-операторов |
+| `YANDEX_CONFIRMATION_PASSWORD` | unset | Опциональный пользователь-define пароль, который сервер требует ввести вместе с confirmation code (расширение HMAC-binding) | Включить если параноидально относитесь к prompt-injection через тело письма |
 
 ## Troubleshooting
 
