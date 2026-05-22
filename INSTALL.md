@@ -168,6 +168,20 @@ Settings → «Cursor Settings» → найти `mcp.servers` (или `mcpServer
 JSON-режиме). Вставить тот же блок что для Claude Desktop. Перезапустить
 Cursor.
 
+## Шаг 4.5 *(опционально)*: slash-команда `/ymc-config`
+
+Если используешь Claude Code и не хочешь править `~/.claude.json` руками — поставь интерактивный пикер. Это файл markdown который надо положить в каталог command'ов Claude Code:
+
+```bash
+# из корня склонированного репо
+mkdir -p ~/.claude/commands
+cp .claude/commands/ymc-config.md ~/.claude/commands/
+```
+
+После этого в Claude Code набираешь `/ymc-config`, появляется пикер со стрелочками (как у GSD), выбираешь уровень доступа — он записывается в `~/.claude.json`. Финальный шаг (перезапуск Claude Code) команда не делает сама — это безопасностная закладка, нужно сделать `/exit` руками.
+
+Почему не делает сама: процесс MCP-сервера читает `YANDEX_AUTH_LEVEL` один раз при старте — это намеренная защита от prompt-injection. Hot-reload уровня создал бы TOCTOU-уязвимость (см. README раздел про подтверждение).
+
 ## Шаг 5: выбор YANDEX_AUTH_LEVEL
 
 ### Choosing YANDEX_AUTH_LEVEL
