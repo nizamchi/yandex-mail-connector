@@ -61,7 +61,7 @@ Send Pipeline Refactor / CLI Extensions / Documentation). Раздаётся ч�
   абсорбции Windows parallel-load jitter, документированной в
   `07-DEVIATIONS.md §D4`.
 - Bundle size (main `dist/yandex-mail-mcp.js`): 2,624,841 (v2.0.0 tag) →
-  **T-08-07 measured** bytes.
+  2710359 bytes.
 
 ### Безопасность
 
@@ -87,8 +87,8 @@ Send Pipeline Refactor / CLI Extensions / Documentation). Раздаётся ч�
   widened 10ms → 30ms с документированным rationale).
 
 SHA-256 (см. release tag annotation):
-  dist/yandex-mail-mcp.js  <BUNDLE-SHA-MAIN>
-  dist/cli-trust.js        <BUNDLE-SHA-CLI>
+  dist/yandex-mail-mcp.js  97888dc5517f58a292c0903911b1e6585d35eff5081480cf9b131c8eb147fd77
+  dist/cli-trust.js        10a006bd78db040533a4d76ff3e456e6c7cdb6917efd6b0475edd4ebea87d486
 
 ## [2.0.0] - 2026-05-20
 
