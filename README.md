@@ -149,10 +149,11 @@ yandex-mail-mcp-trust --policy set thresholds.augment 25 --yes  # подкрут
 - [INSTALL.md](INSTALL.md) — пошаговая установка для четырёх MCP-клиентов.
 - [POLICY.md](POLICY.md) — детальная документация системы оценки риска: какие
   сигналы, какие веса, как настраивать под себя, как защита устроена изнутри.
+- [MISSION.md](MISSION.md) — миссия проекта, принципы, что мы НЕ строим.
+- [ROADMAP.md](ROADMAP.md) — долгосрочная дорожная карта по семи слоям.
 - [CHANGELOG.md](CHANGELOG.md) — история версий.
-- [.planning/MISSION.md](.planning/MISSION.md) — миссия проекта и принципы.
-- [.planning/LAYERS.md](.planning/LAYERS.md) — стратегия многоуровневой
-  разработки.
+- [SECURITY.md](SECURITY.md) — как сообщить уязвимость.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — как помочь проекту.
 
 ## Статус проекта
 
