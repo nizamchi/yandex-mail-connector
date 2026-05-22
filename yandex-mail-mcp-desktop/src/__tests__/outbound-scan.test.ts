@@ -151,7 +151,7 @@ test('T-PERF-01-002: perf harness self-test (tiny body, near-instant)', () => {
 // itself is O(1) -- the cost we measure is dominated by Buffer.byteLength on
 // the oversize input. Deviation: Rule 1 (test flake) -- documented in
 // 02-01-SUMMARY.md.
-test('T-PERF-01-003: oversize body (2 MB) short-circuits in < 10 ms', async () => {
+test('T-PERF-01-003: oversize body (2 MB) short-circuits in < 30 ms', async () => {
   const dir = mkTmpStateDir();
   try {
     _resetOutboundScan();
@@ -172,8 +172,12 @@ test('T-PERF-01-003: oversize body (2 MB) short-circuits in < 10 ms', async () =
     const end = process.hrtime.bigint();
     const elapsedMs = Number(end - start) / 1_000_000;
 
+    // Phase 8 (T-08-06): HARD cap widened 10ms -> 30ms to absorb Windows
+    // parallel-load jitter documented in 07-DEVIATIONS.md §D4. Standalone
+    // run completes in <5ms; this gate now catches genuine perf regressions
+    // (multi-ms scans of a 2MB body) while tolerating CI contention.
     process.stderr.write(`[T-PERF-01-003] elapsed_ms=${elapsedMs.toFixed(2)}\n`);
-    assert.ok(elapsedMs < 10, `oversize short-circuit took ${elapsedMs.toFixed(2)} ms`);
+    assert.ok(elapsedMs < 30, `oversize short-circuit took ${elapsedMs.toFixed(2)} ms (HARD cap 30ms, widened Phase 8 from 10ms for Windows parallel-load — see CHANGELOG [2.1.0] Исправлено)`);
     assert.deepEqual(result.hits, []);
     assert.equal(result.totalScore, 0);
     assert.equal(result.summary, 'body too large');
