@@ -51,6 +51,7 @@
 
 import { loadCredentials } from './token.js';
 import { sendEmail } from './smtp.js';
+import { findByMessageId, type FindByMessageIdResult } from './imap.js';
 import {
   generateCode,
   verifyCode,
@@ -241,8 +242,21 @@ export function _getSmtpMockForTests(): SmtpFnLike | null {
   return _smtpMock;
 }
 
+// findByMessageId test seam (H-A1 fix): the auto-trust-on-reply path inside
+// the checkAllowlist stage performs a best-effort imap.findByMessageId
+// lookup when ctx.input.in_reply_to is set. Tests inject a mock here so
+// stage 3 can be exercised without a live IMAP socket. Production callers
+// use the real findByMessageId (null mock).
+type FindByMessageIdFnLike = (messageId: string) => Promise<FindByMessageIdResult | null>;
+let _findByMessageIdMock: FindByMessageIdFnLike | null = null;
+
+export function _setFindByMessageIdForTests(fn: FindByMessageIdFnLike | null): void {
+  _findByMessageIdMock = fn;
+}
+
 export function _resetForTests(): void {
   _smtpMock = null;
+  _findByMessageIdMock = null;
 }
 
 // -- Helpers (file-local) -----------------------------------------------
@@ -371,15 +385,15 @@ export const normalizeRecipients: Stage = async (ctx) => {
 // At authLevel===0: SHOULD NOT reach here in practice (yandex_send_email
 // requires L2); kept as a defence-in-depth no-op pass-through.
 //
-// Note: the in_reply_to lookup uses imap.findByMessageId in v2.0.0. To
-// keep send-pipeline.ts cycle-free with the wider tools.ts import graph,
-// the auto-trust path inside the pipeline does NOT call imap directly;
-// callers that want auto-trust must precompute the find result and feed
-// it into ctx via a future extension. For Phase 6 the pipeline does the
-// allowlist gate, NOT the imap lookup -- v2.0.0 path semantics for plain
-// (non-reply) sends are byte-equal. This is the same anti-scope as the
-// canonical v2.0.0 send-pipeline-ordering test (which does not exercise
-// in_reply_to).
+// H-A1 fix (post-review): the in_reply_to lookup is performed in-pipeline
+// via imap.findByMessageId (test seam _setFindByMessageIdForTests). The
+// allowlist.autoTrustOnReply mutator runs between the BEFORE and AFTER
+// _listTrusted snapshots so the diff derives autoTrusted correctly. The
+// H-1 source-gate invariant is preserved by autoTrustOnReply itself
+// (Sent-only elevation; INBOX results emit allowlist_skip and are NOT
+// trust evidence). YANDEX_AUTO_TRUST_REPLY=off disables the path globally.
+// IMAP / lookup failures are swallowed: a forensics failure must not
+// crash a send (the recipient gate below remains the real check).
 export const checkAllowlist: Stage = async (ctx) => {
   if (ctx.authLevel === 0) {
     // L0 cannot reach yandex_send_email at all (tool not registered);
@@ -400,11 +414,22 @@ export const checkAllowlist: Stage = async (ctx) => {
       .map(t => t.address),
   );
 
-  // (We do NOT invoke autoTrustOnReply from inside the pipeline -- the
-  // imap lookup remains in tools.ts to avoid pulling imapflow into the
-  // pipeline's import graph. The snapshot-diff infra is in place so that
-  // if a future iteration moves the auto-trust call into the pipeline,
-  // the autoTrusted derivation works without API change.)
+  // H-A1: invoke autoTrustOnReply between the snapshots so the diff
+  // detects the session-scope mutation. Best-effort throughout: any
+  // IMAP / allowlist failure is swallowed (the recipient gate is the
+  // real check). The mutator itself respects YANDEX_AUTO_TRUST_REPLY=off
+  // and the Sent-only source gate (H-1 invariant).
+  const inReplyTo = ctx.input?.in_reply_to;
+  if (inReplyTo && inReplyTo.length > 0) {
+    try {
+      const lookup = _findByMessageIdMock ?? findByMessageId;
+      const found = await lookup(inReplyTo);
+      allowlist.autoTrustOnReply(found);
+    } catch {
+      // Best-effort: IMAP lookup failure must not crash the send. The
+      // recipient gate below remains authoritative.
+    }
+  }
 
   const sessionAfter = new Set(
     allowlist._listTrusted()

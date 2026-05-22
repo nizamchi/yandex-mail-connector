@@ -38,6 +38,7 @@ import {
   recordSend,
   runPipeline,
   _setSmtpFnForTests,
+  _setFindByMessageIdForTests,
   _resetForTests as _resetPipeline,
   type SendContext,
   type StageResult,
@@ -45,6 +46,7 @@ import {
 import {
   addTrusted,
   getTrustEntry,
+  _listTrusted,
   _resetForTests as _resetAllowlist,
   _setEntryAddedForTests,
 } from '../allowlist.js';
@@ -205,6 +207,91 @@ test('T-STAGE-ALLOWLIST-02: snapshot-diff derives autoTrusted from session add',
       assert.equal(r.ctx.allowlistDecision!.autoTrusted, null);
     }
   } finally { cleanup(dir); }
+});
+
+// -- T-STAGE-ALLOWLIST-AUTOTRUST-01 (H-A1 fix) ------------------------------
+
+test('T-STAGE-ALLOWLIST-AUTOTRUST-01: in_reply_to Sent-source resolves -> autoTrusted set; recipient gate passes', async () => {
+  const dir = mkTmpDir('gsd-pipe-autotrust-');
+  // mkTmpDir sets YANDEX_AUTO_TRUST_REPLY=off; H-A1 path is the policy
+  // helper allowlist.autoTrustOnReply which respects that env. Clear it
+  // so the helper actually performs the Sent-only elevation.
+  delete process.env.YANDEX_AUTO_TRUST_REPLY;
+  try {
+    // Mock findByMessageId: return a Sent-folder hit for the supplied
+    // message-id. autoTrustOnReply must elevate the from-address to
+    // session-scope, and the snapshot-diff must surface it as autoTrusted.
+    _setFindByMessageIdForTests(async (msgId) => {
+      if (msgId === '<thread-1@example.com>') {
+        return { from: 'replier@example.com', folder: 'Sent', source: 'Sent', uid: 7 };
+      }
+      return null;
+    });
+
+    // Build a ctx with in_reply_to set + recipient that is ONLY trustable
+    // via the auto-trust path (no pre-existing allowlist entry).
+    const ctx = mkCtx(2, {});
+    ctx.input = {
+      to: ['replier@example.com'], subject: 'S',
+      text: 'reply body',
+      in_reply_to: '<thread-1@example.com>',
+      dry_run: false,
+    } as SendContext['input'];
+    ctx.recipients = {
+      to: ['replier@example.com'], cc: [], bcc: [],
+      all: ['replier@example.com'],
+    };
+
+    const r = await checkAllowlist(ctx);
+    assert.equal(r.kind, 'pass',
+      'reply-context send to a Sent-source resolved address must pass the gate; got ' +
+      r.kind + (r.kind === 'block' ? ' reason=' + r.reason : ''));
+    if (r.kind === 'pass') {
+      assert.equal(r.ctx.allowlistDecision!.autoTrusted, 'replier@example.com',
+        'autoTrusted must be the freshly-elevated address');
+      // _listTrusted must include the session-scope entry post-mutation.
+      const trusted = _listTrusted();
+      const hit = trusted.find(t => t.address === 'replier@example.com');
+      assert.ok(hit, 'session-scope entry must be visible in _listTrusted');
+      assert.equal(hit!.scope, 'session', 'auto-trust elevation is session-scope only');
+    }
+  } finally {
+    delete process.env.YANDEX_AUTO_TRUST_REPLY;
+    cleanup(dir);
+  }
+});
+
+test('T-STAGE-ALLOWLIST-AUTOTRUST-01-NEG: no in_reply_to -> autoTrusted null, allowlist unchanged', async () => {
+  const dir = mkTmpDir('gsd-pipe-autotrust-neg-');
+  delete process.env.YANDEX_AUTO_TRUST_REPLY;
+  try {
+    // Even with the mock available, no in_reply_to means no lookup call.
+    let lookupCalls = 0;
+    _setFindByMessageIdForTests(async () => {
+      lookupCalls++;
+      return null;
+    });
+    addTrusted('alice@example.com', 'permanent', 'sent_history');
+    const ctx = mkCtx(2, {});
+    ctx.input = {
+      to: ['alice@example.com'], subject: 'S', text: 'no-reply body',
+      dry_run: false,
+    } as SendContext['input'];
+    ctx.recipients = {
+      to: ['alice@example.com'], cc: [], bcc: [],
+      all: ['alice@example.com'],
+    };
+    const r = await checkAllowlist(ctx);
+    assert.equal(r.kind, 'pass');
+    if (r.kind === 'pass') {
+      assert.equal(r.ctx.allowlistDecision!.autoTrusted, null,
+        'no in_reply_to -> no auto-trust path -> autoTrusted null');
+    }
+    assert.equal(lookupCalls, 0, 'findByMessageId must NOT be called when in_reply_to is absent');
+  } finally {
+    delete process.env.YANDEX_AUTO_TRUST_REPLY;
+    cleanup(dir);
+  }
 });
 
 // -- T-STAGE-SCAN-01 --------------------------------------------------------
