@@ -223,7 +223,12 @@ function evalMultiRecipient(ctx: RiskContext, policy: RiskPolicy): RiskReason | 
 }
 
 // 8. large_body -- strict GT 50000 bytes (D5 row 8). 50000 does NOT fire.
+// W-3 (v2.1.1 cosmetic): if bodySize is non-finite (Infinity/NaN) or negative,
+// the signal must not fire AND the detail string must not leak "Infinity" /
+// "NaN" tokens. NaN comparisons are already false (signal silent), but
+// Infinity > 50_000 is true and would surface "~Infinity KB" in detail.
 function evalLargeBody(ctx: RiskContext, policy: RiskPolicy): RiskReason | null {
+  if (!Number.isFinite(ctx.bodySize) || ctx.bodySize < 0) return null;
   if (ctx.bodySize <= 50_000) return null;
   const approxKB = Math.round(ctx.bodySize / 1000);
   return {

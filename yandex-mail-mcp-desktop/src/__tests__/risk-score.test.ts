@@ -335,6 +335,20 @@ test('T-RISK-LARGE-BODY-BOUNDARY-01 -- bodySize=50000 does NOT fire (strict GT)'
   assert.equal(r.tier, 'low');
 });
 
+// W-3 (v2.1.1 cosmetic): non-finite bodySize must not leak "Infinity" / "NaN"
+// into detail strings. Three inputs: +Infinity, NaN, negative. None must fire.
+test('T-RISK-LARGE-BODY-NONFINITE-01 -- Infinity/NaN/negative bodySize is silent', () => {
+  installDefaults();
+  for (const bad of [Number.POSITIVE_INFINITY, Number.NaN, -1, -1_000_000]) {
+    const ctx = emptyCtx({ bodySize: bad });
+    const r = computeRiskScore(ctx);
+    const leaks = r.reasons.filter((x) => /Infinity|NaN/.test(x.detail));
+    assert.equal(leaks.length, 0, `bodySize=${bad} leaked Infinity/NaN to detail`);
+    const largeBodyFires = r.reasons.some((x) => x.signal === 'large_body');
+    assert.equal(largeBodyFires, false, `bodySize=${bad} must not fire large_body`);
+  }
+});
+
 test('T-RISK-BURST-01 -- recentSendCount==threshold fires weight 25', () => {
   installDefaults();
   const ctx = emptyCtx({ recentSendCount: 3 });
