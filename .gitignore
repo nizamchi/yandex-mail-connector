@@ -49,6 +49,8 @@ recent-sends.jsonl
 override-tokens.jsonl
 **/override-tokens.jsonl
 
-# GSD runtime state
-.planning/STATE.local.md
-.planning/HANDOFF.json
+# Внутренние рабочие материалы — не для публики
+.planning/
+CLAUDE.md
+MILESTONE-DEEP-REVIEW-PROMPT.md
+.github/REPO-SETUP.md
