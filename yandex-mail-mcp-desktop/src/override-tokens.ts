@@ -315,11 +315,44 @@ export function mintOverrideToken(fingerprint: string): {
     expires_at_ms: expiresAtMs,
     used_at_ms: null,
   };
+  // WR-03 (v2.1.1 cosmetic): supersede prior unconsumed + un-expired records
+  // for the SAME fingerprint. Without this, a CLI operator who runs
+  // `yandex-mail-mcp-trust --high-risk-send=<fp>` twice (e.g. forgot the first
+  // succeeded) leaves N valid override tokens floating in the JSONL until
+  // their 30-min TTL elapses. Each is single-use, so they cannot stack into
+  // multi-send, but defense-in-depth wants "one mint, one shot." We mark
+  // prior records used_at_ms=now -- this is the same marker consumeOverrideToken
+  // already recognises (Step 7 rejects with reason='used'), so the consume
+  // path needs no schema change. The existing GC in atomicWriteJsonl will
+  // sweep these out after USED_GC_GRACE_MS (7d). Forensics: audit log retains
+  // separate override_token_minted records, so supersede is visible there.
+  let supersededCount = 0;
+  for (const r of cache) {
+    if (
+      r.fingerprint === fingerprint &&
+      r.used_at_ms === null &&
+      mintedAtMs <= r.expires_at_ms
+    ) {
+      r.used_at_ms = mintedAtMs;
+      supersededCount++;
+    }
+  }
   cache.push(record);
   atomicWriteJsonl(tokensPath(), cache);
   // Re-read cache from disk so the in-memory mirror reflects post-prune state.
   cache = _readJsonlFresh();
   loaded = true;
+  if (supersededCount > 0) {
+    // Forensic trail: emit a denied-style audit so operators can see in the
+    // log that the prior unconsumed token was retired (not consumed).
+    auditLog({
+      action: 'override_token_superseded',
+      status: 'denied',
+      level: 'info',
+      ts: new Date().toISOString(),
+      reason: 'fp=' + fingerprint.slice(0, 8) + ',count=' + supersededCount,
+    });
+  }
   auditLog({
     action: 'override_token_minted',
     status: 'success',

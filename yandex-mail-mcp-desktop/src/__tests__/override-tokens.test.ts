@@ -157,6 +157,55 @@ test('T-OVERRIDE-CONSUME-01: consume returns ok and marks used_at_ms', () => {
   }
 });
 
+// WR-03 (v2.1.1 cosmetic): re-minting against the same fingerprint must
+// supersede prior unconsumed tokens. The first token must become unusable
+// (reason='used') and only the second token consumes successfully.
+test('T-OVERRIDE-SUPERSEDE-01: mintOverrideToken supersedes prior unconsumed tokens (WR-03)', () => {
+  const restoreEnv = snapshotEnv();
+  const stateDir = tmpStateDir();
+  process.env.YANDEX_STATE_DIR = stateDir;
+  delete process.env.YANDEX_AUDIT_LOG;
+  resetAll();
+  try {
+    const first = mintOverrideToken(VALID_FP);
+    const second = mintOverrideToken(VALID_FP);
+    // The two tokens must differ (fresh nonce -> fresh HMAC output).
+    assert.notEqual(first.token, second.token, 'second mint must produce a distinct token');
+
+    // First token is now superseded -> consume fails with reason='used'.
+    const r1 = consumeOverrideToken(VALID_FP, first.token);
+    assert.equal(r1.ok, false, 'first (superseded) token must be rejected');
+    if (r1.ok === false) assert.equal(r1.reason, 'used');
+
+    // Second token consumes successfully.
+    const r2 = consumeOverrideToken(VALID_FP, second.token);
+    assert.equal(r2.ok, true, 'second (live) token must consume successfully');
+  } finally {
+    restoreEnv();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('T-OVERRIDE-SUPERSEDE-DIFF-FP-01: mint against DIFFERENT fingerprints does NOT cross-supersede (WR-03)', () => {
+  const restoreEnv = snapshotEnv();
+  const stateDir = tmpStateDir();
+  process.env.YANDEX_STATE_DIR = stateDir;
+  delete process.env.YANDEX_AUDIT_LOG;
+  resetAll();
+  try {
+    const a = mintOverrideToken(VALID_FP);
+    const b = mintOverrideToken(OTHER_FP);
+    // Both still valid -- different fingerprints.
+    const ra = consumeOverrideToken(VALID_FP, a.token);
+    assert.equal(ra.ok, true, 'token A on FP A must remain valid after FP B mint');
+    const rb = consumeOverrideToken(OTHER_FP, b.token);
+    assert.equal(rb.ok, true, 'token B on FP B must remain valid after FP A consume');
+  } finally {
+    restoreEnv();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test('T-OVERRIDE-REPLAY-01: second consume returns {ok:false, reason:used} (single-use)', () => {
   const restoreEnv = snapshotEnv();
   const stateDir = tmpStateDir();
