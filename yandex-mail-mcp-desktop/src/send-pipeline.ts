@@ -308,7 +308,8 @@ export const validateSchema: Stage = async (ctx) => {
       kind: 'block',
       reason: 'invalid_schema',
       audit: {
-        action: 'yandex_send_email',
+        // H-A2: per-stage discriminator action (driver emits to audit.jsonl).
+        action: 'schema_invalid',
         status: 'denied',
         level: 'warn',
         reason: 'schema_parse_failed',
@@ -323,7 +324,7 @@ export const validateSchema: Stage = async (ctx) => {
       kind: 'block',
       reason: 'invalid_schema',
       audit: {
-        action: 'yandex_send_email',
+        action: 'schema_invalid',
         status: 'denied',
         level: 'warn',
         reason: 'missing_body',
@@ -672,7 +673,8 @@ export const enforceGuards: Stage = async (ctx) => {
     kind: 'block',
     reason: result.reason,
     audit: {
-      action: 'yandex_send_email',
+      // H-A2: per-stage discriminator action (driver emits to audit.jsonl).
+      action: 'guard_block',
       status: 'denied',
       level: 'warn',
       reason: result.reason,
@@ -700,18 +702,14 @@ export const smtpSend: Stage = async (ctx) => {
   if (conf?.code !== undefined) {
     const v = verifyCode(fp, conf.code);
     if (v !== true) {
-      auditLog({
-        action: 'verify_failed',
-        status: 'denied',
-        level: 'warn',
-        ts: nowIso(ctx),
-        reason: 'code_' + v,
-      });
+      // H-A2: driver emits this AuditPayload to audit.jsonl on block;
+      // the prior inline auditLog({action:'verify_failed',...}) was
+      // duplicated by the driver and is removed.
       return {
         kind: 'block',
         reason: 'confirm_failed',
         audit: {
-          action: 'yandex_send_email',
+          action: 'verify_failed',
           status: 'denied',
           level: 'warn',
           reason: 'code_' + v,
@@ -732,7 +730,8 @@ export const smtpSend: Stage = async (ctx) => {
         kind: 'block',
         reason: 'risk_block',
         audit: {
-          action: 'yandex_send_email',
+          // H-A2: per-stage discriminator action.
+          action: 'risk_block_no_override',
           status: 'denied',
           level: 'warn',
           reason: 'risk_block_no_override',
@@ -753,7 +752,10 @@ export const smtpSend: Stage = async (ctx) => {
         kind: 'block',
         reason: blockReason,
         audit: {
-          action: 'yandex_send_email',
+          // H-A2: per-stage discriminator action ('override_used' /
+          // 'override_forged' / 'override_expired' / etc.) -- the
+          // reason itself IS the discriminator for this stage.
+          action: blockReason,
           status: 'denied',
           level: 'warn',
           reason: blockReason,
@@ -772,18 +774,14 @@ export const smtpSend: Stage = async (ctx) => {
   const smtpFn = _smtpMock ?? (sendEmail as unknown as SmtpFnLike);
   const result = await smtpFn(creds, buildSmtpOpts(ctx));
   if (!result.success) {
-    auditLog({
-      action: 'send_failed',
-      status: 'denied',
-      level: 'warn',
-      ts: nowIso(ctx),
-      reason: 'smtp_error',
-    });
+    // H-A2: driver emits this AuditPayload to audit.jsonl on block;
+    // the prior inline auditLog({action:'send_failed',...}) was
+    // duplicated by the driver and is removed.
     return {
       kind: 'block',
       reason: 'smtp_error',
       audit: {
-        action: 'yandex_send_email',
+        action: 'send_failed',
         status: 'denied',
         level: 'warn',
         reason: 'smtp_error',
@@ -859,13 +857,44 @@ export const pipeline: Stage[] = [
 // `block` / `pending` return immediately. After the loop a `pass`
 // becomes `success`. The function is total -- no throw paths from the
 // driver itself; stage exceptions propagate to the handler caller.
+//
+// H-A2 fix: on `block`, emit the per-stage AuditPayload to audit.jsonl
+// BEFORE returning. This restores the v2.0.0 forensic completeness
+// contract: every block-emitting stage's discriminating action
+// ('untrusted_block', 'verify_failed', 'risk_block_no_override',
+// 'override_used' / 'override_forged' / 'override_expired',
+// 'send_failed', 'schema_invalid', 'guard_block') reaches the log.
+// The outer `wrapWithAudit` in tools.ts still emits its generic
+// 'yandex_send_email' envelope; two entries per deny is the deliberate
+// Option-A ownership pattern (outer envelope for compat + inner stage
+// payload for forensics).
+//
+// Pending paths carry no audit field today and are not emitted here.
 export async function runPipeline(ctxIn: SendContext): Promise<PipelineResult> {
   let ctx = ctxIn;
   for (const stage of pipeline) {
     const r = await stage(ctx);
-    if (r.kind === 'block')   return { kind: 'block',   reason: r.reason,   audit: r.audit,    ctx: r.ctx };
+    if (r.kind === 'block') {
+      emitStageBlockAudit(r.audit, r.ctx);
+      return { kind: 'block', reason: r.reason, audit: r.audit, ctx: r.ctx };
+    }
     if (r.kind === 'pending') return { kind: 'pending', requires: r.requires, ctx: r.ctx };
     ctx = r.ctx;
   }
   return { kind: 'success', ctx };
+}
+
+// emitStageBlockAudit: fold the per-stage AuditPayload into an
+// auditLog-shaped record. The audit.jsonl Zod schema is .strict() and
+// has no `error` key, so we fold any `error` text into `reason` instead
+// of attempting to pass it through (which would fail Zod parse and
+// silently drop the entire record). Synthesizes `ts` from ctx.nowMs.
+function emitStageBlockAudit(audit: AuditPayload, ctx: SendContext): void {
+  const { error, ...rest } = audit;
+  const reasonCombined = error
+    ? (audit.reason ? `${audit.reason},err=${error}` : `err=${error}`)
+    : audit.reason;
+  const record: Record<string, unknown> = { ...rest, ts: nowIso(ctx) };
+  if (reasonCombined !== undefined) record.reason = reasonCombined;
+  auditLog(record);
 }

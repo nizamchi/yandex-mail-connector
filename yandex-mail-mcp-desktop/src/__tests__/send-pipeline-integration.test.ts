@@ -339,3 +339,70 @@ test('T-INTEG-V200-H2-01: daily_limit at L1 + valid code -> block before code bu
     delete process.env.YANDEX_DAILY_SEND_LIMIT;
   } finally { cleanup(dir); }
 });
+
+// -- T-INTEG-AUDIT-INNER-PAYLOAD-01 (H-A2 fix) -----------------------------
+
+test('T-INTEG-AUDIT-INNER-PAYLOAD-01: deny path persists per-stage AuditPayload to audit.jsonl', async () => {
+  const dir = mkTmpDir('gsd-integ-audit-inner-');
+  try {
+    // Untrusted recipient -> checkAllowlist stage emits a block with
+    // AuditPayload { action: 'untrusted_block', from_domain: ..., ... }.
+    // H-A2: the driver MUST forward that payload to audit.jsonl. v2.0.0
+    // emitted one such entry per blocked send; Phase 6 lost the signal.
+    _setSmtpFnForTests(async () => ({ success: true, messageId: '<should-not-send>' }));
+
+    const r = await runPipeline(mkCtx(2, {
+      to: ['exfil-target@evil.com'],
+      subject: 'Untrusted-block fixture',
+      text: 'Body',
+    }));
+    assert.equal(r.kind, 'block');
+    if (r.kind === 'block') {
+      assert.equal(r.reason, 'untrusted_recipient');
+    }
+
+    // Drain the audit write queue and inspect audit.jsonl.
+    const { _drainForTests } = await import('../audit.js');
+    await _drainForTests();
+    const auditPath = path.join(dir, 'audit.jsonl');
+    assert.ok(fs.existsSync(auditPath), 'audit.jsonl must exist after a denied send');
+    const lines = fs.readFileSync(auditPath, 'utf-8').split('\n').filter(l => l.length > 0);
+    const entries = lines.map(l => JSON.parse(l) as Record<string, unknown>);
+    const untrustedHits = entries.filter(e => e.action === 'untrusted_block');
+    assert.ok(untrustedHits.length >= 1,
+      'audit.jsonl MUST contain at least one entry with action=untrusted_block; ' +
+      'got actions=' + JSON.stringify(entries.map(e => e.action)));
+    const hit = untrustedHits[0];
+    assert.equal(hit!.status, 'denied');
+    assert.ok(typeof hit!.from_domain === 'string' && (hit!.from_domain as string).length > 0,
+      'untrusted_block audit entry must carry from_domain (got ' + String(hit!.from_domain) + ')');
+    assert.equal(hit!.from_domain, 'evil.com',
+      'from_domain must be the untrusted recipient domain');
+  } finally { cleanup(dir); }
+});
+
+test('T-INTEG-AUDIT-INNER-PAYLOAD-01-NEG: success path produces NO untrusted_block entry', async () => {
+  const dir = mkTmpDir('gsd-integ-audit-inner-neg-');
+  try {
+    const thirtyDaysAgo = Date.now() - 30 * 86400_000;
+    const { mkAllowlistEntryWithMeta } = await import('./util/allowlist-fixture.js');
+    mkAllowlistEntryWithMeta('clean@x.com', thirtyDaysAgo, 5, 'permanent', 'sent_history');
+    _setSmtpFnForTests(async () => ({ success: true, messageId: '<mid-clean>' }));
+
+    const r = await runPipeline(mkCtx(2, {
+      to: ['clean@x.com'], subject: 'Clean', text: 'Plain text.',
+    }));
+    assert.equal(r.kind, 'success');
+
+    const { _drainForTests } = await import('../audit.js');
+    await _drainForTests();
+    const auditPath = path.join(dir, 'audit.jsonl');
+    if (fs.existsSync(auditPath)) {
+      const lines = fs.readFileSync(auditPath, 'utf-8').split('\n').filter(l => l.length > 0);
+      const entries = lines.map(l => JSON.parse(l) as Record<string, unknown>);
+      const blockEntries = entries.filter(e => e.action === 'untrusted_block');
+      assert.equal(blockEntries.length, 0,
+        'success path MUST NOT emit untrusted_block; got ' + blockEntries.length + ' entries');
+    }
+  } finally { cleanup(dir); }
+});
