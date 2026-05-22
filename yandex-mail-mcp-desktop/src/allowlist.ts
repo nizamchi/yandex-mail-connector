@@ -159,8 +159,13 @@ function computeSignature(file: AllowlistFile, secret: Buffer): string {
 
 // ── Atomic write helper ────────────────────────────────────
 
+// M-1 (v2.1.1 cosmetic): per-process tmp suffix to bound first-launch race
+// between two concurrently-bootstrapping MCP processes (npx in two terminals,
+// CI parallelism). Without this, both processes write to the same target+'.tmp'
+// and either's tmp can be truncated by the other before rename. Mirrored
+// byte-for-byte in policy.ts -- W-2 mirror discipline.
 function atomicWrite(target: string, data: Buffer | string, mode: number): void {
-  const tmp = target + '.tmp';
+  const tmp = target + '.tmp.' + process.pid + '.' + randomBytes(3).toString('hex');
   try {
     fs.writeFileSync(tmp, data, { mode });
     fs.renameSync(tmp, target);

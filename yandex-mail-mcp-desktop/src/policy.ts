@@ -176,8 +176,15 @@ function signPolicy(policy: RiskPolicy, secret: Buffer): string {
 // Byte-identical pattern to allowlist.ts atomicWrite (W-2 mirror principle
 // extends here in spirit; the bodies are short so no scripted gate).
 
+// M-1 (v2.1.1 cosmetic): the tmp filename embeds pid + randomBytes(3) so two
+// MCP processes booting concurrently on a fresh install (npx in two terminals,
+// CI parallelism) cannot overwrite each other's .tmp file mid-write. The
+// last `rename` still wins for the target itself -- this fix bounds the
+// damage to "last writer wins" instead of "writer A's tmp got truncated by
+// writer B before rename" (which is data loss). Mirrored byte-for-byte in
+// allowlist.ts -- if you change one, change both.
 function atomicWrite(target: string, data: Buffer | string, mode: number): void {
-  const tmp = target + '.tmp';
+  const tmp = target + '.tmp.' + process.pid + '.' + randomBytes(3).toString('hex');
   try {
     fs.writeFileSync(tmp, data, { mode });
     fs.renameSync(tmp, target);

@@ -153,7 +153,10 @@ function atomicWriteJsonl(target: string, records: readonly OverrideTokenRecord[
     return true;
   });
   const body = live.map((r) => JSON.stringify(r)).join('\n') + (live.length > 0 ? '\n' : '');
-  const tmp = target + '.tmp';
+  // M-1 (v2.1.1 cosmetic): per-process tmp suffix -- mirrors policy.ts +
+  // allowlist.ts atomicWrite. Two MCP processes consuming override tokens
+  // concurrently would otherwise share target+'.tmp' and corrupt each other.
+  const tmp = target + '.tmp.' + process.pid + '.' + randomBytes(3).toString('hex');
   try {
     fs.writeFileSync(tmp, body, { mode: 0o600 });
     fs.renameSync(tmp, target);
