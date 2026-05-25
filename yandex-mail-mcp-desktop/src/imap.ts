@@ -241,6 +241,64 @@ export async function getEmail(folder: string, uid: number): Promise<EmailMessag
   });
 }
 
+// streamEnvelopes -- bounded-memory async generator over a folder's envelopes.
+// Yields per envelope (not per batch) so the consumer can short-circuit. UIDs
+// are fetched in chunks of CHUNK_SIZE to bound the imapflow internal buffer;
+// each chunk's envelopes are emitted as they parse, then the chunk is dropped.
+//
+// since/until are inclusive ISO dates; the filter runs per-envelope after the
+// fetch because IMAP UID order is not date-sorted (we'd have to fetch envelope
+// before we know whether to keep it). For mailboxes that need a cheaper filter
+// the caller can use c.search({since, before}) -- but that's a different
+// trade-off (extra round trip vs. extra parse) and v2.3.0 ships the simpler
+// per-envelope filter.
+//
+// has_attachments cannot be derived from the envelope alone (would need
+// bodyStructure, which is much heavier per message). EnvelopeRow.hasAttachments
+// is always false here -- documented in the stats tool description.
+export async function* streamEnvelopes(
+  folder: string,
+  since?: string,
+  until?: string,
+): AsyncGenerator<EmailHeader, void, void> {
+  const CHUNK_SIZE = 1000;
+  const sinceMs = since ? new Date(since).getTime() : null;
+  const untilMs = until ? new Date(until).getTime() : null;
+  if (sinceMs !== null && isNaN(sinceMs)) throw new Error('invalid since date: ' + since);
+  if (untilMs !== null && isNaN(untilMs)) throw new Error('invalid until date: ' + until);
+
+  // We need the connection open for the lifetime of the iteration, so we
+  // can't use ConnectionManager.withClient (which logs out on Promise
+  // resolution). Reuse the same makeClient + try/finally pattern manually so
+  // the connection is opened lazily on first iteration and closed on
+  // generator return/throw. Memory cost: O(CHUNK_SIZE) envelopes in flight,
+  // not O(folder size).
+  const c = makeClient(loadCredentials());
+  await c.connect();
+  try {
+    await c.mailboxOpen(folder, { readOnly: true });
+    const searchResult = await c.search({}, { uid: true });
+    const uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+    for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
+      const chunk = uids.slice(i, i + CHUNK_SIZE);
+      if (chunk.length === 0) continue;
+      for await (const msg of c.fetch(chunk, { uid: true, envelope: true, flags: true, size: true }, { uid: true })) {
+        const hdr = parseHeader(msg);
+        // Per-envelope date filter: IMAP UID order is not date-sorted, so we
+        // must check each envelope. Envelopes with no date pass through and
+        // are bucketed as <unknown> downstream when the aggregator runs a
+        // date-based group_by.
+        const ts = hdr.date ? new Date(hdr.date).getTime() : NaN;
+        if (sinceMs !== null && !isNaN(ts) && ts < sinceMs) continue;
+        if (untilMs !== null && !isNaN(ts) && ts > untilMs) continue;
+        yield hdr;
+      }
+    }
+  } finally {
+    await c.logout().catch(() => {});
+  }
+}
+
 export async function searchEmails(
   folder: string,
   query: Record<string, unknown>,

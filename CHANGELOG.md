@@ -7,6 +7,45 @@
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-05-25
+
+Minor-релиз. Один новый L0 MCP-инструмент `yandex_stats` и опциональный
+параметр `summary_only` у `yandex_list_emails`. Никаких изменений auth/security,
+никаких breaking changes. Бандл вырос на ~11 КБ (2.72 МБ).
+
+### Добавлено
+
+- **`yandex_stats` — серверная агрегация по почтовому ящику.** L0 read-only
+  инструмент. Принимает `folder`, `group_by` (массив 1-3 полей композитного
+  ключа), опциональные `since`/`until` (ISO даты), `top_n` (1-1000, default 50).
+  Доступно 16 полей группировки: `sender`, `sender_name`, `domain`, `year`,
+  `month`, `year_month`, `weekday`, `hour`, `date`, `to_first`, `subject_prefix`,
+  `subject_normalized`, `size_bucket` (4 интервала), `has_attachments`,
+  `flag_seen`, `flag_flagged`. Возвращает только счётчики (несколько КБ)
+  вместо envelopes (сотни КБ). Поток envelope-only IMAP-фетчей по 1000 UID
+  за раз — память O(chunk), не O(folder size).
+
+  Обнаружено когда агент при запросе «статистика по входящим, кто мне больше
+  пишет по годам» исчерпал контекстный бюджет, загружая 3765 писем постранично
+  через `yandex_list_emails` ради подсчёта вручную. Бридж-фикс до полноценного
+  Layer 2 SQLite-индекса.
+
+- **`summary_only: boolean` у `yandex_list_emails`.** При `true` возвращает
+  усечённую форму envelope `{uid, from_email, date, subject_first_50}` вместо
+  полного заголовка. Снижает вес в токенах примерно в 3-5 раз — полезно
+  когда агенту нужен список писем, но не нужны CC/flags/size.
+
+- **13 unit-тестов агрегатора** в `src/__tests__/stats.test.ts`. Все
+  бакетеры, композитные ключи, top_n cap, фильтр по дате, edge cases
+  (пустой iterator, отсутствующие поля envelope, цепочки `Re: Fwd: Re:`).
+
+### Известные ограничения
+
+- `has_attachments` всегда `'no'` в v2.3.0. Реальное определение требует
+  тяжёлого `bodyStructure` fetch'а, что сломает cost-модель streaming.
+  Документировано в описании инструмента. Будет решено в Layer 2 (offline
+  индексация с богатой схемой).
+
 ## [2.2.1] — 2026-05-25
 
 Patch-релиз. Включает рабочий `npx -y github:...` (раньше не работал

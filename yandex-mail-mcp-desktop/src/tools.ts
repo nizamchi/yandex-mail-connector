@@ -20,6 +20,7 @@ import * as path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import { loadCredentials } from './token.js';
 import * as imap from './imap.js';
+import { aggregate, type GroupByField, type EnvelopeRow } from './stats.js';
 import { sendEmail } from './smtp.js';
 import { sanitizeForDisplay, wrapUntrusted, sanitizeError } from './sanitize.js';
 import { generateCode, verifyCode, actionFingerprint, type VerifyResult } from './confirm.js';
@@ -263,6 +264,25 @@ const listEmailsSchema = z.object({
   folder:    z.string().default('INBOX').describe('IMAP папка'),
   page:      z.number().int().min(1).default(1).describe('Страница (1-based)'),
   page_size: z.number().int().min(1).max(100).default(20).describe('Писем на странице'),
+  summary_only: z.boolean().default(false).describe(
+    'Если true -- возвращает только {uid, from_email, date, subject_first_50} вместо полного заголовка. Снижает вес в токенах ~3-5x.',
+  ),
+}).strict();
+const GROUP_BY_FIELDS = [
+  'sender', 'sender_name', 'domain',
+  'year', 'month', 'year_month', 'weekday', 'hour', 'date',
+  'to_first',
+  'subject_prefix', 'subject_normalized',
+  'size_bucket', 'has_attachments',
+  'flag_seen', 'flag_flagged',
+] as const;
+const statsSchema = z.object({
+  folder: z.string().default('INBOX').describe('IMAP папка для сканирования'),
+  group_by: z.array(z.enum(GROUP_BY_FIELDS)).min(1).max(3)
+    .describe('Поля группировки (1-3). См. описание инструмента для списка.'),
+  since: z.string().optional().describe('ISO дата начала диапазона (включительно), напр. "2025-01-01"'),
+  until: z.string().optional().describe('ISO дата конца диапазона (включительно)'),
+  top_n: z.number().int().min(1).max(1000).default(50).describe('Максимум строк в результате'),
 }).strict();
 const getEmailSchema = z.object({
   folder: z.string().default('INBOX'),
@@ -789,8 +809,24 @@ Args: folder (default "INBOX"), page (default 1), page_size (1-100, default 20).
     requires: { authLevel: 0 },
     handler: async (params, _ctx) => {
       try {
-        const { folder, page, page_size } = listEmailsSchema.parse(params);
+        const { folder, page, page_size, summary_only } = listEmailsSchema.parse(params);
         const r = await imap.listEmails(folder, page, page_size);
+        if (summary_only) {
+          const slim = r.emails.map(e => ({
+            uid: e.uid,
+            from_email: e.from[0]?.address ?? '',
+            date: e.date,
+            subject_first_50: (e.subject ?? '').slice(0, 50),
+          }));
+          const text = `${r.folder}  |  всего: ${r.total}  |  стр. ${r.page}  |  ещё есть: ${r.hasMore}  |  summary_only\n\n` +
+            (slim.length
+              ? slim.map(s => `UID ${s.uid}  ${s.date}  ${sanitizeForDisplay(s.from_email)}  | ${sanitizeForDisplay(s.subject_first_50)}`).join('\n')
+              : 'Писем не найдено.');
+          return {
+            content: [{ type: 'text', text }],
+            structuredContent: { folder: r.folder, total: r.total, page: r.page, pageSize: r.pageSize, hasMore: r.hasMore, summary_only: true, emails: slim },
+          };
+        }
         const text = `${r.folder}  |  всего: ${r.total}  |  стр. ${r.page}  |  ещё есть: ${r.hasMore}\n\n${fmtHeaders(r.emails)}`;
         return { content: [{ type: 'text', text }], structuredContent: r };
       } catch (e) { return errorResult(e); }
@@ -1006,6 +1042,72 @@ Args:
           `Спам:        ${folders.spam}`,
         ].join('\n');
         return { content: [{ type: 'text', text }], structuredContent: folders };
+      } catch (e) { return errorResult(e); }
+    },
+  },
+
+  // 6b. Stats (L0) -- server-side aggregation; v2.3.0.
+  // Closes the gap revealed when an agent burned its full context budget
+  // downloading 3765 envelopes through yandex_list_emails just to count them
+  // by year. Streams envelopes from IMAP in 1000-UID chunks, aggregates in
+  // pure code (src/stats.ts), returns counts only. Bridge until Layer 2
+  // ships a persistent SQLite index.
+  {
+    name: 'yandex_stats',
+    title: 'Статистика писем',
+    description: `ВСЕГДА используй этот инструмент когда нужна агрегация по получателям/датам/размерам --
+НЕ загружай список писем через yandex_list_emails чтобы подсчитать вручную (сожжёт контекст на тысячах писем).
+Серверная агрегация: возвращает счётчики (~КБ) вместо envelopes (~сотни КБ).
+Args:
+  folder    (default "INBOX") -- IMAP папка
+  group_by  (string[], 1-3 полей) -- композитный ключ группировки
+  since     (ISO date?, включительно)
+  until     (ISO date?, включительно)
+  top_n     (1-1000, default 50)
+Доступные поля group_by:
+  sender / sender_name / domain
+  year / month / year_month / weekday / hour / date
+  to_first / subject_prefix / subject_normalized
+  size_bucket (<10KB / 10-100KB / 100KB-1MB / >1MB)
+  has_attachments (best-effort: envelope-only, всегда "no" в v2.3.0 -- bodyStructure слишком тяжёл для streaming)
+  flag_seen / flag_flagged
+Примеры:
+  group_by=["sender"]              -- топ отправителей
+  group_by=["year","domain"]       -- по годам и доменам
+  group_by=["weekday","hour"]      -- распределение по дню недели + часу
+Output: { rows: [{ key:[...], count, total_size_bytes, earliest, latest }], total_scanned, scan_time_ms, truncated }
+Сортировка: count desc, ключ asc.`,
+    inputSchema: statsSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    meta: { 'anthropic/maxResultSizeChars': 200_000 },
+    requires: { authLevel: 0 },
+    handler: async (params, _ctx) => {
+      try {
+        const { folder, group_by, since, until, top_n } = statsSchema.parse(params);
+        // Adapter: imap.streamEnvelopes yields EmailHeader; stats.aggregate
+        // accepts the EnvelopeRow subset. Shape is structurally compatible,
+        // but the cast keeps type-narrowing honest and survives future
+        // EmailHeader-only field additions.
+        const src = imap.streamEnvelopes(folder, since, until) as AsyncGenerator<EnvelopeRow>;
+        const result = await aggregate(src, {
+          groupBy: group_by as GroupByField[],
+          since,
+          until,
+          topN: top_n,
+        });
+        const out = {
+          folder,
+          group_by,
+          total_scanned: result.total_scanned,
+          date_range: result.date_range,
+          rows: result.rows,
+          scan_time_ms: result.scan_time_ms,
+          truncated: result.truncated,
+        };
+        return {
+          content: [{ type: 'text', text: JSON.stringify(out, null, 2) }],
+          structuredContent: out,
+        };
       } catch (e) { return errorResult(e); }
     },
   },

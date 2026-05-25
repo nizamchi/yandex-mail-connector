@@ -96,10 +96,10 @@ npm install --omit=dev --ignore-scripts
 Запомни **абсолютный путь** к `dist/yandex-mail-mcp.js` — он понадобится в
 Шаге 4.
 
-### Вариант B — `npx` без клонирования (с v2.2.1)
+### Вариант B — `npx` без клонирования (с v2.2.1+)
 
 ```bash
-npx -y github:nizamchi/yandex-mail-connector#v2.2.1 --check
+npx -y github:nizamchi/yandex-mail-connector#v2.3.0 --check
 ```
 
 Удобно для быстрого health-check, демо или одноразового запуска. Бандл
@@ -109,7 +109,7 @@ npx -y github:nizamchi/yandex-mail-connector#v2.2.1 --check
 Для запуска в режиме MCP-сервера через npx (без `--check`):
 
 ```bash
-npx -y github:nizamchi/yandex-mail-connector#v2.2.1
+npx -y github:nizamchi/yandex-mail-connector#v2.3.0
 ```
 
 `token.json` при этом ищется в state-каталоге (`%APPDATA%\yandex-mail-mcp\` /
@@ -140,7 +140,9 @@ claude mcp add yandex-mail --scope user \
 После добавления — `/exit` в Claude Code и запустить заново. Инструменты
 `yandex_list_folders` / `yandex_list_emails` / `yandex_get_email` /
 `yandex_search_emails` / `yandex_get_special_folders` /
-`yandex_folder_status` появятся в чате.
+`yandex_folder_status` / `yandex_stats` появятся в чате. `yandex_stats`
+(c v2.3.0) — серверная агрегация: используй его когда нужно посчитать
+«сколько писем от кого/когда/каких размеров» вместо пагинации списка.
 
 **Tool Search defer:** Claude Code по умолчанию откладывает загрузку MCP
 tools и подгружает их по запросу. v2.1.3 добавил `instructions` на сервер,
