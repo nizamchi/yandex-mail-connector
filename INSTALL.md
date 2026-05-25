@@ -65,8 +65,9 @@ chmod 600 token.json
 1. **Произвольный путь:** `YANDEX_TOKEN_FILE=/абсолютный/путь/token.json`.
    Полезно для CI / dotfiles / shared secrets.
 2. **Project-root** (legacy): `<repo>/token.json` — работает при
-   `git clone` + `npm start`. Не работает для `npx -y github:...` (бандл
-   живёт в `~/.npm/_npx` и стирается между запусками).
+   `git clone` + `npm start`. Для `npx -y github:...` не подходит — бандл
+   живёт в `~/.npm/_npx/` и пересоздаётся между запусками. Для npx используй
+   state-каталог (по умолчанию) или `YANDEX_TOKEN_FILE`.
 3. **CWD** (legacy): `<cwd>/token.json` — работает при ручном запуске из
    известного каталога. Для Claude Desktop / Cursor cwd непредсказуем.
 4. **Без файла (рекомендуется):** environment variables
@@ -76,9 +77,9 @@ chmod 600 token.json
 
 ## Шаг 3: установка бандла
 
-Структурно `package.json` лежит в подкаталоге `yandex-mail-mcp-desktop/`, что
-блокирует `npx -y github:...`. До v2.2.0 (переезд в корень) — устанавливай
-руками через git clone:
+Два способа.
+
+### Вариант A — git clone (рекомендуется для постоянной установки)
 
 ```bash
 git clone https://github.com/nizamchi/yandex-mail-connector.git
@@ -87,13 +88,32 @@ npm install --omit=dev --ignore-scripts
 # готовый бандл лежит в dist/yandex-mail-mcp.js
 ```
 
-`--ignore-scripts` нужен потому что у нас есть `prepare: npm run build`,
+`--ignore-scripts` нужен потому что в подпакете есть `prepare: npm run build`,
 который пытается пересобрать esbuild'ом — а dev-deps (включая esbuild) при
 `--omit=dev` не ставятся. Бандл уже собран и закоммичен в git, пересобирать
 не нужно.
 
 Запомни **абсолютный путь** к `dist/yandex-mail-mcp.js` — он понадобится в
 Шаге 4.
+
+### Вариант B — `npx` без клонирования (с v2.2.1)
+
+```bash
+npx -y github:nizamchi/yandex-mail-connector#v2.2.1 --check
+```
+
+Удобно для быстрого health-check, демо или одноразового запуска. Бандл
+кэшируется в `~/.npm/_npx/<hash>/`, но npm периодически чистит этот кэш,
+поэтому для постоянного подключения к MCP-клиенту надёжнее Вариант A.
+
+Для запуска в режиме MCP-сервера через npx (без `--check`):
+
+```bash
+npx -y github:nizamchi/yandex-mail-connector#v2.2.1
+```
+
+`token.json` при этом ищется в state-каталоге (`%APPDATA%\yandex-mail-mcp\` /
+`~/.config/yandex-mail-mcp/`) — см. Шаг 2.
 
 ## Шаг 4: настройка MCP-клиента
 

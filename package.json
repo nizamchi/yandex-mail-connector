@@ -1,0 +1,36 @@
+{
+  "name": "yandex-mail-mcp",
+  "version": "2.2.1",
+  "description": "MCP server for Yandex Mail (IMAP+SMTP) — secure agentic access, read-only by default, HMAC-confirmed sends, TOFU allowlist, 11 content detectors. Single-file bundle.",
+  "bin": {
+    "yandex-mail-mcp": "yandex-mail-mcp-desktop/dist/yandex-mail-mcp.js",
+    "yandex-mail-mcp-trust": "yandex-mail-mcp-desktop/dist/cli-trust.js"
+  },
+  "files": [
+    "yandex-mail-mcp-desktop/dist/",
+    "README.md",
+    "INSTALL.md",
+    "LICENSE"
+  ],
+  "license": "SEE LICENSE IN LICENSE",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nizamchi/yandex-mail-connector.git"
+  },
+  "homepage": "https://github.com/nizamchi/yandex-mail-connector#readme",
+  "bugs": {
+    "url": "https://github.com/nizamchi/yandex-mail-connector/issues"
+  },
+  "keywords": [
+    "mcp",
+    "yandex",
+    "mail",
+    "imap",
+    "smtp",
+    "claude",
+    "anthropic"
+  ]
+}

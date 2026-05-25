@@ -86,6 +86,8 @@ MCP-сервер для подключения AI-ассистента (Claude D
 
 ### 3. Поставить бандл локально
 
+**Вариант A — git clone (рекомендуется для постоянной установки):**
+
 ```bash
 git clone https://github.com/nizamchi/yandex-mail-connector.git
 cd yandex-mail-connector/yandex-mail-mcp-desktop
@@ -94,6 +96,16 @@ npm install --omit=dev --ignore-scripts
 
 Готовый бандл лежит в `dist/yandex-mail-mcp.js`. Абсолютный путь к нему
 понадобится в шаге 4.
+
+**Вариант B — `npx` без клонирования (с v2.2.1):**
+
+```bash
+npx -y github:nizamchi/yandex-mail-connector#v2.2.1 --check
+```
+
+Бандл закэшируется в `~/.npm/_npx/`. Удобно для быстрого health-check или
+если ты не хочешь держать копию репо. Для постоянного подключения к MCP-клиенту
+всё равно нужен стабильный путь к бандлу — Вариант A надёжнее.
 
 ### 4. Подключить к MCP-клиенту
 
@@ -147,12 +159,6 @@ claude mcp add yandex-mail --scope user \
 
 Пошагово для четырёх клиентов (Claude Desktop, Claude Code, Cursor, Codex) —
 [INSTALL.md](INSTALL.md).
-
-> ⚠️ **`npx -y github:nizamchi/yandex-mail-connector#vX.Y.Z` пока не работает**
-> из-за того что `package.json` лежит в подкаталоге `yandex-mail-mcp-desktop/`,
-> а npm ожидает его в корне репо. Структурный фикс запланирован на v2.2.0.
-> Сейчас используй git-clone путь выше — это рекомендация официальной
-> документации Claude Code для personal MCP-серверов.
 
 ## Уровни доступа
 
@@ -223,13 +229,17 @@ L0 read-only. Возвращает JSON со всеми деталями: вер
 |---|---|---|
 | macOS | `~/.config/yandex-mail-mcp/` | `allowlist.json`, `secret.bin`, `audit.jsonl`, `risk-policy.json`, `recent-sends.jsonl`, `override-tokens.jsonl` |
 | Linux | `~/.config/yandex-mail-mcp/` или `$XDG_CONFIG_HOME` | то же |
-| Windows | `%APPDATA%\yandex-mail-mcp\` | то же |
+| Windows | `%APPDATA%\yandex-mail-mcp\` | то же + `token.json` |
 
-Переопределить — через переменную окружения `YANDEX_STATE_DIR`. На Linux/macOS
-папка автоматически создаётся с правами `0700` (читает только владелец).
+`token.json` живёт в том же каталоге состояния (приоритетное расположение, см.
+Шаг 2 «Быстрой установки»). Для совместимости сервер также ищет его рядом с
+бандлом и в текущей рабочей папке — это legacy-пути из v2.0, новые установки
+лучше класть в state-каталог.
 
-Файл с паролем `token.json` лежит **не там** — рядом с бандлом или в текущей
-рабочей папке. На Linux/macOS должен быть `chmod 600`.
+Переопределить state-каталог — через переменную окружения `YANDEX_STATE_DIR`.
+На Linux/macOS папка и `token.json` автоматически создаются с правами `0700` /
+`0600` (читает только владелец). Произвольный путь к токену — через
+`YANDEX_TOKEN_FILE=/absolute/path/token.json`.
 
 ## Управление из терминала
 
@@ -259,7 +269,7 @@ yandex-mail-mcp-trust --policy set thresholds.augment 25 --yes  # подкрут
 
 ## Статус
 
-Текущая версия — **2.2.0**, май 2026 года. 377 тестов (371 проходят, 6 unix-only пропускаются на Windows), ноль известных уязвимостей в зависимостях. Основной бандл 2,7 МБ, утилита для оператора 90 КБ.
+Текущая версия — **2.2.1**, май 2026 года. 377 тестов (371 проходят, 6 unix-only пропускаются на Windows), ноль известных уязвимостей в зависимостях. Основной бандл 2,7 МБ, утилита для оператора 90 КБ.
 
 Дальнейшие планы — в [ROADMAP.md](ROADMAP.md).
 
