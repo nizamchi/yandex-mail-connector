@@ -158,6 +158,43 @@ export async function folderStatus(folder: string) {
   });
 }
 
+// countEmails -- returns the count of messages matching an IMAP search query.
+// Cheaper than searchEmails: no fetch, just the UID list length.
+export async function countEmails(
+  folder: string,
+  query: Record<string, unknown>,
+): Promise<number> {
+  return getConnectionManager().withClient(async c => {
+    await c.mailboxOpen(folder, { readOnly: true });
+    const uids = await c.search(query, { uid: true });
+    return Array.isArray(uids) ? uids.length : 0;
+  });
+}
+
+export interface FolderPeekResult {
+  folder: string;
+  total?: number;
+  unseen?: number;
+  error?: string;
+}
+
+// folderPeek -- batch c.status() across multiple folders in a single connection.
+// Cheaper than N separate folderStatus() calls (one connect vs N).
+export async function folderPeek(folders: string[]): Promise<FolderPeekResult[]> {
+  return getConnectionManager().withClient(async c => {
+    const results: FolderPeekResult[] = [];
+    for (const folder of folders) {
+      try {
+        const s = await c.status(folder, { messages: true, unseen: true });
+        results.push({ folder, total: s.messages ?? 0, unseen: s.unseen ?? 0 });
+      } catch (e) {
+        results.push({ folder, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return results;
+  });
+}
+
 export async function listEmails(
   folder: string, page: number, pageSize: number
 ) {

@@ -281,6 +281,20 @@ const findSenderSchema = z.object({
   folder:      z.string().default('INBOX').describe('IMAP папка для поиска'),
   max_senders: z.number().int().min(1).max(100).default(20).describe('Максимум кандидатов в ответе'),
 }).strict();
+const countEmailsSchema = z.object({
+  folder:  z.string().default('INBOX'),
+  from:    z.string().optional(),
+  to:      z.string().optional(),
+  subject: z.string().optional(),
+  text:    z.string().optional(),
+  since:   z.string().optional().describe('ISO дата начала, напр. "2025-01-01"'),
+  before:  z.string().optional().describe('ISO дата конца'),
+  seen:    z.boolean().optional().describe('true=только прочитанные, false=только непрочитанные'),
+  flagged: z.boolean().optional().describe('true=только со звёздочкой'),
+}).strict();
+const folderPeekSchema = z.object({
+  folders: z.array(z.string()).optional().describe('Список папок. Если не задан — все папки ящика.'),
+}).strict();
 const statsSchema = z.object({
   folder: z.string().default('INBOX').describe('IMAP папка для сканирования'),
   group_by: z.array(z.enum(GROUP_BY_FIELDS)).min(1).max(3)
@@ -687,7 +701,7 @@ const TOOLS_RAW: ToolDef[] = [
     requires: { authLevel: 0 },
     handler: async (_params, ctx) => {
       const report: Record<string, unknown> = {
-        server_version: '2.3.0',
+        server_version: '2.5.0',
         auth_level: ctx.authLevel,
         capabilities: Array.from(ctx.capabilities),
         platform: process.platform,
@@ -803,8 +817,11 @@ const TOOLS_RAW: ToolDef[] = [
     name: 'yandex_list_emails',
     title: 'Список писем',
     description: `Письма в папке с пагинацией, свежие первые. Возвращает заголовки без тела.
-Args: folder (default "INBOX"), page (default 1), page_size (1-100, default 20).
-Для чтения тела -- yandex_get_email по UID.`,
+Args: folder (default "INBOX"), page (default 1), page_size (1-100, default 20), summary_only (bool, default false).
+Для чтения тела -- yandex_get_email по UID.
+НЕ используй чтобы найти письма по критерию (отправитель/тема/дата) -- используй yandex_search_emails.
+НЕ используй чтобы посчитать письма -- используй yandex_count или yandex_stats.
+НЕ загружай много страниц подряд чтобы проанализировать ящик -- используй yandex_stats.`,
     inputSchema: listEmailsSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     // v2.1.3: raise per-tool output cap. Default Claude Code limit is ~25k tokens
@@ -844,7 +861,9 @@ Args: folder (default "INBOX"), page (default 1), page_size (1-100, default 20).
     title: 'Прочитать письмо',
     description: `Полное содержимое письма по IMAP UID (из yandex_list_emails или yandex_search_emails).
 Args: folder (default "INBOX"), uid (integer UID письма).
-Тело обрезается на 8000 символах; флаг truncated=true если обрезано.`,
+Тело обрезается на 8000 символах; флаг truncated=true если обрезано.
+НЕ вызывай в цикле по многим письмам -- сначала сузь список через yandex_search_emails или yandex_stats.
+НЕ вызывай чтобы узнать тему/отправителя -- эти данные уже есть в yandex_list_emails / yandex_search_emails.`,
     inputSchema: getEmailSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     // v2.1.3: same rationale as list_emails — single full email body + headers
@@ -985,7 +1004,9 @@ Args:
   before (string?) -- ISO дата
   seen   (boolean?) -- true=только прочитанные, false=только непрочитанные
   flagged(boolean?) -- true=со звёздочкой
-  max_results (1-100, default 20)`,
+  max_results (1-100, default 20)
+НЕ передавай имя без @ в поле from -- сначала вызови yandex_find_sender чтобы узнать адрес.
+НЕ используй чтобы только посчитать письма -- используй yandex_count.`,
     inputSchema: searchEmailsSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     // v2.1.3: same rationale as list_emails — search can return up to 100 headers.
@@ -1020,10 +1041,16 @@ Args:
             : '<search-no-message-id-uid-' + (e.uid ?? 'unknown') + '>';
           provenance.recordRead(msgid, { folder, uid: e.uid });
         }
+        // C-alt: if from looks like a name (no @) and search returned nothing,
+        // add a structured hint so the agent knows to try yandex_find_sender.
+        const fromLooksLikeName = typeof rest.from === 'string' && !rest.from.includes('@');
+        const hint = (!emails.length && fromLooksLikeName && !rest.text && !rest.subject)
+          ? 'Подсказка: поле from не содержит @, возможно передано имя вместо адреса. Вызови yandex_find_sender чтобы найти точный адрес.'
+          : undefined;
         const text = emails.length
           ? `Найдено: ${emails.length}\n\n${fmtHeaders(emails)}`
-          : 'Ничего не найдено.';
-        return { content: [{ type: 'text', text }], structuredContent: { count: emails.length, emails } };
+          : hint ?? 'Ничего не найдено.';
+        return { content: [{ type: 'text', text }], structuredContent: { count: emails.length, emails, hint } };
       } catch (e) { return errorResult(e); }
     },
   },
@@ -1093,7 +1120,71 @@ Output: { candidates: [{ email, displayName, count, lastDate }], total_found, fo
     },
   },
 
-  // 6c. Stats (L0) -- server-side aggregation; v2.3.0.
+  // 6c. Count emails (L0) -- v2.5.0. Just a number, no envelopes.
+  {
+    name: 'yandex_count',
+    title: 'Подсчёт писем',
+    description: `Считает письма по критериям без загрузки содержимого. Возвращает одно число.
+ВСЕГДА используй вместо yandex_list_emails / yandex_search_emails когда нужно только количество.
+Args: folder (default "INBOX"), from?, to?, subject?, text?, since?, before?, seen?, flagged?
+Примеры: "сколько непрочитанных?" → seen=false. "сколько писем от boss@co.ru?" → from="boss@co.ru".`,
+    inputSchema: countEmailsSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    meta: { 'anthropic/maxResultSizeChars': 1_000 },
+    requires: { authLevel: 0 },
+    handler: async (params, _ctx) => {
+      try {
+        const { folder, since, before, seen, flagged, ...rest } = countEmailsSchema.parse(params);
+        const query: Record<string, unknown> = {};
+        if (rest.from)    query.from    = rest.from;
+        if (rest.to)      query.to      = rest.to;
+        if (rest.subject) query.subject = rest.subject;
+        if (rest.text)    query.text    = rest.text;
+        if (since)           query['since']     = parseSearchDate(since, 'since');
+        if (before)          query['before']    = parseSearchDate(before, 'before');
+        if (seen === true)   query['seen']      = true;
+        if (seen === false)  query['unseen']    = true;
+        if (flagged === true)  query['flagged']   = true;
+        if (flagged === false) query['unflagged'] = true;
+        const count = await imap.countEmails(folder, query);
+        const out = { folder, count, query_echo: params };
+        return { content: [{ type: 'text', text: `${folder}: ${count} писем по заданным критериям.` }], structuredContent: out };
+      } catch (e) { return errorResult(e); }
+    },
+  },
+
+  // 6d. Folder peek (L0) -- v2.5.0. Batch status, one connection.
+  {
+    name: 'yandex_folder_peek',
+    title: 'Обзор папок',
+    description: `Возвращает total и unseen для нескольких папок за один запрос.
+Используй в начале сессии чтобы понять что есть в ящике, или когда нужен статус нескольких папок сразу.
+НЕ используй для одной папки -- yandex_folder_status дешевле.
+Args: folders (string[]?) -- список папок; если не задан, берёт все папки ящика.
+Папки с ошибкой возвращают {folder, error} вместо счётчиков -- не падает целиком.`,
+    inputSchema: folderPeekSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    meta: { 'anthropic/maxResultSizeChars': 20_000 },
+    requires: { authLevel: 0 },
+    handler: async (params, _ctx) => {
+      try {
+        const { folders: requestedFolders } = folderPeekSchema.parse(params);
+        const targetFolders = requestedFolders && requestedFolders.length > 0
+          ? requestedFolders
+          : (await imap.listFolders()).map(f => f.path);
+        const results = await imap.folderPeek(targetFolders);
+        const lines = results.map(r =>
+          r.error
+            ? `${r.folder}: ошибка (${r.error})`
+            : `${r.folder}: всего ${r.total}, непрочитанных ${r.unseen}`
+        );
+        const out = { folders: results, total_folders: results.length };
+        return { content: [{ type: 'text', text: lines.join('\n') }], structuredContent: out };
+      } catch (e) { return errorResult(e); }
+    },
+  },
+
+  // 6e. Stats (L0) -- server-side aggregation; v2.3.0.
   {
     name: 'yandex_stats',
     title: 'Статистика писем',
