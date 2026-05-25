@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yandex Mail MCP — инструменты v2.5.0</title>
+<style>
+  :root { --bg:#0f172a; --surface:#1e293b; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --green:#22c55e; --amber:#f59e0b; --red:#ef4444; --purple:#8b5cf6; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',system-ui,sans-serif; font-size:14px; padding:32px 24px; }
+  h1 { font-size:1.4rem; font-weight:700; margin-bottom:4px; }
+  .meta { color:var(--muted); font-size:12px; margin-bottom:24px; }
+  .meta b { color:var(--text); }
+  table { width:100%; border-collapse:collapse; background:var(--surface); border-radius:10px; overflow:hidden; }
+  thead { background:#0f172a; }
+  th { padding:10px 14px; text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); font-weight:600; }
+  td { padding:10px 14px; border-top:1px solid var(--border); vertical-align:top; }
+  tr:hover td { background:rgba(255,255,255,.03); }
+  code { font-family:'JetBrains Mono','Fira Mono',monospace; font-size:12px; color:#7dd3fc; }
+  .badge { display:inline-block; padding:2px 7px; border-radius:4px; font-size:11px; font-weight:700; color:#fff; cursor:default; }
+  .l0 { background:var(--green); }
+  .l1 { background:var(--amber); color:#000; }
+  .l2 { background:var(--red); }
+  .l3 { background:var(--purple); }
+  .rw { text-align:center; color:var(--muted); }
+  .desc { color:var(--muted); font-size:13px; max-width:420px; }
+  .legend { margin-top:20px; font-size:12px; color:var(--muted); display:flex; gap:16px; flex-wrap:wrap; }
+  .legend span { display:flex; align-items:center; gap:6px; }
+  footer { margin-top:16px; font-size:11px; color:var(--muted); }
+</style>
+</head>
+<body>
+<h1>Yandex Mail MCP — инструменты</h1>
+<div class="meta">Версия <b>v2.5.0</b> &nbsp;·&nbsp; 16 инструментов &nbsp;·&nbsp; <b>L0</b> 11 &nbsp;·&nbsp; <b>L1</b> 4 &nbsp;·&nbsp; <b>L2</b> 1 &nbsp;·&nbsp; <span title="Сгенерировано из src/tools.ts">авто-генерация</span></div>
+<table>
+  <thead>
+    <tr>
+      <th>Инструмент</th>
+      <th>Название</th>
+      <th>Auth</th>
+      <th title="Только чтение (readOnlyHint)">RO</th>
+      <th>Описание</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>yandex_health_check</code></td>
+      <td>Состояние коннектора</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc"></td>
+    </tr>
+    <tr>
+      <td><code>yandex_list_folders</code></td>
+      <td>Список папок</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc"></td>
+    </tr>
+    <tr>
+      <td><code>yandex_folder_status</code></td>
+      <td>Статус папки</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc"></td>
+    </tr>
+    <tr>
+      <td><code>yandex_list_emails</code></td>
+      <td>Список писем</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc">Письма в папке с пагинацией, свежие первые. Возвращает заголовки без тела.</td>
+    </tr>
+    <tr>
+      <td><code>yandex_get_email</code></td>
+      <td>Прочитать письмо</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc">Полное содержимое письма по IMAP UID (из yandex_list_emails или yandex_search_emails).</td>
+    </tr>
+    <tr>
+      <td><code>yandex_search_emails</code></td>
+      <td>Поиск писем</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc">Серверный поиск писем по критериям IMAP.</td>
+    </tr>
+    <tr>
+      <td><code>yandex_get_special_folders</code></td>
+      <td>Специальные папки</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc"></td>
+    </tr>
+    <tr>
+      <td><code>yandex_find_sender</code></td>
+      <td>Найти отправителя</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc">Используй ПЕРЕД поиском писем, если пользователь назвал человека по имени без email-адр…</td>
+    </tr>
+    <tr>
+      <td><code>yandex_count</code></td>
+      <td>Подсчёт писем</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc">Считает письма по критериям без загрузки содержимого. Возвращает одно число.</td>
+    </tr>
+    <tr>
+      <td><code>yandex_folder_peek</code></td>
+      <td>Обзор папок</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc">Возвращает total и unseen для нескольких папок за один запрос.</td>
+    </tr>
+    <tr>
+      <td><code>yandex_stats</code></td>
+      <td>Статистика писем</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc">Серверная агрегация: возвращает счётчики (~КБ) вместо envelopes (~сотни КБ).</td>
+    </tr>
+    <tr>
+      <td><code>yandex_mark_email</code></td>
+      <td>Пометить письмо</td>
+      <td><span class="badge l1" title="Требует YANDEX_AUTH_LEVEL=safe">L1</span></td>
+      <td class="rw">✗</td>
+      <td class="desc">Изменить статус прочитанности или звёздочки.</td>
+    </tr>
+    <tr>
+      <td><code>yandex_move_email</code></td>
+      <td>Переместить письмо</td>
+      <td><span class="badge l1" title="Требует YANDEX_AUTH_LEVEL=safe">L1</span></td>
+      <td class="rw">✗</td>
+      <td class="desc">Переместить письмо в другую папку.</td>
+    </tr>
+    <tr>
+      <td><code>yandex_delete_email</code></td>
+      <td>Удалить письмо</td>
+      <td><span class="badge l1" title="Требует YANDEX_AUTH_LEVEL=safe">L1</span></td>
+      <td class="rw">✗</td>
+      <td class="desc">Удалить письмо. По умолчанию -- в корзину (восстановимо).</td>
+    </tr>
+    <tr>
+      <td><code>yandex_send_email</code></td>
+      <td>Отправить письмо</td>
+      <td><span class="badge l2" title="Требует YANDEX_AUTH_LEVEL=full">L2</span></td>
+      <td class="rw">✗</td>
+      <td class="desc">Отправить письмо через SMTP Яндекса (OAuth2).</td>
+    </tr>
+    <tr>
+      <td><code>yandex_trust_address</code></td>
+      <td>Доверять адресу для отправки</td>
+      <td><span class="badge l1" title="Требует YANDEX_AUTH_LEVEL=safe">L1</span></td>
+      <td class="rw">✗</td>
+      <td class="desc">Добавить адрес в allowlist для отправки писем. Требует trust_token,</td>
+    </tr>
+  </tbody>
+</table>
+<div class="legend">
+  <span><span class="badge l0">L0</span> По умолчанию (только чтение)</span>
+  <span><span class="badge l1">L1</span> YANDEX_AUTH_LEVEL=safe</span>
+  <span><span class="badge l2">L2</span> YANDEX_AUTH_LEVEL=full</span>
+</div>
+<footer>Сгенерировано из <code>src/tools.ts</code> · <code>npm run docs</code></footer>
+</body>
+</html>

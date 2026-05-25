@@ -24,6 +24,10 @@
   "bugs": {
     "url": "https://github.com/nizamchi/yandex-mail-connector/issues"
   },
+  "type": "module",
+  "scripts": {
+    "docs": "node scripts/gen-tools-docs.js"
+  },
   "keywords": [
     "mcp",
     "yandex",
