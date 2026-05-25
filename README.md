@@ -2,8 +2,8 @@
 
 MCP-сервер для Яндекс.Почты с защитой опасных операций на стороне сервера.
 
-[![Версия](https://img.shields.io/badge/версия-2.2.0-blue)](CHANGELOG.md)
-[![Тесты](https://img.shields.io/badge/тесты-371_/_0_упавших-success)](#)
+[![Версия](https://img.shields.io/badge/версия-2.3.0-blue)](CHANGELOG.md)
+[![Тесты](https://img.shields.io/badge/тесты-384_/_0_упавших-success)](#)
 [![Уязвимости](https://img.shields.io/badge/npm_audit-0-success)](#)
 [![Лицензия](https://img.shields.io/badge/лицензия-PolyForm_NC_1.0.0-orange)](LICENSE)
 
