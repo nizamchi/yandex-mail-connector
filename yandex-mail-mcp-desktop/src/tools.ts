@@ -276,6 +276,11 @@ const GROUP_BY_FIELDS = [
   'size_bucket', 'has_attachments',
   'flag_seen', 'flag_flagged',
 ] as const;
+const findSenderSchema = z.object({
+  query:       z.string().min(1).describe('Имя, часть имени или часть адреса (подстрока). Пример: "Катя", "ivan", "@company.ru"'),
+  folder:      z.string().default('INBOX').describe('IMAP папка для поиска'),
+  max_senders: z.number().int().min(1).max(100).default(20).describe('Максимум кандидатов в ответе'),
+}).strict();
 const statsSchema = z.object({
   folder: z.string().default('INBOX').describe('IMAP папка для сканирования'),
   group_by: z.array(z.enum(GROUP_BY_FIELDS)).min(1).max(3)
@@ -1046,12 +1051,49 @@ Args:
     },
   },
 
-  // 6b. Stats (L0) -- server-side aggregation; v2.3.0.
-  // Closes the gap revealed when an agent burned its full context budget
-  // downloading 3765 envelopes through yandex_list_emails just to count them
-  // by year. Streams envelopes from IMAP in 1000-UID chunks, aggregates in
-  // pure code (src/stats.ts), returns counts only. Bridge until Layer 2
-  // ships a persistent SQLite index.
+  // 6b. Find sender (L0) -- disambiguates a name before a deep search; v2.4.0.
+  //
+  // When the user says "find emails from Катя" without specifying an address,
+  // use this tool first to resolve which Катя they mean. IMAP SEARCH FROM
+  // matches against the full FROM header (display name + address), so "Катя"
+  // hits "Катя Иванова" <k.ivanova@co.ru> even though "katya" isn't in the
+  // address. Returns deduped candidates sorted by message count; the agent
+  // can ask the user to pick one and then pass the exact email to
+  // yandex_search_emails or yandex_stats.
+  {
+    name: 'yandex_find_sender',
+    title: 'Найти отправителя',
+    description: `Используй ПЕРЕД поиском писем, если пользователь назвал человека по имени без email-адреса.
+Принимает часть имени или адреса, возвращает список уникальных отправителей с числом писем.
+Агент должен показать список пользователю и спросить кого именно искать, затем передать точный email в yandex_search_emails.
+Поиск нечёткий: "Катя" найдёт "Катя Иванова <k.ivanova@co.ru>" и "katya@mail.ru".
+Args:
+  query        -- часть имени или адреса (обязательно)
+  folder       -- папка (default "INBOX")
+  max_senders  -- максимум кандидатов (default 20)
+Output: { candidates: [{ email, displayName, count, lastDate }], total_found, folder }`,
+    inputSchema: findSenderSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    meta: { 'anthropic/maxResultSizeChars': 20_000 },
+    requires: { authLevel: 0 },
+    handler: async (params, _ctx) => {
+      try {
+        const { query, folder, max_senders } = findSenderSchema.parse(params);
+        const candidates = await imap.findSenders(folder, query, max_senders);
+        const out = { folder, query, candidates, total_found: candidates.length };
+        if (!candidates.length) {
+          return { content: [{ type: 'text', text: `Отправители по запросу "${query}" не найдены в папке ${folder}.` }], structuredContent: out };
+        }
+        const lines = candidates.map((c, i) =>
+          `${i + 1}. ${c.displayName ? c.displayName + ' ' : ''}<${c.email}> — ${c.count} писем, последнее ${c.lastDate.slice(0, 10)}`
+        );
+        const text = `Найдено ${candidates.length} отправителей по "${query}":\n\n${lines.join('\n')}`;
+        return { content: [{ type: 'text', text }], structuredContent: out };
+      } catch (e) { return errorResult(e); }
+    },
+  },
+
+  // 6c. Stats (L0) -- server-side aggregation; v2.3.0.
   {
     name: 'yandex_stats',
     title: 'Статистика писем',

@@ -299,6 +299,59 @@ export async function* streamEnvelopes(
   }
 }
 
+export interface SenderCandidate {
+  email: string;
+  displayName: string;   // last seen display name for this address
+  count: number;
+  lastDate: string;      // ISO date of the most recent matching message
+}
+
+// findSenders -- disambiguates a name/partial address before a deep search.
+//
+// Uses IMAP SEARCH FROM to pre-filter at the server (substring match across
+// both display name and address parts, e.g. "Катя" hits "Катя Иванова"
+// <k.ivanova@co.ru> without knowing the address). Returns unique senders
+// sorted by message count desc, capped at maxSenders. Typical result is a
+// handful of rows (~100 bytes) -- never floods the agent context.
+export async function findSenders(
+  folder: string,
+  query: string,
+  maxSenders: number,
+): Promise<SenderCandidate[]> {
+  return getConnectionManager().withClient(async c => {
+    await c.mailboxOpen(folder, { readOnly: true });
+    const uids = await c.search({ from: query }, { uid: true });
+    if (!uids.length) return [];
+
+    const map = new Map<string, SenderCandidate>();
+    for await (const msg of c.fetch(uids, { uid: true, envelope: true }, { uid: true })) {
+      const hdr = parseHeader(msg);
+      const addr = hdr.from[0];
+      if (!addr) continue;
+      const key = addr.address.toLowerCase();
+      const existing = map.get(key);
+      if (existing) {
+        existing.count++;
+        if (hdr.date && hdr.date > existing.lastDate) {
+          existing.lastDate = hdr.date;
+          if (addr.name) existing.displayName = addr.name;
+        }
+      } else {
+        map.set(key, {
+          email: addr.address,
+          displayName: addr.name ?? '',
+          count: 1,
+          lastDate: hdr.date ?? '',
+        });
+      }
+    }
+
+    return [...map.values()]
+      .sort((a, b) => b.count - a.count || a.email.localeCompare(b.email))
+      .slice(0, maxSenders);
+  });
+}
+
 export async function searchEmails(
   folder: string,
   query: Record<string, unknown>,
