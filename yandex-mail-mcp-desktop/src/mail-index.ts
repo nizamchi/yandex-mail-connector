@@ -666,16 +666,18 @@ export function getThread(query: string, opts?: { folder?: string; limit?: numbe
 
   members.sort((a, b) => -dateCompareDesc(a.date, b.date)); // ascending by date.
 
+  // When a thread is longer than the limit, keep the NEWEST messages (the tail
+  // of the ascending list) rather than the oldest -- a thread view wants the
+  // most recent replies. Order stays chronological (ascending).
+  const kept = members.length > limit ? members.slice(members.length - limit) : members;
+
   // Score by recency rank: newest message gets the highest score so a caller
   // sorting by score still lands on the latest reply.
-  const n = members.length;
-  const hits: SearchHit[] = members.map((r, i) => ({
+  return kept.map((r, i) => ({
     record: r,
     score: i + 1, // chronological position; later = newer = higher.
     matchReasons: ['thread'],
   }));
-  void n;
-  return hits.slice(0, limit);
 }
 
 // ── Test-only ─────────────────────────────────────────────────────────
