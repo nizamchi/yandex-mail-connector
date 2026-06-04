@@ -117,6 +117,20 @@ const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 const HEX_RE = /[0-9a-fA-F]{32,}/g;
 const BASE64_RE = /[A-Za-z0-9+/_\-]{32,}/g;
 
+// R1 (v2.6.0): bare Yandex app password. A Yandex application password is
+// EXACTLY 16 lowercase Latin letters with no separators (e.g. issued at
+// id.yandex.ru/security/app-passwords). It sits BELOW the 32-char token
+// threshold above and is not wrapped in JSON, so neither HEX_RE/BASE64_RE nor
+// PASSWORD_JSON_RE catch it — a credential echoed bare into an IMAP/SMTP auth
+// error string (or pasted into a body) would otherwise survive into logs. This
+// is exactly the leak class from the 2026-05-22 incident.
+//
+// Matched as a whole word (\b on both sides) so longer identifiers are left
+// intact. A standalone 16-letter all-lowercase English word is rare in error
+// text; redacting that false positive is an acceptable trade for closing the
+// credential leak.
+const APP_PASSWORD_RE = /\b[a-z]{16}\b/g;
+
 export function sanitizeError(e: unknown): string {
   let raw: string;
   if (e instanceof Error) {
@@ -156,6 +170,12 @@ export function sanitizeError(e: unknown): string {
   // 4. Long hex / base64 tokens.
   out = out.replace(HEX_RE, '[REDACTED-TOKEN]');
   out = out.replace(BASE64_RE, '[REDACTED-TOKEN]');
+
+  // 5. Bare 16-lowercase-letter Yandex app password (R1). Runs LAST so the
+  //    longer-token and email passes above have already consumed anything they
+  //    own; what remains and is exactly 16 lowercase letters is treated as a
+  //    credential.
+  out = out.replace(APP_PASSWORD_RE, '[REDACTED-PW]');
 
   // Idempotency: if the message already begins with "[<Category>]" we keep
   // it as-is (no double bracketing).

@@ -88,6 +88,24 @@ test('yandex_send_email schema accepts confirmation_token and dry_run as optiona
   assert.throws(() => schema.parse({ to: ['a@x'], subject: 's', text: 't', dry_run: 'yes' }));
 });
 
+// R7 (v2.6.0): permanent delete is gated by a server-issued confirmation code,
+// carried back via the same 6-digit confirmation_token field as send.
+test('yandex_delete_email schema accepts 6-digit confirmation_token (R7)', () => {
+  const byName = new Map(TOOLS.map(t => [t.name, t]));
+  const def = byName.get('yandex_delete_email');
+  assert.ok(def, 'delete_email must exist');
+  const schema = def.inputSchema;
+
+  // Recoverable delete, no token — must parse.
+  assert.doesNotThrow(() => schema.parse({ uid: 1 }));
+  // Permanent delete with a 6-digit token — must parse.
+  assert.doesNotThrow(() => schema.parse({ uid: 1, permanent: true, confirmation_token: '123456' }));
+  // Non-numeric token — must reject.
+  assert.throws(() => schema.parse({ uid: 1, permanent: true, confirmation_token: 'abcdef' }));
+  // Wrong digit count — must reject.
+  assert.throws(() => schema.parse({ uid: 1, permanent: true, confirmation_token: '12345' }));
+});
+
 test('authLevel matrix: send_email=2; mark/move/delete=1; rest=0', () => {
   const byName = new Map(TOOLS.map(t => [t.name, t]));
   assert.equal(byName.get('yandex_send_email')?.requires.authLevel, 2);

@@ -419,7 +419,16 @@ export function getPolicy(): RiskPolicy {
   return cachedPolicy ?? DEFAULT_POLICY;
 }
 
+// R3 (v2.6.0): defense-in-depth — these test seams replace the cached policy
+// and reset load state; refuse to run them in a production process.
+function assertTestSeam(name: string): void {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(name + ': test seam unavailable in production');
+  }
+}
+
 export function _resetForTests(): void {
+  assertTestSeam('_resetForTests');
   cachedPolicy = null;
   loaded = false;
   secretCache = null;
@@ -433,6 +442,7 @@ export function _resetForTests(): void {
 // The supplied policy is deep-frozen before caching to preserve the
 // downstream immutability contract.
 export function _setPolicyForTests(policy: RiskPolicy): void {
+  assertTestSeam('_setPolicyForTests');
   cachedPolicy = freezePolicy(policy);
   loaded = true;
 }

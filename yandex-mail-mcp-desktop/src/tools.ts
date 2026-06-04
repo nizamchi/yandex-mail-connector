@@ -341,6 +341,10 @@ const deleteEmailSchema = z.object({
   folder:    z.string().default('INBOX'),
   uid:       z.number().int().positive(),
   permanent: z.boolean().default(false),
+  // R7 (v2.6.0): permanent (irreversible) delete requires a server-issued
+  // one-time code. Recoverable trash-delete (permanent=false) ignores this.
+  // Same 6-digit shape as yandex_send_email's confirmation_token.
+  confirmation_token: z.string().regex(/^\d{6}$/).optional(),
 }).strict();
 const markEmailSchema = z.object({
   folder:  z.string().default('INBOX'),
@@ -1343,21 +1347,22 @@ Args: folder (откуда), uid (UID письма), target_folder (куда, н
     },
   },
 
-  // 9. Delete email (L1; permanent=true is gated by Phase 4 confirmation flow)
+  // 9. Delete email (L1). permanent=true is gated by a server-issued
+  // confirmation code (R7, v2.6.0) — see the handler's confirmation block.
   {
     name: 'yandex_delete_email',
     title: 'Удалить письмо',
     description: `Удалить письмо. По умолчанию -- в корзину (восстановимо).
-Args: folder, uid, permanent (bool, default false). permanent=true -- безвозвратно.`,
+Args: folder, uid, permanent (bool, default false), confirmation_token (string?).
+permanent=true -- безвозвратно; требует двух шагов: первый вызов без
+confirmation_token возвращает 6-значный код, второй вызов с тем же folder/uid и
+confirmation_token=<код> выполняет удаление. Код истекает через 300с.`,
     inputSchema: deleteEmailSchema,
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
-    // TODO(phase-4): permanent=true must require a confirmation_token. In Phase 3
-    // the entire delete tool is gated at L1; Phase 4 will split the permanent flag
-    // into an explicit confirmation-required pathway.
     requires: { authLevel: 1 },
     handler: async (params, ctx) => {
       try {
-        const { folder, uid, permanent } = deleteEmailSchema.parse(params);
+        const { folder, uid, permanent, confirmation_token } = deleteEmailSchema.parse(params);
         // Phase 7: protected-folder gate -- fail-fast BEFORE any IMAP call.
         // delete has no destination; gate only the source folder.
         {
@@ -1394,6 +1399,54 @@ Args: folder, uid, permanent (bool, default false). permanent=true -- безво
                 _audit: { folder: gate.matched ?? folder, uid, message_id: '<blocked-no-message-id>' },
               };
             }
+          }
+        }
+        // R7 (v2.6.0): permanent delete is irreversible — gate it behind a
+        // server-issued confirmation code, mirroring the send flow. The
+        // destructiveHint annotation is only a client-side hint; enforcement
+        // must live server-side (project security rule). Trash-delete
+        // (permanent=false) stays a single L1 call.
+        if (permanent) {
+          const fp = actionFingerprint('yandex_delete_email_permanent', { folder, uid });
+          if (confirmation_token === undefined) {
+            const gen = generateCode(fp);
+            auditLog({
+              action: 'yandex_delete_email',
+              status: 'pending',
+              level: 'info',
+              ts: new Date().toISOString(),
+              reason: 'permanent_confirmation_required',
+              folder, uid,
+            });
+            return {
+              content: [{
+                type: 'text',
+                text: `Безвозвратное удаление UID ${uid} из «${folder}» требует подтверждения. ` +
+                  `Код подтверждения: ${gen.code}. Повторите вызов yandex_delete_email с теми же ` +
+                  `folder и uid, permanent=true и confirmation_token=${gen.code}. Код истекает через 300 секунд.`,
+              }],
+              structuredContent: { requires_confirmation: true, action_fingerprint: fp },
+              _audit: { folder, uid, message_id: '<pending-confirmation>' },
+            };
+          }
+          const verdict = verifyCode(fp, confirmation_token);
+          if (verdict !== true) {
+            const why = verdict === 'expired'
+              ? 'код истёк — повторите вызов без confirmation_token, чтобы получить новый'
+              : verifyResultToError(verdict);
+            auditLog({
+              action: 'yandex_delete_email',
+              status: 'denied',
+              level: 'warn',
+              ts: new Date().toISOString(),
+              reason: 'permanent_confirmation_' + verdict,
+              folder, uid,
+            });
+            return {
+              content: [{ type: 'text', text: 'Безвозвратное удаление отклонено: ' + why + '.' }],
+              isError: true,
+              _audit: { folder, uid, message_id: '<denied-confirmation>' },
+            };
           }
         }
         // Hook-2: fetch message_id BEFORE the (potentially permanent) mutation.

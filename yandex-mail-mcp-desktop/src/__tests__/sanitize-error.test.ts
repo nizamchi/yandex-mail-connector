@@ -125,3 +125,37 @@ test('sanitizeError: collapses multiline messages to single line', () => {
   const out = sanitizeError(new Error('line1\nline2\nline3'));
   assert.ok(!out.includes('\n'));
 });
+
+// R1 (v2.6.0): bare 16-lowercase Yandex app password must be redacted even
+// when it appears outside JSON and below the 32-char token threshold.
+// Placeholder is the obviously-synthetic sequential string, never a real value.
+test('sanitizeError: bare 16-letter app password redacted (R1)', () => {
+  const pw = 'abcdefghijklmnop'; // synthetic, exactly 16 lowercase letters
+  const out = sanitizeError(new Error('Invalid login or password ' + pw));
+  assert.match(out, /\[REDACTED-PW\]/);
+  assert.ok(!out.includes(pw));
+});
+
+test('sanitizeError: app password in auth-context redacted (R1)', () => {
+  const pw = 'abcdefghijklmnop';
+  const out = sanitizeError(new Error('SMTP AUTH failed: user=x password=' + pw));
+  assert.match(out, /^\[AuthError\]/);
+  assert.match(out, /\[REDACTED-PW\]/);
+  assert.ok(!out.includes(pw));
+});
+
+test('sanitizeError: 15- and 17-letter words are NOT redacted (R1 boundary)', () => {
+  // Only exactly-16-letter all-lowercase runs are credential-shaped.
+  const out = sanitizeError(new Error('characteristic abcdefghijklmnopq'));
+  assert.ok(!out.includes('[REDACTED-PW]'));
+  assert.ok(out.includes('characteristic'));        // 14 letters
+  assert.ok(out.includes('abcdefghijklmnopq'));     // 17 letters — left intact
+});
+
+test('sanitizeError: 16-letter substring inside a longer word left intact (R1)', () => {
+  // A 20-letter lowercase run must not be partially eaten.
+  const word = 'abcdefghijklmnopqrst'; // 20 letters
+  const out = sanitizeError(new Error('folder ' + word + ' missing'));
+  assert.ok(out.includes(word));
+  assert.ok(!out.includes('[REDACTED-PW]'));
+});

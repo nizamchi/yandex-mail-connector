@@ -323,12 +323,24 @@ export function verifyCode(fingerprint: string, code: string): VerifyResult {
   return true;
 }
 
+// R3 (v2.6.0): test seams that mutate confirmation state (clearing codes,
+// expiring brute-force lockouts) must never run in a production process.
+// They are not reachable through the MCP tool surface, but this is cheap
+// defense-in-depth against a host that loads the bundle and calls exports.
+function assertTestSeam(name: string): void {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(name + ': test seam unavailable in production');
+  }
+}
+
 export function _resetForTests(): void {
+  assertTestSeam('_resetForTests');
   codes.clear();
   failures.clear();
 }
 
 export function _expireForTests(fingerprint: string): void {
+  assertTestSeam('_expireForTests');
   const e = codes.get(fingerprint);
   // Use Date.now() - 1 so the entry is past expiry but still within the reap
   // grace window — reap() only purges entries older than expiresAt + 60s.
@@ -336,6 +348,7 @@ export function _expireForTests(fingerprint: string): void {
 }
 
 export function _expireLockoutForTests(fingerprint: string): void {
+  assertTestSeam('_expireLockoutForTests');
   const e = failures.get(fingerprint);
   if (e) {
     e.lockoutUntil = 0;
