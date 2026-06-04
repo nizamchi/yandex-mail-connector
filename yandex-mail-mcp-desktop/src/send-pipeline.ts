@@ -349,10 +349,13 @@ export const normalizeRecipients: Stage = async (ctx) => {
   const all = Array.from(
     new Set<string>([...toN.normalized, ...ccN.normalized, ...bccN.normalized]),
   );
+  // normRcpt returns readonly arrays; SendContext.recipients holds mutable
+  // string[]. Copy into mutable arrays so the types match honestly (the old
+  // code relied on the type being unchecked).
   const recipients = {
-    to:  toN.normalized,
-    cc:  ccN.normalized,
-    bcc: bccN.normalized,
+    to:  [...toN.normalized],
+    cc:  [...ccN.normalized],
+    bcc: [...bccN.normalized],
     all,
   };
   // Fingerprint shape mirrors tools.ts v2.0.0:

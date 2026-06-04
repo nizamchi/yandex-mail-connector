@@ -84,7 +84,10 @@ function detectCategory(e: unknown, rawMsg: string): ErrorCategory {
   }
   if (/AUTH|Invalid login|authentication failed|535/i.test(rawMsg)) return 'AuthError';
   if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNRESET/.test(rawMsg)) return 'NetworkError';
-  const ctorName = (e && typeof e === 'object' && (e as { constructor?: { name?: string } }).constructor?.name) || '';
+  const ctorName: string =
+    typeof e === 'object' && e !== null
+      ? ((e as { constructor?: { name?: string } }).constructor?.name ?? '')
+      : '';
   if (ctorName.indexOf('IMAP') >= 0 || /^IMAP|imapflow/i.test(rawMsg)) return 'ImapError';
   if (
     ctorName.indexOf('SMTP') >= 0 ||

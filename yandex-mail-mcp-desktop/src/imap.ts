@@ -241,11 +241,13 @@ export async function getEmail(folder: string, uid: number): Promise<EmailMessag
     if (!raw || !hdr) return null;
 
     const parsed = await simpleParser(raw);
-    const attachments = (parsed.attachments ?? []).map(a => ({
-      filename: a.filename ?? 'attachment',
-      contentType: a.contentType,
-      size: a.size,
-    }));
+    const attachments = (parsed.attachments ?? []).map(
+      (a: { filename?: string; contentType?: string; size?: number }) => ({
+        filename: a.filename ?? 'attachment',
+        contentType: a.contentType ?? 'application/octet-stream',
+        size: a.size ?? 0,
+      }),
+    );
 
     // SEC-04 (T-02-02): text-first body extraction. mailparser автоматически
     // конвертирует HTML→text (strip tags, drop scripts, collapse hidden CSS).
@@ -265,7 +267,7 @@ export async function getEmail(folder: string, uid: number): Promise<EmailMessag
 
     // HTML-only письмо без текстовой части и при включённом strip:
     // показать explicit placeholder вместо пустого body (UX guard).
-    if (!textBody && stripHtml && parsed.html && parsed.html !== false) {
+    if (!textBody && stripHtml && parsed.html) {
       textBody = '(HTML-only message; HTML body stripped — set YANDEX_STRIP_HTML=false to opt in)';
     }
 
@@ -357,8 +359,12 @@ export async function findSenders(
 ): Promise<SenderCandidate[]> {
   return getConnectionManager().withClient(async c => {
     await c.mailboxOpen(folder, { readOnly: true });
-    const uids = await c.search({ from: query }, { uid: true });
-    if (!uids.length) return [];
+    // imapflow's search() returns `false` (not []) on no-match or a transient
+    // condition. The old `!uids.length` "worked" only by JS coercion luck
+    // (false.length === undefined); normalize to an array so the type is honest
+    // and the fetch below can never receive `false`.
+    const uids = (await c.search({ from: query }, { uid: true })) || [];
+    if (uids.length === 0) return [];
 
     const map = new Map<string, SenderCandidate>();
     for await (const msg of c.fetch(uids, { uid: true, envelope: true }, { uid: true })) {
@@ -396,8 +402,9 @@ export async function searchEmails(
 ): Promise<EmailHeader[]> {
   return getConnectionManager().withClient(async c => {
     await c.mailboxOpen(folder, { readOnly: true });
-    const uids = await c.search(query, { uid: true });
-    if (!uids.length) return [];
+    // See findSenders: search() may return `false`; normalize to an array.
+    const uids = (await c.search(query, { uid: true })) || [];
+    if (uids.length === 0) return [];
     const slice = uids.slice(-maxResults).reverse();
     const emails: EmailHeader[] = [];
     for await (const msg of c.fetch(slice.join(','), { uid: true, flags: true, envelope: true, size: true }, { uid: true })) {

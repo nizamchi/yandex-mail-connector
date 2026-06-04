@@ -140,7 +140,12 @@ server.server.oninitialized = (): void => {
   process.stderr.write(`[yandex-mail] client capabilities: elicitation=${serverContext.canElicit}\n`);
 };
 
-serverContext.elicit = (params) => server.server.elicitInput(params) as Promise<{ action: 'accept' | 'cancel' | 'decline'; content?: Record<string, unknown> }>;
+// The SDK's elicitInput requires a very narrow requestedSchema generic; our
+// ElicitParams is structurally compatible at runtime but wider statically.
+// Cast the argument to the SDK's own parameter type (consistent with the
+// existing result cast) rather than weakening our ServerContext.elicit type.
+serverContext.elicit = (params) =>
+  server.server.elicitInput(params as Parameters<typeof server.server.elicitInput>[0]) as Promise<{ action: 'accept' | 'cancel' | 'decline'; content?: Record<string, unknown> }>;
 
 async function main(): Promise<void> {
   // ── Phase 5: first-L1+-start bootstrap ───────────────────────────────

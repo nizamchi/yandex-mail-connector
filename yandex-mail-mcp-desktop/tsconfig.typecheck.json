@@ -1,0 +1,8 @@
+{
+  "//": "v2.6.0 P-2: thin typecheck gate over PRODUCTION source only. The full",
+  "//2": "tsc OOMs on the MCP SDK type graph at default heap; `npm run typecheck`",
+  "//3": "bumps the heap. Test files are excluded (validated by running them);",
+  "//4": "their type looseness is intentional and out of this gate's scope.",
+  "extends": "./tsconfig.json",
+  "exclude": ["node_modules", "dist", "src/__tests__"]
+}

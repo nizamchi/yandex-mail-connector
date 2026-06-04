@@ -1613,7 +1613,11 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
         annotations: def.annotations,
         ...(def.meta ? { _meta: def.meta } : {}),
       },
-      (input: unknown) => def.handler(input, ctx),
+      // Our handlers validate input via zod and return a CallToolResult-shaped
+      // value; the SDK's registerTool callback generic is narrower than our
+      // runtime contract. Cast to the SDK's own callback type rather than
+      // loosening every handler signature.
+      ((input: unknown) => def.handler(input, ctx)) as Parameters<typeof server.registerTool>[2],
     );
   }
 }
