@@ -8,6 +8,7 @@ import * as imap from './imap.js';
 import { auditLog } from './audit.js';
 import { resolveProtectedFolders } from './guards.js';
 import { runHealthCheck } from './check-config.js';
+import { runIndexCli } from './cli-index.js';
 
 // `--check` mode (v2.1.4): run a non-authenticating health check (token shape,
 // state dir, allowlist signature, policy JSON, IMAP/SMTP TLS reachability) and
@@ -20,6 +21,15 @@ if (process.argv.includes('--check') || process.argv.includes('--check-config'))
     .then(code => process.exit(code))
     .catch(err => {
       process.stderr.write(`[yandex-mail] health check fatal: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(2);
+    });
+} else if (process.argv[2] === 'index') {
+  // `yandex-mail-mcp index <build|update|status|drop>` (Layer 2). Runs the
+  // index CLI and exits WITHOUT booting the server or its startup gates.
+  runIndexCli(process.argv.slice(3))
+    .then(code => process.exit(code))
+    .catch(err => {
+      process.stderr.write(`[yandex-mail] index command failed: ${err instanceof Error ? err.message : String(err)}\n`);
       process.exit(2);
     });
 } else {

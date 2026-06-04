@@ -299,12 +299,16 @@ export async function* streamEnvelopes(
   folder: string,
   since?: string,
   until?: string,
+  opts?: { minUid?: number },
 ): AsyncGenerator<EmailHeader, void, void> {
   const CHUNK_SIZE = 1000;
   const sinceMs = since ? new Date(since).getTime() : null;
   const untilMs = until ? new Date(until).getTime() : null;
   if (sinceMs !== null && isNaN(sinceMs)) throw new Error('invalid since date: ' + since);
   if (untilMs !== null && isNaN(untilMs)) throw new Error('invalid until date: ' + until);
+  // Layer 2 index incremental sync: when minUid is given, fetch only UIDs >=
+  // minUid via an IMAP UID-range search instead of scanning the whole folder.
+  const minUid = opts?.minUid;
 
   // We need the connection open for the lifetime of the iteration, so we
   // can't use ConnectionManager.withClient (which logs out on Promise
@@ -316,7 +320,8 @@ export async function* streamEnvelopes(
   await c.connect();
   try {
     await c.mailboxOpen(folder, { readOnly: true });
-    const searchResult = await c.search({}, { uid: true });
+    const searchQuery = minUid && minUid > 1 ? { uid: `${minUid}:*` } : {};
+    const searchResult = await c.search(searchQuery, { uid: true });
     const uids: number[] = Array.isArray(searchResult) ? searchResult : [];
     for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
       const chunk = uids.slice(i, i + CHUNK_SIZE);
@@ -336,6 +341,24 @@ export async function* streamEnvelopes(
   } finally {
     await c.logout().catch(() => {});
   }
+}
+
+// getMailboxCursor -- cheap read of a folder's sync cursor for the Layer 2
+// index. uidValidity changes when the server renumbers UIDs (rare); when it
+// changes the index for this folder must be rebuilt from scratch. uidNext is
+// the UID the next delivered message will get, so it is the high-water mark:
+// the next incremental sync fetches `${storedUidNext}:*`.
+export async function getMailboxCursor(
+  folder: string,
+): Promise<{ uidValidity: number; uidNext: number; exists: number }> {
+  return getConnectionManager().withClient(async c => {
+    const mbox = await c.mailboxOpen(folder, { readOnly: true });
+    return {
+      uidValidity: Number(mbox.uidValidity),
+      uidNext: Number(mbox.uidNext),
+      exists: Number(mbox.exists),
+    };
+  });
 }
 
 export interface SenderCandidate {
