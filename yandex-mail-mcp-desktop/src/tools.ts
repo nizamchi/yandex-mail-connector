@@ -21,6 +21,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { loadCredentials } from './token.js';
 import * as imap from './imap.js';
 import { aggregate, type GroupByField, type EnvelopeRow } from './stats.js';
+import * as mailIndex from './mail-index.js';
 import { sendEmail } from './smtp.js';
 import { sanitizeForDisplay, wrapUntrusted, sanitizeError } from './sanitize.js';
 import { generateCode, verifyCode, actionFingerprint, type VerifyResult } from './confirm.js';
@@ -280,6 +281,16 @@ const findSenderSchema = z.object({
   query:       z.string().min(1).describe('Имя, часть имени или часть адреса (подстрока). Пример: "Катя", "ivan", "@company.ru"'),
   folder:      z.string().default('INBOX').describe('IMAP папка для поиска'),
   max_senders: z.number().int().min(1).max(100).default(20).describe('Максимум кандидатов в ответе'),
+}).strict();
+const searchFastSchema = z.object({
+  query:  z.string().min(1).describe('Слова из темы или имени/адреса отправителя. Кириллица поддерживается.'),
+  folder: z.string().optional().describe('Ограничить поиск одной папкой; по умолчанию все проиндексированные'),
+  limit:  z.number().int().min(1).max(100).optional().describe('Максимум результатов (default 20)'),
+}).strict();
+const getThreadSchema = z.object({
+  query:  z.string().min(1).describe('Слова из темы письма, тред которого нужен'),
+  folder: z.string().optional(),
+  limit:  z.number().int().min(1).max(100).optional(),
 }).strict();
 const countEmailsSchema = z.object({
   folder:  z.string().default('INBOX'),
@@ -1245,6 +1256,96 @@ Output: { rows: [{ key:[...], count, total_size_bytes, earliest, latest }], tota
           content: [{ type: 'text', text: JSON.stringify(out, null, 2) }],
           structuredContent: out,
         };
+      } catch (e) { return errorResult(e); }
+    },
+  },
+
+  // 6f. Fast search over the local index (L0) -- v2.6.0 Layer 2 foundation.
+  // Always registered; the handler degrades gracefully when no index is built
+  // (the index may be built by the CLI after the server started, so gating
+  // registration on indexExists() at startup would hide a usable tool).
+  {
+    name: 'yandex_search_fast',
+    title: 'Быстрый поиск (локальный индекс)',
+    description: `Мгновенный поиск по локальному индексу писем -- единицы мс вместо ~1 с живого IMAP.
+Ищет по теме и отправителю, ранжирует по релевантности, поддерживает кириллицу.
+Требует построенного индекса: в терминале \`yandex-mail-mcp index build\` (и \`index update\` для досинхронизации).
+Если индекс не построен -- вернёт подсказку; тогда используй yandex_search_emails (живой поиск).
+Args: query (обязательно), folder? (по умолчанию все папки индекса), limit (default 20, max 100).
+Output: { index_built, total, hits: [{ uid, folder, from, subject, date, score, match_reasons }] }`,
+    inputSchema: searchFastSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    meta: { 'anthropic/maxResultSizeChars': 50_000 },
+    requires: { authLevel: 0 },
+    handler: async (params, _ctx) => {
+      try {
+        const { query, folder, limit } = searchFastSchema.parse(params);
+        if (!mailIndex.indexExists()) {
+          return {
+            content: [{ type: 'text', text: 'Локальный индекс не построен. Запусти `yandex-mail-mcp index build` в терминале, либо используй yandex_search_emails для живого поиска по IMAP.' }],
+            structuredContent: { index_built: false, total: 0, hits: [] },
+          };
+        }
+        const hits = mailIndex.searchFast(query, { folder, limit });
+        const rows = hits.map(h => ({
+          uid: h.record.uid,
+          folder: h.record.folder,
+          from: h.record.fromName ? `${h.record.fromName} <${h.record.fromEmail}>` : h.record.fromEmail,
+          subject: h.record.subject,
+          date: h.record.date,
+          score: h.score,
+          match_reasons: h.matchReasons,
+        }));
+        const out = { index_built: true, query, total: rows.length, hits: rows };
+        if (rows.length === 0) {
+          return { content: [{ type: 'text', text: `По запросу "${query}" в индексе ничего не найдено.` }], structuredContent: out };
+        }
+        const lines = rows.map((r, i) =>
+          `${i + 1}. [${r.folder}#${r.uid}] ${sanitizeForDisplay(r.subject) || '(без темы)'} — ${sanitizeForDisplay(r.from)}, ${r.date.slice(0, 10)} (релевантность ${r.score})`,
+        );
+        return { content: [{ type: 'text', text: `Найдено ${rows.length} (локальный индекс):\n\n${lines.join('\n')}` }], structuredContent: out };
+      } catch (e) { return errorResult(e); }
+    },
+  },
+
+  // 6g. Thread reconstruction over the local index (L0) -- v2.6.0.
+  {
+    name: 'yandex_get_thread',
+    title: 'Цепочка письма (тред)',
+    description: `Собирает цепочку (тред) по локальному индексу: находит лучшее совпадение по теме и
+возвращает все письма в той же папке с той же нормализованной темой (Re:/Fwd: отбрасываются),
+в хронологическом порядке. Требует построенного индекса (см. yandex_search_fast).
+Args: query (слова из темы), folder?, limit (default 20, max 100).
+Output: { index_built, total, thread: [{ uid, folder, from, subject, date }] }`,
+    inputSchema: getThreadSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    meta: { 'anthropic/maxResultSizeChars': 50_000 },
+    requires: { authLevel: 0 },
+    handler: async (params, _ctx) => {
+      try {
+        const { query, folder, limit } = getThreadSchema.parse(params);
+        if (!mailIndex.indexExists()) {
+          return {
+            content: [{ type: 'text', text: 'Локальный индекс не построен. Запусти `yandex-mail-mcp index build` в терминале.' }],
+            structuredContent: { index_built: false, total: 0, thread: [] },
+          };
+        }
+        const hits = mailIndex.getThread(query, { folder, limit });
+        const thread = hits.map(h => ({
+          uid: h.record.uid,
+          folder: h.record.folder,
+          from: h.record.fromName ? `${h.record.fromName} <${h.record.fromEmail}>` : h.record.fromEmail,
+          subject: h.record.subject,
+          date: h.record.date,
+        }));
+        const out = { index_built: true, query, total: thread.length, thread };
+        if (thread.length === 0) {
+          return { content: [{ type: 'text', text: `Тред по запросу "${query}" в индексе не найден.` }], structuredContent: out };
+        }
+        const lines = thread.map((r, i) =>
+          `${i + 1}. ${r.date.slice(0, 10)} — ${sanitizeForDisplay(r.from)}: ${sanitizeForDisplay(r.subject) || '(без темы)'} [${r.folder}#${r.uid}]`,
+        );
+        return { content: [{ type: 'text', text: `Тред из ${thread.length} писем:\n\n${lines.join('\n')}` }], structuredContent: out };
       } catch (e) { return errorResult(e); }
     },
   },
