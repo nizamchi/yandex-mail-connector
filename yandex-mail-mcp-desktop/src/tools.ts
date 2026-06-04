@@ -433,10 +433,10 @@ function buildSendPlan(p: ParsedSendParams, fp: string, guard?: GuardResult): Se
   const body = previewBody(p);
   const rateOk = guard !== undefined && guard.ok === true
     ? 'pass (guards-pure: daily + per-recipient + dedup)'
-    : 'deferred to phase 7';
+    : 'not evaluated (guard state unavailable)';
   const dedupOk = guard !== undefined && guard.ok === true
     ? 'pass (no fingerprint hit in dedup window)'
-    : 'deferred to phase 7';
+    : 'not evaluated (guard state unavailable)';
   const plan: SendPlan = {
     dry_run: true,
     action: 'send',
