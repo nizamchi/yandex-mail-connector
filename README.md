@@ -2,8 +2,8 @@
 
 MCP-сервер для Яндекс.Почты с защитой опасных операций на стороне сервера.
 
-[![Версия](https://img.shields.io/badge/версия-2.3.0-blue)](CHANGELOG.md)
-[![Тесты](https://img.shields.io/badge/тесты-384_/_0_упавших-success)](#)
+[![Версия](https://img.shields.io/badge/версия-2.6.0-blue)](CHANGELOG.md)
+[![Тесты](https://img.shields.io/badge/тесты-409_/_0_упавших-success)](#)
 [![Уязвимости](https://img.shields.io/badge/npm_audit-0-success)](#)
 [![Лицензия](https://img.shields.io/badge/лицензия-PolyForm_NC_1.0.0-orange)](LICENSE)
 
@@ -296,7 +296,7 @@ yandex-mail-mcp-trust --policy set thresholds.augment 25 --yes  # подкрут
 
 ## Статус
 
-Текущая версия — **2.3.0**, май 2026 года. 390 тестов (384 проходят, 6 unix-only пропускаются на Windows), ноль известных уязвимостей в зависимостях. Основной бандл 2,73 МБ, утилита для оператора 90 КБ.
+Текущая версия — **2.6.0**, июнь 2026 года. 415 тестов (409 проходят, 6 unix-only пропускаются на Windows), ноль известных уязвимостей в зависимостях. Есть статическая проверка типов нашего кода (`npm run typecheck`).
 
 Дальнейшие планы — в [ROADMAP.md](ROADMAP.md).
 

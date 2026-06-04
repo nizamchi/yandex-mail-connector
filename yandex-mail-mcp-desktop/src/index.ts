@@ -124,7 +124,7 @@ const SERVER_INSTRUCTIONS = [
 ].join(' ');
 
 const server = new McpServer(
-  { name: 'yandex-mail-mcp', version: '2.5.0' },
+  { name: 'yandex-mail-mcp', version: '2.6.0' },
   { instructions: SERVER_INSTRUCTIONS },
 );
 
