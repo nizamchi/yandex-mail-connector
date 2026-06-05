@@ -2,8 +2,8 @@
 
 MCP-сервер для Яндекс.Почты с защитой опасных операций на стороне сервера.
 
-[![Версия](https://img.shields.io/badge/версия-2.6.0-blue)](CHANGELOG.md)
-[![Тесты](https://img.shields.io/badge/тесты-409_/_0_упавших-success)](#)
+[![Версия](https://img.shields.io/badge/версия-2.7.1-blue)](CHANGELOG.md)
+[![Тесты](https://img.shields.io/badge/тесты-420_/_0_упавших-success)](#)
 [![Уязвимости](https://img.shields.io/badge/npm_audit-0-success)](#)
 [![Лицензия](https://img.shields.io/badge/лицензия-PolyForm_NC_1.0.0-orange)](LICENSE)
 
@@ -34,6 +34,9 @@ MCP-сервер для подключения AI-ассистента (Claude D
 - Локальный журнал действий в формате JSON Lines, без тела писем.
 - Эксплуатационные ограничения: дневной лимит отправки, частота на одного
   получателя, защищённые системные папки, маскировка кодов 2FA.
+- Локальный индекс почты для мгновенного поиска: фильтры (отправитель, даты,
+  прочитано/звёздочка), ранжирование по релевантности, сборка цепочек писем по
+  Message-ID. Подробнее — раздел [«Быстрый поиск по локальному индексу»](#быстрый-поиск-по-локальному-индексу).
 
 ## Пример: блокировка скрытой инструкции в письме
 
@@ -100,7 +103,7 @@ npm install --omit=dev --ignore-scripts
 **Вариант B — `npx` без клонирования (с v2.2.1+):**
 
 ```bash
-npx -y github:nizamchi/yandex-mail-connector#v2.3.0 --check
+npx -y github:nizamchi/yandex-mail-connector#v2.7.1 --check
 ```
 
 Бандл закэшируется в `~/.npm/_npx/`. Удобно для быстрого health-check или
@@ -199,8 +202,40 @@ envelope'ов в контекст модели; статистика — это 
 
 Возвращается JSON `{rows: [{key, count, total_size_bytes, earliest, latest}],
 total_scanned, scan_time_ms, truncated}`. Сортировка `count desc, key asc`.
-Это бридж-решение: следующий слой (Layer 2, SQLite-индекс) даст ту же
-агрегацию мгновенно и без повторных IMAP-сканов.
+Это серверная агрегация поверх живого IMAP. Для мгновенного поиска по уже
+скачанным метаданным есть локальный индекс — следующий раздел.
+
+## Быстрый поиск по локальному индексу
+
+Коннектор умеет держать локальный индекс конвертов писем (тема, отправитель,
+даты, флаги, связи цепочек) — обычные JSON-файлы в каталоге состояния, без
+SQLite и нативных зависимостей, чтобы не ломать единый бандл и установку через
+`npx`. Живой IMAP-поиск (~1 с) превращается в выборку за единицы миллисекунд.
+
+Сборка и поддержка индекса — из терминала:
+
+```bash
+node yandex-mail-mcp-desktop/dist/yandex-mail-mcp.js index build INBOX  # полная сборка
+node yandex-mail-mcp-desktop/dist/yandex-mail-mcp.js index update        # инкрементальная досинхронизация
+node yandex-mail-mcp-desktop/dist/yandex-mail-mcp.js index status        # что в индексе + готовность тредов
+node yandex-mail-mcp-desktop/dist/yandex-mail-mcp.js index drop          # удалить
+```
+
+После сборки появляются два инструмента уровня «только чтение»:
+
+- **`yandex_search_fast`** — мгновенный ранжированный поиск по теме и
+  отправителю. Поддерживает фильтры `from / since / before / seen / flagged` и
+  поиск **только по фильтрам** без текста запроса: «непрочитанные за март» →
+  `seen=false`, `since="2025-03-01"`. Редкие, различимые слова ранжируются выше
+  частых.
+- **`yandex_get_thread`** — сборка цепочки письма по графу Message-ID
+  (In-Reply-To): связывает ответы с изменённой темой и треды, разбитые между
+  Входящими и Отправленными, плюс склейку по теме в пределах папки.
+
+Без индекса оба инструмента возвращают подсказку «собери индекс» и не мешают
+живому `yandex_search_emails`. Связи цепочек появляются после `index build`; на
+уже существующем индексе обычный `index update` до-собирает их автоматически
+(`index status` показывает готовность).
 
 ## Slash-команды в Claude Code
 
@@ -296,7 +331,7 @@ yandex-mail-mcp-trust --policy set thresholds.augment 25 --yes  # подкрут
 
 ## Статус
 
-Текущая версия — **2.6.0**, июнь 2026 года. 415 тестов (409 проходят, 6 unix-only пропускаются на Windows), ноль известных уязвимостей в зависимостях. Есть статическая проверка типов нашего кода (`npm run typecheck`).
+Текущая версия — **2.7.1**, июнь 2026 года. 426 тестов (420 проходят, 6 unix-only пропускаются на Windows), ноль известных уязвимостей в зависимостях (`npm audit --omit=dev`). Есть статическая проверка типов нашего кода (`npm run typecheck`).
 
 Дальнейшие планы — в [ROADMAP.md](ROADMAP.md).
 
@@ -307,8 +342,10 @@ bundle via `npx`. Server-side security is independent of the MCP client:
 read-only by default, one-time codes for destructive operations (signed with
 a key the client cannot access), trust-on-first-use allowlist for outbound
 recipients, local JSONL audit log, and 11 content detectors (API keys, PII,
-crypto wallets, base64 blobs, Cyrillic homoglyph attacks). See
-[INSTALL.md](INSTALL.md) and [POLICY.md](POLICY.md).
+crypto wallets, base64 blobs, Cyrillic homoglyph attacks). A local on-disk
+envelope index (no native deps) powers millisecond filtered search
+(`yandex_search_fast`) and Message-ID thread reconstruction
+(`yandex_get_thread`). See [INSTALL.md](INSTALL.md) and [POLICY.md](POLICY.md).
 
 ## Лицензия
 
