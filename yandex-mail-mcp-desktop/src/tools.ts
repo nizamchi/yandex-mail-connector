@@ -283,9 +283,14 @@ const findSenderSchema = z.object({
   max_senders: z.number().int().min(1).max(100).default(20).describe('Максимум кандидатов в ответе'),
 }).strict();
 const searchFastSchema = z.object({
-  query:  z.string().min(1).describe('Слова из темы или имени/адреса отправителя. Кириллица поддерживается.'),
+  query:  z.string().optional().describe('Слова из темы или имени/адреса отправителя. Кириллица поддерживается. Можно опустить, если задан хотя бы один фильтр.'),
   folder: z.string().optional().describe('Ограничить поиск одной папкой; по умолчанию все проиндексированные'),
   limit:  z.number().int().min(1).max(100).optional().describe('Максимум результатов (default 20)'),
+  from:   z.string().optional().describe('Фильтр: фрагмент адреса/имени отправителя'),
+  since:  z.string().optional().describe('Фильтр: ISO дата, напр. "2025-03-01" -- письма не раньше этой даты (включительно)'),
+  before: z.string().optional().describe('Фильтр: ISO дата -- письма строго раньше этой даты'),
+  seen:   z.boolean().optional().describe('Фильтр: true=только прочитанные, false=только непрочитанные'),
+  flagged:z.boolean().optional().describe('Фильтр: true=только со звёздочкой, false=только без'),
 }).strict();
 const getThreadSchema = z.object({
   query:  z.string().min(1).describe('Слова из темы письма, тред которого нужен'),
@@ -1269,9 +1274,10 @@ Output: { rows: [{ key:[...], count, total_size_bytes, earliest, latest }], tota
     title: 'Быстрый поиск (локальный индекс)',
     description: `Мгновенный поиск по локальному индексу писем -- единицы мс вместо ~1 с живого IMAP.
 Ищет по теме и отправителю, ранжирует по релевантности, поддерживает кириллицу.
+Поддерживает фильтры: from / since / before / seen / flagged. Можно искать ТОЛЬКО по фильтрам без query (напр. «непрочитанные за март»: seen=false, since="2025-03-01").
 Требует построенного индекса: в терминале \`yandex-mail-mcp index build\` (и \`index update\` для досинхронизации).
 Если индекс не построен -- вернёт подсказку; тогда используй yandex_search_emails (живой поиск).
-Args: query (обязательно), folder? (по умолчанию все папки индекса), limit (default 20, max 100).
+Args: query? (опционально, если задан фильтр), folder?, limit (default 20, max 100), from?, since?, before?, seen?, flagged?.
 Output: { index_built, total, hits: [{ uid, folder, from, subject, date, score, match_reasons }] }`,
     inputSchema: searchFastSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -1279,14 +1285,25 @@ Output: { index_built, total, hits: [{ uid, folder, from, subject, date, score, 
     requires: { authLevel: 0 },
     handler: async (params, _ctx) => {
       try {
-        const { query, folder, limit } = searchFastSchema.parse(params);
+        const { query, folder, limit, from, since, before, seen, flagged } = searchFastSchema.parse(params);
+        const q = (query ?? '').trim();
+        const filters: mailIndex.SearchFilters = {};
+        if (from) filters.from = from;
+        if (since) filters.since = parseSearchDate(since, 'since').getTime();
+        if (before) filters.before = parseSearchDate(before, 'before').getTime();
+        if (seen !== undefined) filters.seen = seen;
+        if (flagged !== undefined) filters.flagged = flagged;
+        const hasFilter = Object.keys(filters).length > 0;
+        if (q.length === 0 && !hasFilter) {
+          throw new Error('Укажите query или хотя бы один фильтр (from/since/before/seen/flagged).');
+        }
         if (!mailIndex.indexExists()) {
           return {
             content: [{ type: 'text', text: 'Локальный индекс не построен. Запусти `yandex-mail-mcp index build` в терминале, либо используй yandex_search_emails для живого поиска по IMAP.' }],
             structuredContent: { index_built: false, total: 0, hits: [] },
           };
         }
-        const hits = mailIndex.searchFast(query, { folder, limit });
+        const hits = mailIndex.searchFast(q, { folder, limit, filters });
         const rows = hits.map(h => ({
           uid: h.record.uid,
           folder: h.record.folder,
@@ -1296,9 +1313,10 @@ Output: { index_built, total, hits: [{ uid, folder, from, subject, date, score, 
           score: h.score,
           match_reasons: h.matchReasons,
         }));
-        const out = { index_built: true, query, total: rows.length, hits: rows };
+        const label = q.length > 0 ? `"${q}"` : 'заданным фильтрам';
+        const out = { index_built: true, query: q, total: rows.length, hits: rows };
         if (rows.length === 0) {
-          return { content: [{ type: 'text', text: `По запросу "${query}" в индексе ничего не найдено.` }], structuredContent: out };
+          return { content: [{ type: 'text', text: `По ${label} в индексе ничего не найдено.` }], structuredContent: out };
         }
         const lines = rows.map((r, i) =>
           `${i + 1}. [${r.folder}#${r.uid}] ${sanitizeForDisplay(r.subject) || '(без темы)'} — ${sanitizeForDisplay(r.from)}, ${r.date.slice(0, 10)} (релевантность ${r.score})`,

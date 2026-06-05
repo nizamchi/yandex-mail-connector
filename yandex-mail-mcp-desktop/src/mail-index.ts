@@ -51,6 +51,18 @@ export interface SearchHit {
   matchReasons: string[];
 }
 
+// Structured filters applied on top of (or instead of) the free-text query.
+// Every field maps to a column already present on IndexRecord, so filtering
+// needs no schema change. `since`/`before` are epoch ms; `since` is inclusive,
+// `before` is exclusive (mirrors IMAP SINCE/BEFORE semantics in tools.ts).
+export interface SearchFilters {
+  from?: string;       // substring of fromEmail or fromName (case-insensitive)
+  since?: number;      // ms, inclusive lower bound on date
+  before?: number;     // ms, exclusive upper bound on date
+  seen?: boolean;
+  flagged?: boolean;
+}
+
 export interface FolderStatus {
   folder: string;
   count: number;
@@ -571,7 +583,40 @@ function clampLimit(limit?: number): number {
   return Math.min(Math.max(Math.floor(limit), 1), MAX_LIMIT);
 }
 
-export function searchFast(query: string, opts?: { folder?: string; limit?: number }): SearchHit[] {
+function hasAnyFilter(f?: SearchFilters): boolean {
+  return !!f && (
+    (f.from !== undefined && f.from.length > 0) ||
+    f.since !== undefined || f.before !== undefined ||
+    f.seen !== undefined || f.flagged !== undefined
+  );
+}
+
+// passesFilters: does a record satisfy every set structured filter? `ms` is the
+// pre-parsed date (c.dateMs[idx]); a record with no valid date fails any
+// since/before bound rather than silently passing.
+function passesFilters(r: IndexRecord, ms: number, f?: SearchFilters): boolean {
+  if (!f) return true;
+  if (f.seen !== undefined && r.seen !== f.seen) return false;
+  if (f.flagged !== undefined && r.flagged !== f.flagged) return false;
+  if (f.from !== undefined && f.from.length > 0) {
+    const needle = f.from.toLowerCase();
+    if (!r.fromEmail.includes(needle) && !r.fromName.toLowerCase().includes(needle)) return false;
+  }
+  if (f.since !== undefined && (isNaN(ms) || ms < f.since)) return false;
+  if (f.before !== undefined && (isNaN(ms) || ms >= f.before)) return false;
+  return true;
+}
+
+// searchFast: free-text query (subject + sender, ranked) AND/OR structured
+// filters (from/since/before/seen/flagged). A query with content ranks by
+// token/substring/recency. A query that is ONLY filters ("all unread since
+// March" -- every word consumed as a filter, nothing left to rank) scans every
+// record and orders by recency; without that branch the candidate set would be
+// empty and a pure-filter query would return nothing.
+export function searchFast(
+  query: string,
+  opts?: { folder?: string; limit?: number; filters?: SearchFilters },
+): SearchHit[] {
   const c = getCache();
   if (c.records.length === 0) return [];
 
@@ -579,54 +624,73 @@ export function searchFast(query: string, opts?: { folder?: string; limit?: numb
   const qTokens = tokenize(query);
   const limit = clampLimit(opts?.limit);
   const folderFilter = opts?.folder;
+  const filters = opts?.filters;
+  const hasContent = qTokens.length > 0 || qLower.length > 0;
+  const hasFilters = hasAnyFilter(filters);
 
-  // Candidate set: union of records matching any query token. With no usable
-  // tokens we cannot rank by token -- fall back to a substring scan.
+  // Nothing to match on at all.
+  if (!hasContent && !hasFilters) return [];
+
   const candidates = new Set<number>();
-  for (const t of qTokens) {
-    const set = c.inverted.get(t);
-    if (set) for (const idx of set) candidates.add(idx);
-  }
-  // Substring fallback so a single short query token (or a phrase) still finds
-  // subject-substring matches even when token indexing missed it.
-  if (qLower.length > 0) {
-    for (let i = 0; i < c.records.length; i++) {
-      if (c.records[i].subject.toLowerCase().includes(qLower)) candidates.add(i);
+  if (hasContent) {
+    // Union of records matching any query token.
+    for (const t of qTokens) {
+      const set = c.inverted.get(t);
+      if (set) for (const idx of set) candidates.add(idx);
     }
+    // Substring fallback so a single short query token (or a phrase) still finds
+    // subject-substring matches even when token indexing missed it.
+    if (qLower.length > 0) {
+      for (let i = 0; i < c.records.length; i++) {
+        if (c.records[i].subject.toLowerCase().includes(qLower)) candidates.add(i);
+      }
+    }
+  } else {
+    // Pure-filter query: scan all records; the filter pass below narrows them.
+    for (let i = 0; i < c.records.length; i++) candidates.add(i);
   }
 
   const hits: SearchHit[] = [];
   for (const idx of candidates) {
     const r = c.records[idx];
     if (folderFilter !== undefined && r.folder !== folderFilter) continue;
+    const ms = c.dateMs[idx];
+    if (!passesFilters(r, ms, filters)) continue;
 
     let score = 0;
     const reasons: string[] = [];
-    const sTok = c.subjectTokens[idx];
-    const fromTok = c.senderTokens[idx];
 
-    let subjectMatched = false;
-    let senderMatched = false;
-    for (const t of qTokens) {
-      if (sTok.has(t)) { score += 3; subjectMatched = true; }
-      if (fromTok.has(t)) { score += 2; senderMatched = true; }
-    }
-    if (subjectMatched) reasons.push('subject');
-    if (senderMatched) reasons.push('sender');
+    if (hasContent) {
+      const sTok = c.subjectTokens[idx];
+      const fromTok = c.senderTokens[idx];
+      let subjectMatched = false;
+      let senderMatched = false;
+      for (const t of qTokens) {
+        if (sTok.has(t)) { score += 3; subjectMatched = true; }
+        if (fromTok.has(t)) { score += 2; senderMatched = true; }
+      }
+      if (subjectMatched) reasons.push('subject');
+      if (senderMatched) reasons.push('sender');
 
-    if (qLower.length > 0 && r.subject.toLowerCase().includes(qLower)) {
-      score += 5;
-      reasons.push('subject-substring');
+      if (qLower.length > 0 && r.subject.toLowerCase().includes(qLower)) {
+        score += 5;
+        reasons.push('subject-substring');
+      }
+    } else {
+      // The match reason IS the filter; ranking is recency-only.
+      reasons.push('filter');
     }
 
     // Recency boost: newest RECENCY_TOP_FRACTION by date.
-    const ms = c.dateMs[idx];
     if (!isNaN(ms) && ms >= c.recencyThresholdMs) {
       score += 1;
       reasons.push('recent');
     }
 
-    if (score <= 0) continue;
+    // Content queries: a zero score means no real token/substring match -> drop.
+    // Pure-filter queries: every record that passed the filters is a valid hit
+    // (its score may be 0 when it is not in the recency top fraction).
+    if (hasContent && score <= 0) continue;
     hits.push({ record: r, score, matchReasons: reasons });
   }
 

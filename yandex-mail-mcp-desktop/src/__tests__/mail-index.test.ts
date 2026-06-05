@@ -398,3 +398,93 @@ test('T20: buildIndex of one folder preserves other folders', withTempStateDir(a
   const sentHits = searchFast('sent', { folder: 'Sent' });
   assert.equal(sentHits.length, 1);
 }));
+
+// ── Phase 1 (v2.7.0): structured filters on searchFast ────────────────
+
+test('T21: pure-filter (unread) returns every unread record, no query needed', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, subject: 'alpha', seen: true }),
+    hdr({ uid: 2, subject: 'beta',  seen: false }),
+    hdr({ uid: 3, subject: 'gamma', seen: false }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // No query at all -- this is the case the candidate-set fix exists for.
+  const unread = searchFast('', { filters: { seen: false } });
+  assert.equal(unread.length, 2, 'two unread messages');
+  assert.deepEqual(unread.map(h => h.record.uid).sort(), [2, 3]);
+  assert.ok(unread.every(h => h.matchReasons.includes('filter')));
+}));
+
+test('T22: from filter narrows by sender substring (email or name)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, subject: 'x', from: [{ address: 'billing@acme.io', name: 'Acme Billing' }] }),
+    hdr({ uid: 2, subject: 'y', from: [{ address: 'kate@example.com', name: 'Катя Иванова' }] }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const byEmail = searchFast('', { filters: { from: 'acme.io' } });
+  assert.deepEqual(byEmail.map(h => h.record.uid), [1]);
+
+  const byName = searchFast('', { filters: { from: 'Катя' } });
+  assert.deepEqual(byName.map(h => h.record.uid), [2]);
+}));
+
+test('T23: since/before bound the date range (since inclusive, before exclusive)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, subject: 'jan', date: '2025-01-15T10:00:00.000Z' }),
+    hdr({ uid: 2, subject: 'mar', date: '2025-03-10T10:00:00.000Z' }),
+    hdr({ uid: 3, subject: 'apr', date: '2025-04-02T10:00:00.000Z' }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const march = searchFast('', {
+    filters: {
+      since: new Date('2025-03-01').getTime(),
+      before: new Date('2025-04-01').getTime(),
+    },
+  });
+  assert.deepEqual(march.map(h => h.record.uid), [2], 'only the March message is in [Mar 1, Apr 1)');
+}));
+
+test('T24: filters compose with a content query', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, subject: 'report quarterly', seen: false }),
+    hdr({ uid: 2, subject: 'report monthly',   seen: true }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const unreadReports = searchFast('report', { filters: { seen: false } });
+  assert.deepEqual(unreadReports.map(h => h.record.uid), [1], 'content match AND unread filter');
+}));
+
+test('T25: filter that matches nothing returns empty', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 1, subject: 'hello', flagged: false })], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  assert.equal(searchFast('', { filters: { flagged: true } }).length, 0);
+}));
+
+test('T26: pure-filter results are ordered newest-first', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, subject: 'old',   flagged: true, date: '2025-01-01T00:00:00.000Z' }),
+    hdr({ uid: 2, subject: 'newer', flagged: true, date: '2025-05-01T00:00:00.000Z' }),
+    hdr({ uid: 3, subject: 'newest',flagged: true, date: '2025-06-01T00:00:00.000Z' }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const flagged = searchFast('', { filters: { flagged: true } });
+  assert.deepEqual(flagged.map(h => h.record.uid), [3, 2, 1], 'descending by date');
+}));
