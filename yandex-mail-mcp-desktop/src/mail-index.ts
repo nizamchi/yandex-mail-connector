@@ -108,6 +108,11 @@ const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MIN_TOKEN_LEN = 2;
 const RECENCY_TOP_FRACTION = 0.2;   // newest 20% by date get the recency boost.
+// idf weighting: a matched token's base weight is scaled by how distinctive it
+// is across the corpus. idf is capped+normalised into [0.5, 1.5] so magnitudes
+// stay comparable to the legacy flat scores (substring=5, recency=1) regardless
+// of corpus size -- a token in every message counts ~half, a rare one ~1.5x.
+const IDF_CAP = 6;
 // Strip leading reply/forward prefixes: English re/fwd/fw + Russian "Вс:".
 const SUBJECT_PREFIX_RE = /^\s*(re|fwd?|fw|вс)\s*:\s*/iu;
 // Unicode tokenizer split: anything that is not a letter or a number (handles
@@ -607,6 +612,17 @@ function passesFilters(r: IndexRecord, ms: number, f?: SearchFilters): boolean {
   return true;
 }
 
+// idfWeight: how much a matched token contributes, scaled by its rarity. df is
+// the number of records containing the token (= inverted posting-list size).
+// Returns [0.5, 1.5]; an unindexed token (substring-only candidate) is neutral.
+function idfWeight(c: IndexCache, token: string): number {
+  const df = c.inverted.get(token)?.size ?? 0;
+  if (df <= 0) return 1;
+  const n = c.records.length;
+  const idf = Math.log(1 + (n - df + 0.5) / (df + 0.5));
+  return 0.5 + Math.min(idf, IDF_CAP) / IDF_CAP;
+}
+
 // searchFast: free-text query (subject + sender, ranked) AND/OR structured
 // filters (from/since/before/seen/flagged). A query with content ranks by
 // token/substring/recency. A query that is ONLY filters ("all unread since
@@ -666,8 +682,10 @@ export function searchFast(
       let subjectMatched = false;
       let senderMatched = false;
       for (const t of qTokens) {
-        if (sTok.has(t)) { score += 3; subjectMatched = true; }
-        if (fromTok.has(t)) { score += 2; senderMatched = true; }
+        // Distinct query tokens; a rarer token (higher idf) contributes more.
+        const w = idfWeight(c, t);
+        if (sTok.has(t)) { score += 3 * w; subjectMatched = true; }
+        if (fromTok.has(t)) { score += 2 * w; senderMatched = true; }
       }
       if (subjectMatched) reasons.push('subject');
       if (senderMatched) reasons.push('sender');

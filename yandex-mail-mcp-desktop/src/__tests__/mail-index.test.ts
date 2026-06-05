@@ -488,3 +488,30 @@ test('T26: pure-filter results are ordered newest-first', withTempStateDir(async
   const flagged = searchFast('', { filters: { flagged: true } });
   assert.deepEqual(flagged.map(h => h.record.uid), [3, 2, 1], 'descending by date');
 }));
+
+// ── Phase 2 (v2.7.0): idf-weighted relevance ranking ─────────────────
+
+test('T27: a rarer matched token outranks a common one (idf weighting)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  const headers: EmailHeader[] = [
+    // Rare token "quantum" appears in exactly one subject (df=1).
+    hdr({ uid: 100, subject: 'quantum encryption', date: '2025-03-03T00:00:00.000Z' }),
+    // "sale" is common: this doc + 10 fillers below (df=11).
+    hdr({ uid: 200, subject: 'summer sale', date: '2025-03-03T00:00:00.000Z' }),
+  ];
+  for (let i = 1; i <= 10; i++) {
+    headers.push(hdr({ uid: i, subject: 'weekly sale', date: '2025-03-03T00:00:00.000Z' }));
+  }
+  src.setFolder('INBOX', headers, 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // Query touches both tokens; uid 100 matches only the rare "quantum",
+  // uid 200 (and fillers) match only the common "sale". The rare match must
+  // rank first even though every doc has the same date.
+  const hits = searchFast('quantum sale');
+  assert.equal(hits[0].record.uid, 100, 'rare-token match ranks first');
+  const saleHit = hits.find(h => h.record.uid === 200);
+  assert.ok(saleHit, 'common-token match is still a hit');
+  assert.ok(hits[0].score > saleHit!.score, 'rare match scores strictly higher');
+}));
