@@ -515,3 +515,40 @@ test('T27: a rarer matched token outranks a common one (idf weighting)', withTem
   assert.ok(saleHit, 'common-token match is still a hit');
   assert.ok(hits[0].score > saleHit!.score, 'rare match scores strictly higher');
 }));
+
+// ── Phase 3 (v2.7.0): Message-ID graph threading ─────────────────────
+
+test('T28: getThread links by In-Reply-To across folders + renamed subjects', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<a@x>', subject: 'Проект Альфа: старт', date: '2025-03-01T10:00:00.000Z' }),
+    // A later reply whose subject was renamed entirely (no subject overlap).
+    hdr({ uid: 2, messageId: '<c@x>', inReplyTo: '<b@x>', subject: 'итоги встречи', date: '2025-03-03T10:00:00.000Z' }),
+    hdr({ uid: 9, messageId: '<z@x>', subject: 'спам реклама', date: '2025-03-04T10:00:00.000Z' }),
+  ], 100);
+  src.setFolder('Sent', [
+    // Reply lives in Sent and has a renamed subject; only In-Reply-To ties it in.
+    hdr({ uid: 1, messageId: '<b@x>', inReplyTo: '<a@x>', subject: 'Re: договор по сделке', date: '2025-03-02T10:00:00.000Z' }),
+  ], 100);
+  await buildIndex(['INBOX', 'Sent'], src);
+  _resetForTests();
+
+  const thread = getThread('Альфа');
+  // a -> b (Sent, renamed) -> c (renamed) must all be linked by Message-ID,
+  // in chronological order, despite living in two folders with three subjects.
+  assert.deepEqual(thread.map(h => h.record.messageId), ['<a@x>', '<b@x>', '<c@x>']);
+  assert.ok(!thread.some(h => h.record.messageId === '<z@x>'), 'unrelated mail excluded');
+}));
+
+test('T29: subject fallback stays folder-scoped (no cross-folder false grouping)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 1, messageId: '<i@x>', subject: 'отчёт' })], 100);
+  // Same normalized subject, different folder, NO In-Reply-To link -> unrelated.
+  src.setFolder('Sent', [hdr({ uid: 5, messageId: '<s@x>', subject: 'отчёт' })], 100);
+  await buildIndex(['INBOX', 'Sent'], src);
+  _resetForTests();
+
+  const thread = getThread('отчёт');
+  assert.equal(thread.length, 1, 'only the seed folder match; no graph link to Sent');
+  assert.equal(thread[0].record.messageId, '<i@x>');
+}));

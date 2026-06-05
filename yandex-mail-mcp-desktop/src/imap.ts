@@ -14,6 +14,10 @@ export interface EmailAddress { name?: string; address: string; }
 export interface EmailHeader {
   uid: number;
   messageId: string;
+  // Message-ID of the parent message (In-Reply-To header). Present in the IMAP
+  // envelope already, so capturing it costs no extra fetch. Optional: older
+  // index records predate this field.
+  inReplyTo?: string;
   from: EmailAddress[];
   to: EmailAddress[];
   cc: EmailAddress[];
@@ -122,6 +126,7 @@ function parseHeader(msg: FetchMessageObject): EmailHeader {
   return {
     uid: msg.uid,
     messageId: e?.messageId ?? '',
+    inReplyTo: e?.inReplyTo ?? '',
     from: toAddrs(e?.from),
     to: toAddrs(e?.to),
     cc: toAddrs(e?.cc),

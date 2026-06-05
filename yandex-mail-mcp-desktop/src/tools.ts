@@ -1330,9 +1330,11 @@ Output: { index_built, total, hits: [{ uid, folder, from, subject, date, score, 
   {
     name: 'yandex_get_thread',
     title: 'Цепочка письма (тред)',
-    description: `Собирает цепочку (тред) по локальному индексу: находит лучшее совпадение по теме и
-возвращает все письма в той же папке с той же нормализованной темой (Re:/Fwd: отбрасываются),
-в хронологическом порядке. Требует построенного индекса (см. yandex_search_fast).
+    description: `Собирает цепочку (тред) по локальному индексу: находит лучшее совпадение и связывает письма
+по графу Message-ID (In-Reply-To) — ловит ответы с изменённой темой и треды, разбитые между
+папками (Входящие/Отправленные), — плюс по нормализованной теме (Re:/Fwd:/Вс: отбрасываются)
+в пределах папки совпадения. Возвращает письма в хронологическом порядке. Требует индекса
+(см. yandex_search_fast; для связей по In-Reply-To нужен \`index build\`, не только update).
 Args: query (слова из темы), folder?, limit (default 20, max 100).
 Output: { index_built, total, thread: [{ uid, folder, from, subject, date }] }`,
     inputSchema: getThreadSchema,

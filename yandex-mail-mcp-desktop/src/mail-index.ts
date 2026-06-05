@@ -36,6 +36,9 @@ export interface IndexRecord {
   folder: string;
   uid: number;
   messageId: string;
+  // In-Reply-To message-id (parent in the thread graph). Optional: records
+  // written before v2.7.0-p3 lack it -- getThread falls back to subject grouping.
+  inReplyTo?: string;
   fromEmail: string;
   fromName: string;
   subject: string;
@@ -240,6 +243,7 @@ function toRecord(account: string, folder: string, h: EmailHeader): IndexRecord 
     folder,
     uid: h.uid,
     messageId: h.messageId,
+    inReplyTo: h.inReplyTo ?? '',
     fromEmail: h.from[0]?.address?.toLowerCase() ?? '',
     fromName: h.from[0]?.name ?? '',
     subject: h.subject ?? '',
@@ -461,6 +465,10 @@ interface IndexCache {
   dateMs: number[];
   // Recency threshold: records with dateMs >= this get the recency boost.
   recencyThresholdMs: number;
+  // Thread graph (v2.7.0-p3): messageId -> record index, and parent-messageId ->
+  // child record indices (from inReplyTo). Empty strings are never keyed.
+  byMessageId: Map<string, number>;
+  childrenOf: Map<string, number[]>;
 }
 
 let cache: IndexCache | null = null;
@@ -500,6 +508,8 @@ function buildCache(): IndexCache {
   const senderTokens: Set<string>[] = [];
   const dateMs: number[] = [];
   const validDates: number[] = [];
+  const byMessageId = new Map<string, number>();
+  const childrenOf = new Map<string, number[]>();
 
   for (let i = 0; i < records.length; i++) {
     const r = records[i];
@@ -513,6 +523,13 @@ function buildCache(): IndexCache {
 
     for (const t of sTok) addToInverted(inverted, t, i);
     for (const t of fromTok) addToInverted(inverted, t, i);
+
+    if (r.messageId) byMessageId.set(r.messageId, i);
+    const irt = r.inReplyTo;
+    if (irt) {
+      const kids = childrenOf.get(irt);
+      if (kids) kids.push(i); else childrenOf.set(irt, [i]);
+    }
 
     const ms = r.date ? new Date(r.date).getTime() : NaN;
     dateMs.push(ms);
@@ -536,6 +553,8 @@ function buildCache(): IndexCache {
     senderTokens,
     dateMs,
     recencyThresholdMs,
+    byMessageId,
+    childrenOf,
   };
 }
 
@@ -561,6 +580,8 @@ function getCache(): IndexCache {
       senderTokens: [],
       dateMs: [],
       recencyThresholdMs: Number.POSITIVE_INFINITY,
+      byMessageId: new Map(),
+      childrenOf: new Map(),
     };
     return cache;
   }
@@ -727,25 +748,55 @@ function dateCompareDesc(a: string, b: string): number {
   return vb - va;
 }
 
-// getThread: pick the best searchFast hit, compute its normalized subject, and
-// return every record in the SAME folder whose normalized subject matches,
-// sorted by date ascending (chronological thread order). Score is a recency
-// rank so the caller can still surface the newest message. Empty if no hit.
+// getThread: assemble the thread containing the best searchFast hit. Two
+// complementary signals are UNION-ed:
+//   1. Message-ID graph (cross-folder, precise) -- BFS over In-Reply-To links,
+//      walking both to the parent (this.inReplyTo -> a messageId) and to
+//      children (records whose inReplyTo == this.messageId). This catches
+//      renamed-subject replies and threads split across INBOX/Sent.
+//   2. Normalized-subject grouping IN THE SEED'S FOLDER (the prior behaviour) --
+//      catches same-folder Re:/Fwd: variants that carry no In-Reply-To and
+//      keeps working on indexes built before inReplyTo was captured.
+// Result is sorted ascending by date (chronological). On overflow the NEWEST
+// `limit` messages are kept. Score is the chronological rank (newest highest).
 export function getThread(query: string, opts?: { folder?: string; limit?: number }): SearchHit[] {
+  const c = getCache();
   const top = searchFast(query, { folder: opts?.folder, limit: 1 });
   if (top.length === 0) return [];
   const seed = top[0].record;
-  const target = normalizeSubject(seed.subject);
   const limit = clampLimit(opts?.limit);
 
-  const c = getCache();
-  const members: IndexRecord[] = [];
-  for (const r of c.records) {
-    if (r.folder !== seed.folder) continue;
-    if (normalizeSubject(r.subject) !== target) continue;
-    members.push(r);
+  const memberIdx = new Set<number>();
+  // 1. Message-ID graph BFS over actual In-Reply-To EDGES only: a node links to
+  //    its parent (the record whose messageId == this.inReplyTo) and to its
+  //    children (records whose inReplyTo == this.messageId). We deliberately do
+  //    NOT treat a shared messageId as a link -- malformed/duplicate Message-IDs
+  //    must not collapse unrelated mail into one thread.
+  const stack: number[] = [];
+  const seedIdx = c.records.indexOf(seed);
+  if (seedIdx >= 0) { memberIdx.add(seedIdx); stack.push(seedIdx); }
+  const visit = (i: number | undefined): void => {
+    if (i === undefined || i < 0 || memberIdx.has(i)) return;
+    memberIdx.add(i);
+    stack.push(i);
+  };
+  while (stack.length > 0) {
+    const r = c.records[stack.pop()!];
+    if (r.inReplyTo) visit(c.byMessageId.get(r.inReplyTo));   // parent edge
+    if (r.messageId) {                                         // child edges
+      const kids = c.childrenOf.get(r.messageId);
+      if (kids) for (const k of kids) visit(k);
+    }
   }
 
+  // 2. Same-folder normalized-subject fallback (always unioned).
+  const target = normalizeSubject(seed.subject);
+  for (let i = 0; i < c.records.length; i++) {
+    const r = c.records[i];
+    if (r.folder === seed.folder && normalizeSubject(r.subject) === target) memberIdx.add(i);
+  }
+
+  const members: IndexRecord[] = [...memberIdx].map(i => c.records[i]);
   members.sort((a, b) => -dateCompareDesc(a.date, b.date)); // ascending by date.
 
   // When a thread is longer than the limit, keep the NEWEST messages (the tail
