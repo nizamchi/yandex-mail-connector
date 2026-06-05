@@ -1,6 +1,6 @@
 {
   "name": "yandex-mail-mcp-desktop",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "description": "MCP server for Yandex Mail — Claude Desktop (stdio)",
   "main": "dist/index.js",
   "bin": {
