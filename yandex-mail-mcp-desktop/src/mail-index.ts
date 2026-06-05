@@ -72,6 +72,7 @@ export interface FolderStatus {
   uidValidity: number;
   uidNext: number;
   lastSyncMs: number;
+  schema: number;
 }
 
 export interface IndexStatus {
@@ -80,6 +81,10 @@ export interface IndexStatus {
   folders: FolderStatus[];
   totalCount: number;
   indexPath: string;
+  // True once every indexed folder carries In-Reply-To links (schema >= 2).
+  // False on a pre-threading index -> getThread falls back to subject grouping
+  // until the next `index update` auto-rebuilds.
+  threadingReady: boolean;
 }
 
 // Dependency injection so tests do not need a live IMAP server. The default
@@ -96,6 +101,11 @@ interface FolderMeta {
   uidNext: number;
   count: number;
   lastSyncMs: number;
+  // Index schema the folder's records were written under. 1 = pre-threading
+  // (no inReplyTo captured); 2 = inReplyTo present. A folder below the current
+  // schema is auto-rebuilt on the next `index update`, so threading links
+  // appear without the user having to know to run a full `index build`.
+  schema: number;
 }
 
 interface MetaFile {
@@ -107,6 +117,10 @@ interface MetaFile {
 // ── Constants ─────────────────────────────────────────────────────────
 
 const META_VERSION = 1 as const;
+// Index content schema (distinct from META_VERSION, the file format). Bumped
+// when a build captures new per-record fields: 2 added inReplyTo (v2.7.0-p3).
+// Folders stamped below this are re-streamed on the next incremental update.
+const INDEX_SCHEMA = 2;
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MIN_TOKEN_LEN = 2;
@@ -219,6 +233,9 @@ function loadMeta(): MetaFile {
         uidNext: Number(r['uidNext']) || 0,
         count: Number(r['count']) || 0,
         lastSyncMs: Number(r['lastSyncMs']) || 0,
+        // Absent on indexes built before schema tracking -> treat as schema 1
+        // (pre-threading) so the next update re-streams to capture inReplyTo.
+        schema: Number(r['schema']) || 1,
       };
     }
     return {
@@ -297,6 +314,7 @@ export function getIndexStatus(): IndexStatus {
     uidValidity: m.uidValidity,
     uidNext: m.uidNext,
     lastSyncMs: m.lastSyncMs,
+    schema: m.schema,
   }));
   const totalCount = folders.reduce((sum, f) => sum + f.count, 0);
   return {
@@ -305,6 +323,7 @@ export function getIndexStatus(): IndexStatus {
     folders,
     totalCount,
     indexPath: indexDir(),
+    threadingReady: folders.length >= 1 && folders.every(f => f.schema >= INDEX_SCHEMA),
   };
 }
 
@@ -341,9 +360,10 @@ export async function buildIndex(
       uidNext: cursor.uidNext,
       count,
       lastSyncMs: Date.now(),
+      schema: INDEX_SCHEMA,
     };
     meta.folders[folder] = m;
-    result.push({ folder, count, uidValidity: m.uidValidity, uidNext: m.uidNext, lastSyncMs: m.lastSyncMs });
+    result.push({ folder, count, uidValidity: m.uidValidity, uidNext: m.uidNext, lastSyncMs: m.lastSyncMs, schema: m.schema });
   }
 
   rewriteEnvelopes(records);
@@ -373,7 +393,10 @@ export async function updateIndex(
     const cursor = await src.getCursor(folder);
     cursors.set(folder, cursor);
     const stored = meta.folders[folder];
-    if (!stored || stored.uidValidity !== cursor.uidValidity) {
+    // Rebuild on: never indexed, server renumbered (uidValidity), OR the stored
+    // records predate the current index schema (auto-migration -- e.g. capturing
+    // inReplyTo for threading without the user running a manual `index build`).
+    if (!stored || stored.uidValidity !== cursor.uidValidity || stored.schema < INDEX_SCHEMA) {
       toRebuild.push(folder);
     } else {
       toAppend.push(folder);
@@ -420,9 +443,10 @@ export async function updateIndex(
         uidNext: cursor.uidNext,
         count: stored.count + newCount,
         lastSyncMs: Date.now(),
+        schema: INDEX_SCHEMA,
       };
       meta.folders[folder] = m;
-      result.push({ folder, count: m.count, uidValidity: m.uidValidity, uidNext: m.uidNext, lastSyncMs: m.lastSyncMs });
+      result.push({ folder, count: m.count, uidValidity: m.uidValidity, uidNext: m.uidNext, lastSyncMs: m.lastSyncMs, schema: m.schema });
     }
 
     rewriteEnvelopes(records);

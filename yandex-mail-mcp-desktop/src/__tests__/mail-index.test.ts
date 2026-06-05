@@ -20,6 +20,7 @@ import {
   getIndexStatus,
   searchFast,
   getThread,
+  getIndexDir,
   _resetForTests,
   type EnvelopeSource,
 } from '../mail-index.js';
@@ -551,4 +552,40 @@ test('T29: subject fallback stays folder-scoped (no cross-folder false grouping)
   const thread = getThread('отчёт');
   assert.equal(thread.length, 1, 'only the seed folder match; no graph link to Sent');
   assert.equal(thread[0].record.messageId, '<i@x>');
+}));
+
+// ── v2.7.1: index schema auto-migration (threading without manual rebuild) ──
+
+test('T30: a fresh build is threading-ready (folder schema == current)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 1 })], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const status = getIndexStatus();
+  assert.equal(status.threadingReady, true);
+  assert.ok(status.folders[0].schema >= 2, 'folder stamped with the threading schema');
+}));
+
+test('T31: a pre-threading (schema 1) folder is auto-rebuilt on update', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<p1@x>', subject: 'Проект' }),
+    hdr({ uid: 2, messageId: '<p2@x>', inReplyTo: '<p1@x>', subject: 'разное' }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+
+  // Simulate an index built before schema tracking: downgrade the stored schema.
+  const metaP = path.join(getIndexDir(), 'meta.json');
+  const meta = JSON.parse(fs.readFileSync(metaP, 'utf-8'));
+  meta.folders['INBOX'].schema = 1;
+  fs.writeFileSync(metaP, JSON.stringify(meta));
+  _resetForTests();
+
+  assert.equal(getIndexStatus().threadingReady, false, 'schema 1 -> not threading-ready');
+
+  // uidValidity is unchanged (100), so only the schema gap should force a rebuild.
+  const r = await updateIndex(['INBOX'], src);
+  assert.ok(r.added >= 2, 'stale-schema folder is re-streamed, not incrementally appended');
+  assert.equal(getIndexStatus().threadingReady, true, 'auto-migration restores threading');
 }));

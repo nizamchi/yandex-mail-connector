@@ -14,6 +14,13 @@ function printStatus(): void {
   process.stdout.write(`  account:  ${s.account}\n`);
   process.stdout.write(`  location: ${s.indexPath}\n`);
   process.stdout.write(`  total:    ${s.totalCount} messages across ${s.folders.length} folder(s)\n`);
+  if (s.exists) {
+    process.stdout.write(
+      `  threads:  ${s.threadingReady
+        ? 'ready (In-Reply-To links present)'
+        : 'subject-only -- run `index update` to add Message-ID links'}\n`,
+    );
+  }
   for (const f of s.folders) {
     const when = f.lastSyncMs ? new Date(f.lastSyncMs).toISOString() : 'never';
     process.stdout.write(`    - ${f.folder}: ${f.count} msg (uidNext=${f.uidNext}, synced ${when})\n`);
