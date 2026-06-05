@@ -582,7 +582,9 @@ test('T-B3-NO-AWAIT-01: confirm.ts verifyCode body has 0 await tokens (B-3 invar
   const startIdx = startMatch!.index!;
   // Walk lines from startIdx until we hit a top-level closing `}` (a line beginning with `}` at column 0).
   const tail = src!.slice(startIdx);
-  const endRe = /\n\}\n/;
+  // CRLF-tolerant: on Windows checkouts confirm.ts has \r\n line endings, so a
+  // bare /\n\}\n/ never matches the closing-brace line ("}\r\n").
+  const endRe = /\r?\n\}\r?\n/;
   const endMatch = tail.match(endRe);
   assert.ok(endMatch !== null, 'verifyCode closing brace not found');
   const body = tail.slice(0, endMatch!.index! + endMatch![0]!.length);
