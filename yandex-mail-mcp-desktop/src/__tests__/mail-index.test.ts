@@ -664,7 +664,45 @@ test('T34: a count drift from a prior bug self-heals on the next update', withTe
   // drift (99 != 2) and rebuilds to the true count.
   const res = await updateIndex(['INBOX'], src);
   assert.equal(res.errors.length, 0);
+  assert.equal(res.added, 2, 'reconcile re-streams the whole folder (a no-op append would add 0)');
   assert.equal(getIndexStatus().totalCount, 2, 'drifted count is corrected to the measured value');
+}));
+
+test('T39: EXISTS exceeding the streamed count converges (no perpetual rebuild)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 1 }), hdr({ uid: 2 }), hdr({ uid: 3 })], 100);
+  // The server's EXISTS reports 4 though only 3 messages stream -- e.g. an
+  // in-flight delivery between the cursor and stream IMAP sessions, or a
+  // deleted-not-expunged message. count tracks EXISTS, so the index converges
+  // instead of rebuilding on every run.
+  src.setExists('INBOX', 4);
+  await buildIndex(['INBOX'], src);
+
+  const r1 = await updateIndex(['INBOX'], src);
+  const r2 = await updateIndex(['INBOX'], src);
+  assert.equal(r1.added, 0, 'first update is a no-op append, not a rebuild');
+  assert.equal(r2.added, 0, 'second update is STILL a no-op -- convergence, no perpetual rebuild');
+  assert.equal(r1.errors.length, 0);
+  assert.equal(r2.errors.length, 0);
+}));
+
+test('T40: updateIndex syncs healthy folders even when one fails mid-run', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 1, subject: 'inbox alpha' })], 100);
+  src.setFolder('Sent', [hdr({ uid: 1, subject: 'sentinel marker' })], 100);
+  await buildIndex(['INBOX', 'Sent'], src);
+  _resetForTests();
+
+  // New INBOX mail arrives (distinct token 'zebra'); Sent's cursor now fails.
+  src.setFolder('INBOX', [hdr({ uid: 1, subject: 'inbox alpha' }), hdr({ uid: 2, subject: 'zebra arrival' })], 100);
+  src.failOn('Sent');
+
+  const res = await updateIndex(['INBOX', 'Sent'], src);
+  assert.equal(res.errors.length, 1, 'the failing folder is surfaced');
+  assert.equal(res.errors[0].folder, 'Sent');
+  _resetForTests();
+  assert.equal(searchFast('zebra').length, 1, 'INBOX still synced its new message');
+  assert.equal(searchFast('sentinel').length, 1, 'Sent records preserved (untouched on failure)');
 }));
 
 // ── v2.8.0 (L2-B): multi-account read isolation ─────────────────────────────

@@ -405,19 +405,26 @@ export async function buildIndex(
       // folder rather than committing half of it.
       const fresh: IndexRecord[] = [];
       for await (const h of src.stream(folder)) fresh.push(toRecord(account, folder, h));
-      const count = fresh.length;
+      const streamed = fresh.length;
       freshByFolder.set(folder, fresh);
       succeeded.add(folder);
-      added += count;
+      added += streamed;
+      // count := the server's EXISTS, the SAME authoritative number updateIndex's
+      // reconcile compares against -- this guarantees convergence. Stamping the
+      // streamed length instead would let a folder reconcile-rebuild on EVERY run
+      // whenever EXISTS exceeds what SEARCH ALL streamed (an in-flight delivery
+      // between the cursor and stream IMAP sessions, or a non-standard server).
+      // Normally EXISTS == streamed, so this is the measured count; in the rare
+      // divergent case it tracks the server and the folder still converges.
       const m: FolderMeta = {
         uidValidity: cursor.uidValidity,
         uidNext: cursor.uidNext,
-        count,
+        count: cursor.exists,
         lastSyncMs: Date.now(),
         schema: INDEX_SCHEMA,
       };
       meta.folders[folder] = m;
-      result.push({ folder, count, uidValidity: m.uidValidity, uidNext: m.uidNext, lastSyncMs: m.lastSyncMs, schema: m.schema });
+      result.push({ folder, count: m.count, uidValidity: m.uidValidity, uidNext: m.uidNext, lastSyncMs: m.lastSyncMs, schema: m.schema });
     } catch (e) {
       errors.push({ folder, error: errMessage(e) });
     }
@@ -510,6 +517,11 @@ export async function updateIndex(
         // If our (stored.count + appended) disagrees, messages were deleted or
         // the stored count had drifted -- the append path can only add, so hand
         // the folder to a full rebuild that measures the true count.
+        // Known limitation: if exactly as many messages are expunged as arrive in
+        // the same interval, EXISTS is unchanged and the stale (expunged) record
+        // is not detected until the next count-changing event or a uidValidity
+        // bump. Perfect detection would require diffing the full UID list every
+        // run (expensive); the count heuristic covers the common cases.
         const expected = stored.count + newCount;
         if (expected !== cursor.exists) {
           reconcile.push(folder);

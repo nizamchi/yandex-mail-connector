@@ -130,8 +130,11 @@ function capLen(s: string, max: number): string {
 
 function fitRows<T>(rows: T[], budget: number): { rows: T[]; truncated: boolean } {
   if (JSON.stringify(rows).length <= budget) return { rows, truncated: false };
+  // Keep at least one row even if it alone exceeds the budget, so a caller never
+  // gets an empty page while `total` reports matches (better an oversized single
+  // result than a silent "nothing found").
   const kept = rows.slice();
-  while (kept.length > 0 && JSON.stringify(kept).length > budget) kept.pop();
+  while (kept.length > 1 && JSON.stringify(kept).length > budget) kept.pop();
   return { rows: kept, truncated: true };
 }
 
@@ -1351,7 +1354,12 @@ Output: { index_built, total (полное число совпадений), ret
           `${off + i + 1}. [${r.folder}#${r.uid}] ${sanitizeForDisplay(r.subject) || '(без темы)'} — ${sanitizeForDisplay(r.from)}, ${r.date.slice(0, 10)} (релевантность ${r.score})`,
         );
         const shownEnd = off + rows.length;
-        const more = total > shownEnd ? `\n\n…показаны ${off + 1}–${shownEnd} из ${total}. Для следующей страницы: offset=${shownEnd}.` : '';
+        // Pagination hint: when the page was size-trimmed (truncated), advancing
+        // offset would skip the dropped rows -- tell the caller to narrow instead.
+        // Otherwise rows.length is the true page size and offset advances cleanly.
+        const more = truncated
+          ? '\n\n…страница обрезана по размеру результата; сузь запрос или уменьши limit.'
+          : (total > shownEnd ? `\n\n…показаны ${off + 1}–${shownEnd} из ${total}. Следующая страница: offset=${shownEnd}.` : '');
         return { content: [{ type: 'text', text: `Найдено ${total} (локальный индекс):\n\n${lines.join('\n')}${more}` }], structuredContent: out };
       } catch (e) { return errorResult(e); }
     },
