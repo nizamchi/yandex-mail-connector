@@ -1007,9 +1007,33 @@ export function getThread(query: string, opts?: { folder?: string; limit?: numbe
 
 // ── Public: unanswered threads ────────────────────────────────────────
 
+// Local-parts that almost always indicate automated/no-reply senders. A tiny
+// HARDCODED set keeps this Layer 2 (a user-editable list would be Layer 4).
+// Matched against the local-part of latest.fromEmail (before '@'), lowercased.
+const NO_REPLY_LOCALPARTS = new Set([
+  'noreply', 'no-reply', 'no_reply',
+  'donotreply', 'do-not-reply',
+  'notifications', 'notification',
+  'mailer-daemon', 'mailer',
+  'newsletter', 'newsletters',
+  'digest', 'bounce', 'postmaster',
+]);
+
+function looksAutomated(fromEmail: string): boolean {
+  const at = fromEmail.indexOf('@');
+  const local = (at >= 0 ? fromEmail.slice(0, at) : fromEmail).toLowerCase();
+  if (NO_REPLY_LOCALPARTS.has(local)) return true;
+  if (local.startsWith('noreply') || local.startsWith('no-reply') || local.startsWith('donotreply')) return true;
+  if (local.includes('notification') || local.includes('newsletter')) return true;
+  return false;
+}
+
 export interface UnansweredHit {
   record: IndexRecord;
   daysWaiting: number;
+  tier: 'reply_likely' | 'normal' | 'fyi_likely';
+  reasons: string[];
+  priority: number;
 }
 
 export interface UnansweredPage {
@@ -1175,11 +1199,46 @@ export function unansweredThreads(opts?: {
       if (!emailMatch && !nameMatch) continue;
     }
 
-    candidates.push({ record: latest, daysWaiting: ageDays });
+    // Step 6b: compute confidence signals from component records and `latest`.
+    // All signals use data ALREADY on IndexRecord -- no new IMAP fetch needed.
+
+    // participated: owner authored an earlier message in this thread.
+    // (By construction latest.fromEmail !== owner, so an owner record = earlier msg.)
+    let participated = false;
+    let flaggedInThread = false;
+    for (const p of positions) {
+      const r = c.records[accountIdx[p]];
+      if (r.fromEmail === owner) participated = true;
+      if (r.flagged) flaggedInThread = true;
+    }
+    const readByMe = latest.seen === true;
+    const automated = looksAutomated(latest.fromEmail);
+
+    const priority =
+      (flaggedInThread ? 3 : 0) +
+      (participated    ? 2 : 0) +
+      (readByMe        ? 0.5 : 0) +
+      (automated       ? -3 : 0);
+
+    const tier: UnansweredHit['tier'] =
+      priority >= 2 ? 'reply_likely' :
+      priority < 0  ? 'fyi_likely'   :
+      'normal';
+
+    const reasons: string[] = [];
+    if (flaggedInThread) reasons.push('отмечено флажком');        // 'отмечено флажком'
+    if (participated)   reasons.push('вы уже писали в этой переписке'); // 'вы уже писали в этой переписке'
+    if (readByMe)       reasons.push('прочитано, но без ответа');                               // 'прочитано, но без ответа'
+    if (automated)      reasons.push('похоже на авто-уведомление');             // 'похоже на авто-уведомление'
+
+    candidates.push({ record: latest, daysWaiting: ageDays, tier, reasons, priority });
   }
 
-  // Step 7: sort OLDEST-INBOUND FIRST (most overdue at top): ascending by date.
+  // Step 7: PRIMARY priority DESC (highest confidence first),
+  // SECONDARY date ASC (most overdue within the same tier first).
+  // Nothing is hidden -- every candidate survives; only order changes.
   candidates.sort((a, b) => {
+    if (b.priority !== a.priority) return b.priority - a.priority;
     const ma = a.record.date ? new Date(a.record.date).getTime() : -Infinity;
     const mb = b.record.date ? new Date(b.record.date).getTime() : -Infinity;
     return ma - mb;

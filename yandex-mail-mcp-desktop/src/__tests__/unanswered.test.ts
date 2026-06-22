@@ -325,3 +325,212 @@ test('U8: oldest-first ordering and offset/limit pagination', withTempStateDir(a
   assert.equal(beyond.total, 5, 'total stable even beyond end');
   assert.equal(beyond.hits.length, 0);
 }));
+
+// T-flagged: a flagged inbound vs a plain inbound of the SAME age.
+// Flagged thread must have tier='reply_likely' and sort FIRST.
+test('T-flagged: flagged inbound sorts above plain inbound of same age', withTempStateDir(async () => {
+  _setAccountForTests('you@yandex.ru');
+  const src = new FakeSource();
+  const nowMs = new Date('2026-06-22T00:00:00.000Z').getTime();
+  const sharedDate = '2026-06-01T00:00:00.000Z'; // 21 days ago
+
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<plain@example.com>', subject: 'Plain thread',
+          from: [{ address: 'alice@example.com', name: 'Alice' }],
+          date: sharedDate, flagged: false }),
+    hdr({ uid: 2, messageId: '<flagged@example.com>', subject: 'Flagged thread',
+          from: [{ address: 'bob@example.com', name: 'Bob' }],
+          date: sharedDate, flagged: true }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const page = unansweredThreads({ olderThanDays: 7, nowMs });
+  assert.equal(page.total, 2, 'both threads present');
+
+  const flaggedHit = page.hits.find(h => h.record.uid === 2);
+  assert.ok(flaggedHit, 'flagged thread returned');
+  assert.equal(flaggedHit!.tier, 'reply_likely', 'flagged -> reply_likely');
+
+  // Flagged sorts first (higher priority).
+  assert.equal(page.hits[0].record.uid, 2, 'flagged thread is first');
+  assert.equal(page.hits[1].record.uid, 1, 'plain thread is second');
+}));
+
+// T-participation: a thread where the owner sent an earlier message but the latest
+// is inbound -> tier='reply_likely', reasons includes participation reason, sorts
+// above a no-history inbound of the same age.
+test('T-participation: thread with owner earlier message sorts above no-history inbound', withTempStateDir(async () => {
+  _setAccountForTests('you@yandex.ru');
+  const src = new FakeSource();
+  const nowMs = new Date('2026-06-22T00:00:00.000Z').getTime();
+
+  // Thread A: owner wrote earlier (message in Sent), then alice replied (latest inbound).
+  // Thread B: plain inbound, no owner history, same date as Thread A's latest.
+  // Both in INBOX in a single setFolder call to avoid overwriting.
+  src.setFolder('INBOX', [
+    hdr({ uid: 10, messageId: '<a-initial@example.com>', subject: 'Discussion A',
+          from: [{ address: 'alice@example.com', name: 'Alice' }],
+          date: '2026-06-01T08:00:00.000Z' }),
+    hdr({ uid: 12, messageId: '<a-reply-alice@example.com>', inReplyTo: '<a-owner@example.com>',
+          subject: 'Re: Discussion A',
+          from: [{ address: 'alice@example.com', name: 'Alice' }],
+          date: '2026-06-10T08:00:00.000Z' }), // latest inbound in Thread A
+    hdr({ uid: 20, messageId: '<b-only@example.com>', subject: 'Standalone B xyzq999',
+          from: [{ address: 'carol@example.com', name: 'Carol' }],
+          date: '2026-06-10T08:00:00.000Z' }), // Thread B: same date, no owner history
+  ], 100);
+  src.setFolder('Sent', [
+    hdr({ uid: 11, messageId: '<a-owner@example.com>', inReplyTo: '<a-initial@example.com>',
+          subject: 'Re: Discussion A',
+          from: [{ address: 'you@yandex.ru', name: 'You' }],
+          date: '2026-06-05T08:00:00.000Z' }), // owner's earlier reply -> participated
+  ], 200);
+
+  await buildIndex(['INBOX', 'Sent'], src);
+  _resetForTests();
+
+  const page = unansweredThreads({ olderThanDays: 7, nowMs });
+  assert.equal(page.total, 2, 'both threads present');
+
+  const threadA = page.hits.find(h => h.record.messageId === '<a-reply-alice@example.com>');
+  assert.ok(threadA, 'Thread A (participated) found');
+  assert.equal(threadA!.tier, 'reply_likely', 'participated thread -> reply_likely');
+  assert.ok(threadA!.reasons.some(r => r.includes('уже писали')), 'participation reason present');
+
+  // Thread A (participated) sorts before Thread B (no history), same date.
+  assert.equal(page.hits[0].record.messageId, '<a-reply-alice@example.com>', 'participated thread is first');
+}));
+
+// T-automated: sender 'noreply@bank.example' -> tier='fyi_likely', reasons includes
+// the automated reason, sorts BELOW a human inbound of the same age -- but is STILL
+// present (recall preserved).
+test('T-automated: noreply sender is fyi_likely and sorts below human sender; still present', withTempStateDir(async () => {
+  _setAccountForTests('you@yandex.ru');
+  const src = new FakeSource();
+  const nowMs = new Date('2026-06-22T00:00:00.000Z').getTime();
+  const sharedDate = '2026-06-01T00:00:00.000Z'; // 21 days ago
+
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<human@example.com>', subject: 'Human message',
+          from: [{ address: 'alice@example.com', name: 'Alice' }],
+          date: sharedDate }),
+    hdr({ uid: 2, messageId: '<auto@bank.example>', subject: 'Bank notification',
+          from: [{ address: 'noreply@bank.example', name: 'Bank' }],
+          date: sharedDate }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const page = unansweredThreads({ olderThanDays: 7, nowMs });
+  assert.equal(page.total, 2, 'both threads returned (recall preserved)');
+
+  const autoHit = page.hits.find(h => h.record.uid === 2);
+  assert.ok(autoHit, 'automated thread is still present in results');
+  assert.equal(autoHit!.tier, 'fyi_likely', 'noreply sender -> fyi_likely');
+  assert.ok(autoHit!.reasons.some(r => r.includes('авто')), 'automated reason present');
+
+  // Human sender sorts before automated sender (higher priority).
+  assert.equal(page.hits[0].record.uid, 1, 'human sender sorts first');
+  assert.equal(page.hits[1].record.uid, 2, 'automated sender sorts second but present');
+}));
+
+// T-recall-invariant: a mix of human + automated unanswered threads.
+// page.total must equal the total number of unanswered threads (nothing hidden).
+test('T-recall-invariant: total is identical with and without tiering -- nothing hidden', withTempStateDir(async () => {
+  _setAccountForTests('you@yandex.ru');
+  const src = new FakeSource();
+  const nowMs = new Date('2026-06-22T00:00:00.000Z').getTime();
+
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<h1@example.com>', subject: 'Human 1',
+          from: [{ address: 'alice@example.com', name: 'Alice' }],
+          date: '2026-06-01T00:00:00.000Z' }),
+    hdr({ uid: 2, messageId: '<h2@example.com>', subject: 'Human 2',
+          from: [{ address: 'bob@example.com', name: 'Bob' }],
+          date: '2026-06-02T00:00:00.000Z' }),
+    hdr({ uid: 3, messageId: '<auto1@mail.example>', subject: 'Newsletter 1',
+          from: [{ address: 'noreply@news.example', name: 'News' }],
+          date: '2026-06-03T00:00:00.000Z' }),
+    hdr({ uid: 4, messageId: '<auto2@mail.example>', subject: 'Newsletter 2',
+          from: [{ address: 'newsletter@updates.example', name: 'Updates' }],
+          date: '2026-06-04T00:00:00.000Z' }),
+    hdr({ uid: 5, messageId: '<h3@example.com>', subject: 'Human 3',
+          from: [{ address: 'carol@example.com', name: 'Carol' }],
+          date: '2026-06-05T00:00:00.000Z' }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const page = unansweredThreads({ olderThanDays: 7, nowMs });
+  // All 5 threads are unanswered and old enough.
+  assert.equal(page.total, 5, 'all 5 unanswered threads returned; nothing hidden by tiering');
+  assert.equal(page.hits.length, 5, 'all hits present in default page');
+
+  // Verify fyi_likely threads are still present.
+  const fyi = page.hits.filter(h => h.tier === 'fyi_likely');
+  assert.ok(fyi.length >= 2, 'fyi_likely hits present (automated senders not dropped)');
+}));
+
+// T-ordering: same age, four threads (flagged, participated, plain, automated).
+// Expected order: flagged, participated, plain, automated.
+test('T-ordering: flagged > participated > plain > automated (same age)', withTempStateDir(async () => {
+  _setAccountForTests('you@yandex.ru');
+  const src = new FakeSource();
+  const nowMs = new Date('2026-06-22T00:00:00.000Z').getTime();
+  const sharedDate = '2026-06-01T00:00:00.000Z';
+
+  // Thread P (participated): owner has earlier message, inbound is latest.
+  // Thread F (flagged): flagged inbound.
+  // Thread N (plain): normal inbound.
+  // Thread A (automated): noreply sender.
+  // All INBOX messages in one setFolder call (subsequent calls overwrite).
+  src.setFolder('INBOX', [
+    hdr({ uid: 10, messageId: '<p-initial@example.com>', subject: 'Participated thread pqrst',
+          from: [{ address: 'alice@example.com', name: 'Alice' }],
+          date: sharedDate }),
+    hdr({ uid: 12, messageId: '<p-alice-reply@example.com>', inReplyTo: '<p-owner@example.com>',
+          subject: 'Re: Participated thread pqrst',
+          from: [{ address: 'alice@example.com', name: 'Alice' }],
+          date: sharedDate }),
+    hdr({ uid: 20, messageId: '<f-msg@example.com>', subject: 'Flagged thread abcde',
+          from: [{ address: 'bob@example.com', name: 'Bob' }],
+          date: sharedDate, flagged: true }),
+    hdr({ uid: 30, messageId: '<n-msg@example.com>', subject: 'Plain thread mnopq',
+          from: [{ address: 'carol@example.com', name: 'Carol' }],
+          date: sharedDate }),
+    hdr({ uid: 40, messageId: '<a-msg@example.com>', subject: 'Automated thread vwxyz',
+          from: [{ address: 'noreply@bank.example', name: 'Bank' }],
+          date: sharedDate }),
+  ], 100);
+  src.setFolder('Sent', [
+    hdr({ uid: 11, messageId: '<p-owner@example.com>', inReplyTo: '<p-initial@example.com>',
+          subject: 'Re: Participated thread pqrst',
+          from: [{ address: 'you@yandex.ru', name: 'You' }],
+          date: sharedDate }),
+  ], 200);
+  await buildIndex(['INBOX', 'Sent'], src);
+  _resetForTests();
+
+  const page = unansweredThreads({ olderThanDays: 7, nowMs });
+
+  // We expect 4 unanswered threads (the owner's Sent message is not unanswered).
+  assert.equal(page.total, 4, '4 unanswered threads');
+
+  // Identify each hit by uid.
+  const uidOrder = page.hits.map(h => h.record.uid);
+
+  // flagged (uid=20) must come before participated (uid=12).
+  assert.ok(uidOrder.indexOf(20) < uidOrder.indexOf(12), 'flagged before participated');
+  // participated (uid=12) must come before plain (uid=30).
+  assert.ok(uidOrder.indexOf(12) < uidOrder.indexOf(30), 'participated before plain');
+  // plain (uid=30) must come before automated (uid=40).
+  assert.ok(uidOrder.indexOf(30) < uidOrder.indexOf(40), 'plain before automated');
+
+  // Verify tiers.
+  const hitByUid = (uid: number) => page.hits.find(h => h.record.uid === uid)!;
+  assert.equal(hitByUid(20).tier, 'reply_likely', 'flagged -> reply_likely');
+  assert.equal(hitByUid(12).tier, 'reply_likely', 'participated -> reply_likely');
+  assert.equal(hitByUid(30).tier, 'normal', 'plain -> normal');
+  assert.equal(hitByUid(40).tier, 'fyi_likely', 'automated -> fyi_likely');
+}));
