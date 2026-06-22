@@ -472,3 +472,51 @@ test('AM-h: AttachmentRecord shape -- all LD-7 fields present including denormal
   // sha256 MUST NOT be present (LD-7 / MR-1).
   assert.ok(!('sha256' in r), 'sha256 absent from AttachmentRecord');
 }));
+
+// (i) Crash self-heal: an orphan manifest row left by a prior run that crashed
+//     between rewriteAttachments (MR-4 manifest-first) and rewriteEnvelopes/persistMeta
+//     must NOT be duplicated when the append path re-streams the same uid. The append
+//     path must self-heal like buildIndex (manifest-side dedup on account|folder|uid|partId).
+test('AM-i: updateIndex append self-heals a crashed-run manifest orphan (no duplicate row)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  // cursor uidNext=2 -> buildIndex stamps meta uidNext=2, count=1 (the crashed-run meta state).
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<m1@ex>', hasAttachments: true,
+      attachments: [ att({ filename: 'first.pdf', partId: '1' }) ],
+    }),
+  ], 100, 2);
+
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // Simulate the crash: a prior append already wrote uid 2's attachment row to the
+  // manifest, then crashed before rewriteEnvelopes/persistMeta -- so the envelope and
+  // meta were never advanced. Inject the orphan row directly (clone base for a matching
+  // account so the dedup key aligns with what updateIndex will compute).
+  const dir = getIndexDir();
+  const manifestPath = path.join(dir, 'attachments.jsonl');
+  const base = JSON.parse(fs.readFileSync(manifestPath, 'utf-8').split('\n').filter(l => l.trim())[0]);
+  const orphan = { ...base, uid: 2, messageId: '<m2@ex>', filename: 'second.pdf', partId: '1', size: 9999 };
+  fs.appendFileSync(manifestPath, JSON.stringify(orphan) + '\n');
+  assert.equal(readManifestRows(dir).length, 2, 'precondition: uid-1 row + injected uid-2 orphan');
+
+  // The server now genuinely has uid 2 (uidNext -> 3); the append path re-streams uid 2
+  // because stored.uidNext is still 2 (meta never advanced in the crashed run).
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<m1@ex>', hasAttachments: true,
+      attachments: [ att({ filename: 'first.pdf', partId: '1' }) ],
+    }),
+    hdr({ uid: 2, messageId: '<m2@ex>', hasAttachments: true,
+      attachments: [ att({ filename: 'second.pdf', partId: '1', size: 9999 }) ],
+    }),
+  ], 100, 3);
+
+  const res = await updateIndex(['INBOX'], src);
+  assert.equal(res.errors.length, 0, 'no errors on the self-heal append');
+  _resetForTests();
+
+  const rows = readManifestRows(dir);
+  const uid2Rows = rows.filter((r: { uid: number }) => r.uid === 2);
+  assert.equal(uid2Rows.length, 1, 'uid 2 has exactly ONE manifest row -- the crashed orphan was NOT duplicated');
+  assert.equal(rows.length, 2, 'total 2 rows: uid 1 + the single (deduped) uid 2');
+}));

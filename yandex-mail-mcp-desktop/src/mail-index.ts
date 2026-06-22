@@ -648,6 +648,15 @@ export async function updateIndex(
     const attachments = loadAllAttachments();
     const existing = new Set<string>();
     for (const r of records) existing.add(dedupKey(r.account, r.folder, r.uid));
+    // Manifest-side dedup so the append path is self-healing like buildIndex. If a
+    // prior run crashed AFTER rewriteAttachments but BEFORE rewriteEnvelopes/persistMeta
+    // (MR-4 manifest-first order), the orphan attachment row already sits in
+    // `attachments`; the envelope existing-Set cannot catch it (the envelope was never
+    // written, so the message is re-streamed), and without this Set the re-stream would
+    // push a DUPLICATE manifest row that survives until a full rebuild. Key on
+    // (account, folder, uid, partId) -- one row per attachment part.
+    const existingAtt = new Set<string>();
+    for (const a of attachments) existingAtt.add(a.account + '|' + a.folder + '|' + a.uid + '|' + a.partId);
 
     for (const folder of toAppend) {
       try {
@@ -669,6 +678,9 @@ export async function updateIndex(
           // a new attachment-carrying email would appear in the envelope index
           // but be invisible in the manifest until a full rebuild.
           for (const a of h.attachments ?? []) {
+            const ak = account + '|' + folder + '|' + h.uid + '|' + a.partId;
+            if (existingAtt.has(ak)) continue; // self-heal a crashed-run orphan (no dup row)
+            existingAtt.add(ak);
             attachments.push(toAttachmentRecord(account, folder, h, a));
           }
           newCount++;
