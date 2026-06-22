@@ -31,7 +31,7 @@
 </head>
 <body>
 <h1>Yandex Mail MCP — инструменты</h1>
-<div class="meta">Версия <b>v2.8.0</b> &nbsp;·&nbsp; 18 инструментов &nbsp;·&nbsp; <b>L0</b> 13 &nbsp;·&nbsp; <b>L1</b> 4 &nbsp;·&nbsp; <b>L2</b> 1 &nbsp;·&nbsp; <span title="Сгенерировано из src/tools.ts">авто-генерация</span></div>
+<div class="meta">Версия <b>v2.8.0</b> &nbsp;·&nbsp; 19 инструментов &nbsp;·&nbsp; <b>L0</b> 14 &nbsp;·&nbsp; <b>L1</b> 4 &nbsp;·&nbsp; <b>L2</b> 1 &nbsp;·&nbsp; <span title="Сгенерировано из src/tools.ts">авто-генерация</span></div>
 <table>
   <thead>
     <tr>
@@ -133,6 +133,13 @@
       <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
       <td class="rw">✓</td>
       <td class="desc">Собирает цепочку (тред) по локальному индексу: находит лучшее совпадение и связывает пи…</td>
+    </tr>
+    <tr>
+      <td><code>yandex_unanswered</code></td>
+      <td>Без ответа (неотвеченные)</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc">Список полученных тредов, где последнее письмо — от другого человека и старше N дней. Работает по локальному индексу, группирует треды между папками.</td>
     </tr>
     <tr>
       <td><code>yandex_mark_email</code></td>

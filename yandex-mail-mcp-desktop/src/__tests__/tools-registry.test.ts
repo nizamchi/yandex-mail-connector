@@ -11,13 +11,14 @@ function wouldRegister(tools: ToolDef[], authLevel: AuthLevel): ToolDef[] {
   return tools.filter(t => authLevel >= t.requires.authLevel);
 }
 
-test('TOOLS is a non-empty array of length 18', () => {
+test('TOOLS is a non-empty array of length 19', () => {
   // 10 v1 tools + 1 v2 trust_address (Phase 5) + 1 v2.1.4 yandex_health_check
   // + 1 v2.3.0 yandex_stats + 1 v2.4.0 yandex_find_sender
   // + 2 v2.5.0 (yandex_count + yandex_folder_peek)
-  // + 2 v2.6.0 (yandex_search_fast + yandex_get_thread).
+  // + 2 v2.6.0 (yandex_search_fast + yandex_get_thread)
+  // + 1 v2.8.0 k20 (yandex_unanswered).
   assert.ok(Array.isArray(TOOLS));
-  assert.equal(TOOLS.length, 18, `expected 18 tools, got ${TOOLS.length}`);
+  assert.equal(TOOLS.length, 19, `expected 19 tools, got ${TOOLS.length}`);
 });
 
 test('every tool name starts with yandex_', () => {
@@ -35,13 +36,13 @@ test('all requires.authLevel are in {0,1,2,3}', () => {
 
 test('registration counts per level', () => {
   // L0 = 6 v1 read-only + health_check + stats + find_sender + count + folder_peek
-  //      + search_fast + get_thread = 13.
-  // L1 = 13 + (mark, move, delete, trust_address) = 17.
-  // L2/L3 = +send_email = 18.
-  assert.equal(wouldRegister(TOOLS, 0).length, 13, 'L0 must expose 13 read-tools');
-  assert.equal(wouldRegister(TOOLS, 1).length, 17, 'L1 must expose 17 tools');
-  assert.equal(wouldRegister(TOOLS, 2).length, 18, 'L2 must expose all 18 tools');
-  assert.equal(wouldRegister(TOOLS, 3).length, 18, 'L3 must expose all 18 tools');
+  //      + search_fast + get_thread + unanswered = 14.
+  // L1 = 14 + (mark, move, delete, trust_address) = 18.
+  // L2/L3 = +send_email = 19.
+  assert.equal(wouldRegister(TOOLS, 0).length, 14, 'L0 must expose 14 read-tools');
+  assert.equal(wouldRegister(TOOLS, 1).length, 18, 'L1 must expose 18 tools');
+  assert.equal(wouldRegister(TOOLS, 2).length, 19, 'L2 must expose all 19 tools');
+  assert.equal(wouldRegister(TOOLS, 3).length, 19, 'L3 must expose all 19 tools');
 });
 
 test('dummy authLevel=99 tool is NEVER registered (even at L3)', () => {
@@ -58,7 +59,7 @@ test('dummy authLevel=99 tool is NEVER registered (even at L3)', () => {
   };
   const extended = [...TOOLS, dummy];
   const visibleAtL3 = wouldRegister(extended, 3);
-  assert.equal(visibleAtL3.length, 18,
+  assert.equal(visibleAtL3.length, 19,
     'dummy with authLevel=99 must NOT be in L3 registration set');
   assert.ok(!visibleAtL3.some(t => t.name === 'yandex_dummy_forbidden'),
     'dummy must be filtered out by predicate');
@@ -128,6 +129,7 @@ test('authLevel matrix: send_email=2; mark/move/delete=1; rest=0', () => {
     'yandex_folder_peek',
     'yandex_search_fast',
     'yandex_get_thread',
+    'yandex_unanswered',
   ]) {
     assert.equal(byName.get(readTool)?.requires.authLevel, 0,
       `${readTool} must be L0`);
