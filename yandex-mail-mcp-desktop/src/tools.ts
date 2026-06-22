@@ -801,7 +801,7 @@ const TOOLS_RAW: ToolDef[] = [
     requires: { authLevel: 0 },
     handler: async (_params, ctx) => {
       const report: Record<string, unknown> = {
-        server_version: '2.8.0',
+        server_version: '2.9.0',
         auth_level: ctx.authLevel,
         capabilities: Array.from(ctx.capabilities),
         platform: process.platform,
@@ -1302,7 +1302,7 @@ Args:
   year / month / year_month / weekday / hour / date
   to_first / subject_prefix / subject_normalized
   size_bucket (<10KB / 10-100KB / 100KB-1MB / >1MB)
-  has_attachments (derived from BODYSTRUCTURE on the streaming fetch; reflects real values in v3.0.0+)
+  has_attachments (derived from BODYSTRUCTURE on the streaming fetch; reflects real values in v2.9.0+)
   flag_seen / flag_flagged
 Примеры:
   group_by=["sender"]              -- топ отправителей
@@ -1537,7 +1537,7 @@ Output: { index_built, owner_known, total, returned, offset, truncated,
     },
   },
 
-  // 6i. Attachment catalog search over the local manifest (L0) -- v3.0.0 Layer 3.
+  // 6i. Attachment catalog search over the local manifest (L0) -- v2.9.0 Layer 3.
   // Always registered; degrades gracefully (no IMAP, no error) when the manifest
   // has no rows. Reads attachments.jsonl only -- offline, account-isolated.
   {
@@ -1571,7 +1571,7 @@ Output: { manifest_built, total (число групп), returned, offset, trunc
         const { manifestBuilt, total, hits } = mailIndex.findAttachments(flt);
         if (!manifestBuilt) {
           // Two distinct hints: no index at all vs. an index whose manifest is
-          // empty (e.g. a pre-v3.0.0 index not yet re-streamed). Never isError,
+          // empty (e.g. a pre-v2.9.0 index not yet re-streamed). Never isError,
           // never IMAP.
           const hint = !mailIndex.indexExists()
             ? 'Каталог вложений пуст: сначала построй индекс — в терминале `yandex-mail-mcp index build`.'
@@ -1583,10 +1583,11 @@ Output: { manifest_built, total (число групп), returned, offset, trunc
         }
 
         const allRows = hits.map(h => {
-          // Re-sanitize EVERY structured field (filename + sender + subject):
-          // storage-time sanitization is not retroactive to older manifests, and
-          // sender fields were never sanitized at store -- filenames are the
-          // highest prompt-injection-risk attacker-controlled field.
+          // Re-sanitize EVERY attacker-influenced structured field (filename + sender
+          // + subject + mime_type): storage-time sanitization is not retroactive to
+          // older manifests, and sender/mime fields were never sanitized at store --
+          // filenames are the highest prompt-injection-risk field, but the MIME type
+          // is also attacker-supplied (Content-Type) and must not pass through raw.
           const fromStr = capLen(h.fromName ? `${h.fromName} <${h.fromEmail}>` : h.fromEmail, MAX_FROM_LEN);
           return {
             message_id: h.messageId,
@@ -1596,7 +1597,7 @@ Output: { manifest_built, total (число групп), returned, offset, trunc
             folder: h.folder,
             uid: h.uid,
             filename: sanitizeForDisplay(h.filename) || null,
-            mime_type: h.mimeType,
+            mime_type: sanitizeForDisplay(h.mimeType),
             size_kb: Number.isFinite(h.size) ? Math.round(h.size / 1024 * 10) / 10 : 0,
             part_id: h.partId,
             occurrence_count: h.occurrenceCount,
@@ -1607,7 +1608,7 @@ Output: { manifest_built, total (число групп), returned, offset, trunc
         const { rows, truncated } = fitRows(allRows, SEARCH_RESULT_BUDGET);
         const out = { manifest_built: true, total, returned: rows.length, offset: off, truncated, hits: rows };
         if (rows.length === 0) {
-          return { content: [{ type: 'text', text: `По заданным фильтрам вложений не найдено (всего групп в каталоге: ${total}).` }], structuredContent: out };
+          return { content: [{ type: 'text', text: `По заданным фильтрам вложений не найдено (совпадений по фильтрам: ${total}).` }], structuredContent: out };
         }
         const lines = rows.map((r, i) => {
           const dup = r.occurrence_count > 1 ? ` ×${r.occurrence_count}` : '';

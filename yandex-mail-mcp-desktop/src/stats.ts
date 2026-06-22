@@ -175,7 +175,7 @@ function bucketField(field: GroupByField, env: EnvelopeRow): string {
     case 'size_bucket':
       return bucketSize(env.size ?? 0);
     case 'has_attachments':
-      // Derived from BODYSTRUCTURE captured on the streaming fetch (v3.0.0+).
+      // Derived from BODYSTRUCTURE captured on the streaming fetch (v2.9.0+).
       // Reports the field as set by imap.ts parseHeader via extractAttachments.
       return env.hasAttachments ? 'yes' : 'no';
     case 'flag_seen':

@@ -49,7 +49,7 @@ export interface IndexRecord {
   flagged: boolean;
   size: number;
   // Whether the message carries attachments, derived from BODYSTRUCTURE. Added
-  // in schema 3 (v3.0.0). Pre-schema-3 records read from disk have this as
+  // in schema 3 (v2.9.0). Pre-schema-3 records read from disk have this as
   // undefined until auto-migrated; the ?? false default handles forward-compat.
   has_attachments: boolean;
 }
@@ -185,7 +185,7 @@ const META_VERSION = 1 as const;
 // when a build captures new per-record fields:
 //   1 = pre-threading (no inReplyTo)
 //   2 = inReplyTo present (v2.7.0-p3)
-//   3 = has_attachments (v3.0.0, derived from BODYSTRUCTURE on streamEnvelopes)
+//   3 = has_attachments (v2.9.0, derived from BODYSTRUCTURE on streamEnvelopes)
 // Folders stamped below INDEX_SCHEMA are re-streamed on the next incremental
 // update (auto-migration gate at updateIndex -- no manual `index build` needed).
 const INDEX_SCHEMA = 3;
@@ -1029,7 +1029,7 @@ function passesFilters(r: IndexRecord, ms: number, f?: SearchFilters): boolean {
   if (f.seen !== undefined && r.seen !== f.seen) return false;
   if (f.flagged !== undefined && r.flagged !== f.flagged) return false;
   // `?? false`, NOT strict ===: loadAllRecords raw-casts JSON, so a pre-schema-3
-  // (pre-v3.0.0) index carries has_attachments:undefined at read time. The ?? false
+  // (pre-v2.9.0) index carries has_attachments:undefined at read time. The ?? false
   // coercion treats those as "no attachments" rather than silently dropping them
   // from a has_attachments:false query; they self-heal on the next auto-migration.
   if (f.has_attachments !== undefined && (r.has_attachments ?? false) !== f.has_attachments) return false;
@@ -1276,19 +1276,27 @@ export function findAttachments(opts?: {
     const ms = c.dateMs[i];
     if (since !== undefined && (isNaN(ms) || ms < since)) continue;
     if (before !== undefined && (isNaN(ms) || ms >= before)) continue;
-    if (fromNeedle !== null && !r.fromEmail.includes(fromNeedle) && !r.fromName.toLowerCase().includes(fromNeedle)) continue;
+    // Defensive ?? '' on every string field: loadAllAttachments raw-casts JSON, so
+    // a hand-edited / schema-drifted / future-version row missing a key would
+    // otherwise throw on .toLowerCase()/.includes() and abort the WHOLE scan (the
+    // load itself only tolerates malformed JSON, not a valid-JSON missing field).
+    if (fromNeedle !== null && !(r.fromEmail ?? '').includes(fromNeedle) && !(r.fromName ?? '').toLowerCase().includes(fromNeedle)) continue;
     // Lowercase the filename ONCE: reused by both the filename filter and the key.
-    const fnLower = r.filename === null ? null : r.filename.toLowerCase();
+    const fnLower = r.filename ? r.filename.toLowerCase() : null;
     if (nameNeedle !== null && (fnLower === null || !fnLower.includes(nameNeedle))) continue;
-    if (mimeNeedle !== null && !r.mimeType.toLowerCase().includes(mimeNeedle)) continue;
+    if (mimeNeedle !== null && !(r.mimeType ?? '').toLowerCase().includes(mimeNeedle)) continue;
 
-    // Dedup key: a named file with a KNOWN size collapses by (filename_lower, size).
-    // A null filename OR an unknown size (0 = the non-finite backstop at store time)
+    // Dedup key: collapse ONLY a named file with a known POSITIVE size, by
+    // (filename_lower, size). A null/empty filename, or a non-positive/unknown size
+    // (0 from the store-time non-finite backstop, or a hand-edited missing field),
     // NEVER collapses — distinct unnamed parts, or files whose byte count we could
-    // not read, must not be merged just because a name+placeholder-size coincide.
-    const key = (fnLower === null || r.size === 0)
-      ? '\x00uniq\x00' + r.folder + '\x00' + r.uid + '\x00' + r.partId
-      : fnLower + '\x00' + r.size;
+    // not read, must not be merged on a name + placeholder-size coincidence. This
+    // errs toward NOT hiding a distinct file; the rare cost is two genuinely-identical
+    // 0-byte files showing as two hits, which is harmless.
+    const collapsible = fnLower !== null && Number.isFinite(r.size) && r.size > 0;
+    const key = collapsible
+      ? fnLower + '\x00' + r.size
+      : '\x00uniq\x00' + r.folder + '\x00' + r.uid + '\x00' + r.partId;
     const msgKey = r.folder + '\x00' + r.uid;
 
     let g = groups.get(key);

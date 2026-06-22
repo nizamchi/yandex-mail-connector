@@ -24,6 +24,7 @@ import {
   buildIndex,
   dropIndex,
   findAttachments,
+  getIndexDir,
   _resetForTests,
   _setAccountForTests,
   type EnvelopeSource,
@@ -406,6 +407,38 @@ test('FA-l: the representative is always present in occurrences[] even when scan
     'the representative location is guaranteed present in occurrences[]');
 }));
 
+test('FA-m: a valid-JSON manifest row missing a string field does not abort the scan', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<ok@ex>', hasAttachments: true,
+      attachments: [att({ filename: 'good.pdf', mimeType: 'application/pdf', size: 10, partId: '1' })] }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // Append a valid-JSON manifest row MISSING the mimeType key (schema drift / hand-edit).
+  // loadAllAttachments raw-casts, so without defensive guards r.mimeType.toLowerCase()
+  // would throw and abort the WHOLE scan. It must instead be skipped by a mime filter.
+  const manifestPath = path.join(getIndexDir(), 'attachments.jsonl');
+  const acct = JSON.parse(fs.readFileSync(manifestPath, 'utf-8').split('\n').filter(l => l.trim())[0]).account;
+  const bad: Record<string, unknown> = {
+    account: acct, folder: 'INBOX', uid: 2, messageId: '<bad@ex>',
+    date: '2025-01-01T00:00:00.000Z', fromEmail: 'a@x.io', fromName: 'A', subject: 's',
+    filename: 'mystery.bin', size: 7, partId: '1', md5: null,
+    // no mimeType key
+  };
+  fs.appendFileSync(manifestPath, JSON.stringify(bad) + '\n');
+  _resetForTests();
+
+  // A mime filter must NOT throw on the missing-key row; it is simply excluded.
+  const mimeResult = findAttachments({ mime: 'pdf' });
+  assert.deepEqual(mimeResult.hits.map(h => h.filename), ['good.pdf'],
+    'mime filter excludes the missing-mimeType row without throwing');
+  // Unfiltered scan includes both rows (no string filter touches the missing field).
+  const allResult = findAttachments({});
+  assert.equal(allResult.total, 2, 'both rows scanned; the malformed row is not dropped');
+}));
+
 // ── <50ms ship gate (its own test so a perf flake never masks a logic bug) ──
 
 test('FA-perf: find_attachments(from, mime=application/pdf) < 50ms on a 1000-row manifest', withTempStateDir(async () => {
@@ -462,13 +495,14 @@ test('FA-handler: structured output re-sanitizes filename/sender/subject; manife
   const ZWSP = String.fromCharCode(0x200B);
   const badName = 'Bad' + RLO + 'Name' + ZWSP;
   const badFile = 'in' + RLO + 'voice' + ZWSP + '.pdf';
+  const badMime = 'app' + RLO + 'lication/pdf' + ZWSP;
 
   const src = new FakeSource();
   src.setFolder('INBOX', [
     hdr({ uid: 1, messageId: '<h@ex>',
       from: [{ address: 'evil@x.io', name: badName }],
       subject: 'sub\nject', hasAttachments: true,
-      attachments: [att({ filename: badFile, size: 10, partId: '1' })] }),
+      attachments: [att({ filename: badFile, mimeType: badMime, size: 10, partId: '1' })] }),
   ], 100);
   await buildIndex(['INBOX'], src);
   _resetForTests();
@@ -478,7 +512,7 @@ test('FA-handler: structured output re-sanitizes filename/sender/subject; manife
   const sc = res.structuredContent as {
     manifest_built: boolean;
     total: number;
-    hits: Array<{ filename: string | null; from: string; subject: string }>;
+    hits: Array<{ filename: string | null; from: string; subject: string; mime_type: string }>;
   };
   assert.equal(sc.manifest_built, true);
   assert.equal(sc.total, 1);
@@ -487,4 +521,5 @@ test('FA-handler: structured output re-sanitizes filename/sender/subject; manife
     'filename format chars stripped in structured output');
   assert.ok(!h.from.includes(RLO) && !h.from.includes(ZWSP), 'sender format chars stripped');
   assert.ok(!h.subject.includes('\n'), 'subject newline collapsed');
+  assert.ok(!h.mime_type.includes(RLO) && !h.mime_type.includes(ZWSP), 'mime_type format chars stripped');
 }));

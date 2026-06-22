@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Yandex Mail MCP — инструменты v2.8.0</title>
+<title>Yandex Mail MCP — инструменты v2.9.0</title>
 <style>
   :root { --bg:#0f172a; --surface:#1e293b; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --green:#22c55e; --amber:#f59e0b; --red:#ef4444; --purple:#8b5cf6; }
   * { box-sizing:border-box; margin:0; padding:0; }
@@ -31,7 +31,7 @@
 </head>
 <body>
 <h1>Yandex Mail MCP — инструменты</h1>
-<div class="meta">Версия <b>v2.8.0</b> &nbsp;·&nbsp; 19 инструментов &nbsp;·&nbsp; <b>L0</b> 14 &nbsp;·&nbsp; <b>L1</b> 4 &nbsp;·&nbsp; <b>L2</b> 1 &nbsp;·&nbsp; <span title="Сгенерировано из src/tools.ts">авто-генерация</span></div>
+<div class="meta">Версия <b>v2.9.0</b> &nbsp;·&nbsp; 21 инструмент &nbsp;·&nbsp; <b>L0</b> 16 &nbsp;·&nbsp; <b>L1</b> 4 &nbsp;·&nbsp; <b>L2</b> 1 &nbsp;·&nbsp; <span title="Сгенерировано из src/tools.ts">авто-генерация</span></div>
 <table>
   <thead>
     <tr>
@@ -147,6 +147,13 @@
       <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
       <td class="rw">✓</td>
       <td class="desc">Сохраняет байты ОДНОГО вложения по uid+index в локальный файл и возвращает путь; байты не возвращаются inline и не парсятся (без OCR) — санкционированное явное получение одного документа. Конфиг: YANDEX_ATTACHMENT_DIR (default: временный каталог ОС) / YANDEX_ATTACHMENT_MAX_BYTES (default: 25 МиБ).</td>
+    </tr>
+    <tr>
+      <td><code>yandex_find_attachments</code></td>
+      <td>Поиск вложений (каталог)</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc">Поиск вложений по локальному каталогу (метаданные BODYSTRUCTURE), без скачивания писем и без IMAP. Фильтры from / filename_contains / mime / since / before (подстрока). Одинаковые файлы (имя + размер) схлопываются с occurrence_count и списком мест (folder#uid). Каталог считает вложением и встроенные именованные части (логотипы) — отсекай точным mime (напр. application/pdf). Ship-критерий слоя: find_attachments(from, mime='application/pdf') &lt; 50 мс.</td>
     </tr>
     <tr>
       <td><code>yandex_mark_email</code></td>

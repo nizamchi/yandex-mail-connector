@@ -505,7 +505,7 @@ test('T26: pure-filter results are ordered newest-first', withTempStateDir(async
   assert.deepEqual(flagged.map(h => h.record.uid), [3, 2, 1], 'descending by date');
 }));
 
-// ── Layer 3 (v3.0.0): has_attachments filter on searchFast ───────────
+// ── Layer 3 (v2.9.0): has_attachments filter on searchFast ───────────
 
 test('T-HA1: has_attachments filter splits records with/without attachments', withTempStateDir(async () => {
   const src = new FakeSource();
@@ -536,7 +536,7 @@ test('T-HA2: a record missing has_attachments on disk is treated as false', with
   await buildIndex(['INBOX'], src);
   _resetForTests();
 
-  // Simulate a pre-v3.0.0 (schema 2) record: strip the has_attachments key from
+  // Simulate a pre-v2.9.0 (schema 2) record: strip the has_attachments key from
   // the on-disk envelope JSONL, exactly as an index built before this milestone
   // would look. The auto-migration would normally rebuild it; here we read it raw.
   const envPath = path.join(getIndexDir(), 'envelopes.jsonl');
@@ -656,7 +656,7 @@ test('T31: a pre-threading (schema 1) folder is auto-rebuilt on update', withTem
   assert.equal(getIndexStatus().threadingReady, true, 'auto-migration restores threading');
 }));
 
-// ── v3.0.0 (L3-P1): schema 2->3 auto-migration + has_attachments persistence ──
+// ── v2.9.0 (L3-P1): schema 2->3 auto-migration + has_attachments persistence ──
 
 test('T-mig: schema 2->3 auto-migration — threadingReady stays true; folder re-streams to schema 3', withTempStateDir(async () => {
   const src = new FakeSource();

@@ -5,7 +5,38 @@
 Формат основан на [Keep a Changelog 1.1.0](https://keepachangelog.com/ru/1.1.0/),
 проект придерживается [Semantic Versioning](https://semver.org/lang/ru/).
 
-## [Unreleased]
+## [2.9.0] — 2026-06-23
+
+Слой 3 «Каталог вложений» — **минорный, обратносовместимый** релиз (только добавления;
+старые индексы до-мигрируют сами, ничего ломающего). Коннектор находит письма по
+метаданным вложений (имя, тип, отправитель, дата) **без скачивания тел писем** — целиком
+на IMAP `BODYSTRUCTURE`. Без новых зависимостей. 536 тестов (530 проходят, 6 unix-only
+пропускаются на Windows), `npm audit --omit=dev` = 0.
+
+### Добавлено (Layer 3)
+
+- **`yandex_find_attachments` — новый L0-инструмент.** Поиск вложений по локальному
+  каталогу (`attachments.jsonl`), оффлайн, без IMAP, с изоляцией аккаунтов. Фильтры
+  `from / filename_contains / mime / since / before` (подстрока, без регистра, складываются
+  по И). Дубли одного файла (`имя в нижнем регистре + размер`) схлопываются в одну запись с
+  `occurrence_count` (число РАЗНЫХ писем, не частей) и списком мест `occurrences[{folder,uid,date}]`
+  (до 10, с флагом `occurrences_truncated`); представитель группы — самое РАННЕЕ письмо,
+  порядок групп — по самой свежей активности. Неизвестный размер (0) и пустое имя файла не
+  схлопываются. Выдача ограничена по размеру (`fitRows`, 50 000), имена/отправители/темы
+  повторно санитизируются на выходе. Без манифеста — подсказка «собери индекс», без ошибки и
+  без IMAP. Ship-критерий слоя: `find_attachments(from, mime='application/pdf')` < 50 мс
+  (живой прогон на реальном ящике — 0.5 мс).
+- **Фильтр `has_attachments` в `yandex_search_fast`.** `true` — только письма с вложениями,
+  `false` — только без (по полю из BODYSTRUCTURE). Записи старого индекса (до схемы 3)
+  трактуются как «без вложений» и самоисцеляются при `index update`.
+- **Захват вложений из BODYSTRUCTURE при индексации.** В том же fetch конвертов (без лишних
+  обращений к серверу) заполняется `has_attachments` на каждом письме и собирается манифест
+  `attachments.jsonl` рядом с локальным индексом (`0o600`, изоляция аккаунтов, атомарная
+  перезапись), синхронный по всем трём путям (build / incremental-append / drop). Схема
+  индекса 2→3 с авто-миграцией (без ручного `index build`). Имена файлов санитизируются при
+  записи; кириллица сохраняется. Метаданные-only: тела писем не скачиваются, не парсятся.
+  Примечание: каталог по BODYSTRUCTURE считает вложением и встроенные именованные части
+  (логотипы) — фильтр `mime` (напр. `application/pdf`) отсекает их.
 
 ### Изменено
 
@@ -778,7 +809,8 @@ sender redaction, send dedup). Завершены 8 фаз + post-review hardeni
 - Флаг `isError` корректно проставляется в ответах MCP при сбое
   IMAP/SMTP-операций (раньше ошибки маскировались под успех).
 
-[Unreleased]: https://github.com/user/yandex-mail-connector/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/user/yandex-mail-connector/compare/v2.9.0...HEAD
+[2.9.0]: https://github.com/user/yandex-mail-connector/compare/v2.8.0...v2.9.0
 [2.1.1]: https://github.com/user/yandex-mail-connector/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/user/yandex-mail-connector/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/user/yandex-mail-connector/compare/v1.0.0...v2.0.0
