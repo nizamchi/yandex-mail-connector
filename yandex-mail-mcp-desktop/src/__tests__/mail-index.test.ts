@@ -22,6 +22,7 @@ import {
   getThread,
   getIndexDir,
   _resetForTests,
+  _setAccountForTests,
   type EnvelopeSource,
 } from '../mail-index.js';
 
@@ -116,6 +117,7 @@ function withTempStateDir(fn: () => void | Promise<void>): () => Promise<void> {
       else process.env.YANDEX_STATE_DIR = prev;
       _resetStateDir();
       _resetForTests();
+      _setAccountForTests(null); // never leak an account override into the next test.
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
   };
@@ -662,4 +664,61 @@ test('T34: a count drift from a prior bug self-heals on the next update', withTe
   const res = await updateIndex(['INBOX'], src);
   assert.equal(res.errors.length, 0);
   assert.equal(getIndexStatus().totalCount, 2, 'drifted count is corrected to the measured value');
+}));
+
+// ── v2.8.0 (L2-B): multi-account read isolation ─────────────────────────────
+
+test('T35: a concrete account never sees another account\'s records', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 1, subject: 'alice secret plan' })], 100);
+
+  _setAccountForTests('alice@ya.ru');
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+  assert.equal(searchFast('secret').length, 1, 'alice sees her own record');
+  assert.equal(getIndexStatus().account, 'alice@ya.ru');
+
+  // Bob shares the same state dir (misconfiguration) -- he must NOT read alice's mail.
+  _setAccountForTests('bob@ya.ru');
+  _resetForTests();
+  assert.equal(searchFast('secret').length, 0, 'cross-account fast search is blocked');
+  assert.equal(getThread('secret').length, 0, 'cross-account thread is blocked');
+
+  // Back to alice: still visible (the records were never altered, only filtered).
+  _setAccountForTests('alice@ya.ru');
+  _resetForTests();
+  assert.equal(searchFast('secret').length, 1);
+}));
+
+// ── v2.8.0 (L2-D/E): thread robustness (subjectless guard, stable seed) ──────
+
+test('T36: subjectless messages are not collapsed into one bogus thread', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<n1@x>', subject: '', from: [{ address: 'a@x', name: 'Sender One' }] }),
+    hdr({ uid: 2, messageId: '<n2@x>', subject: '', from: [{ address: 'b@x', name: 'Sender Two' }] }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // The empty normalized subject must NOT group the two unrelated messages.
+  const thread = getThread('Sender One');
+  assert.equal(thread.length, 1, 'only the seed; no subject-collapse on empty subjects');
+  assert.equal(thread[0].record.uid, 1);
+}));
+
+test('T37: getThread finds its seed after a cache rebuild (stable key, not identity)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<a@x>', subject: 'Бюджет', date: '2025-01-01T10:00:00.000Z' }),
+    hdr({ uid: 2, messageId: '<b@x>', inReplyTo: '<a@x>', subject: 'Re: Бюджет', date: '2025-01-02T10:00:00.000Z' }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  // Do NOT _resetForTests between searchFast and getThread inside getThread:
+  // the seed object identity differs from a freshly-read cache, but the
+  // (account, folder, uid) key lookup still resolves it.
+  _resetForTests();
+
+  const thread = getThread('Бюджет');
+  assert.deepEqual(thread.map(h => h.record.uid), [1, 2], 'Message-ID graph still links the reply');
 }));

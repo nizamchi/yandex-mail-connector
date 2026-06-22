@@ -169,9 +169,14 @@ export function getIndexDir(): string { return indexDir(); }
 
 // ── Account resolution ────────────────────────────────────────────────
 
+// Test seam: override the resolved account without a token file. null = resolve
+// normally. Set/cleared only by _setAccountForTests.
+let accountOverrideForTests: string | null = null;
+
 // getConfiguredAccount: the account id stamped on every record. Lazy + guarded
 // so a missing token file never throws (which would break tool registration).
 function getConfiguredAccount(): string {
+  if (accountOverrideForTests !== null) return accountOverrideForTests;
   try {
     // Lazy require keeps token.ts off the module-load critical path -- importing
     // it does not run loadCredentials, but we centralise the catch here anyway.
@@ -181,6 +186,18 @@ function getConfiguredAccount(): string {
   } catch {
     return 'default';
   }
+}
+
+// enforceAccount: the account that reads must be restricted to, or null to
+// serve every record. When a concrete account is configured we never return
+// another mailbox's records -- this is the defence against a shared/misconfigured
+// state dir leaking account A's mail into account B's session. 'default' (no
+// credentials resolved) disables the filter so the unconfigured single-account
+// case and a transient credential hiccup still return results (fail-open only
+// when there is no account identity to enforce).
+function enforceAccount(): string | null {
+  const acct = getConfiguredAccount();
+  return acct !== 'default' ? acct : null;
 }
 
 // ── Default IMAP-backed source ────────────────────────────────────────
@@ -561,6 +578,9 @@ interface IndexCache {
   senderTokens: Set<string>[];
   // Date (ms) per record; NaN when missing/invalid.
   dateMs: number[];
+  // Normalized subject per record (Re:/Fwd:/Вс: stripped), precomputed so
+  // getThread's same-folder fallback does not re-run the regex loop per call.
+  normalizedSubjects: string[];
   // Recency threshold: records with dateMs >= this get the recency boost.
   recencyThresholdMs: number;
   // Thread graph (v2.7.0-p3): messageId -> record index, and parent-messageId ->
@@ -605,12 +625,14 @@ function buildCache(): IndexCache {
   const subjectTokens: Set<string>[] = [];
   const senderTokens: Set<string>[] = [];
   const dateMs: number[] = [];
+  const normalizedSubjects: string[] = [];
   const validDates: number[] = [];
   const byMessageId = new Map<string, number>();
   const childrenOf = new Map<string, number[]>();
 
   for (let i = 0; i < records.length; i++) {
     const r = records[i];
+    normalizedSubjects.push(normalizeSubject(r.subject));
     const sTok = new Set<string>(tokenize(r.subject));
     const fromTok = new Set<string>([
       ...tokenize(r.fromName),
@@ -650,6 +672,7 @@ function buildCache(): IndexCache {
     subjectTokens,
     senderTokens,
     dateMs,
+    normalizedSubjects,
     recencyThresholdMs,
     byMessageId,
     childrenOf,
@@ -677,6 +700,7 @@ function getCache(): IndexCache {
       subjectTokens: [],
       senderTokens: [],
       dateMs: [],
+      normalizedSubjects: [],
       recencyThresholdMs: Number.POSITIVE_INFINITY,
       byMessageId: new Map(),
       childrenOf: new Map(),
@@ -698,6 +722,27 @@ function normalizeSubject(subject: string): string {
     s = next;
   }
   return s.trim().toLowerCase();
+}
+
+// sameRecord / findRecordIndex: locate a record in the cache by its stable
+// primary key (account, folder, uid) rather than by object identity. getThread
+// gets its seed from a separate searchFast call; if the cache were rebuilt
+// between the two calls an identity (indexOf) lookup would silently fail and
+// drop the Message-ID thread graph. byMessageId gives an O(1) first guess,
+// verified against the key because duplicate Message-IDs exist in the wild.
+function sameRecord(a: IndexRecord, b: IndexRecord): boolean {
+  return a.account === b.account && a.folder === b.folder && a.uid === b.uid;
+}
+
+function findRecordIndex(c: IndexCache, seed: IndexRecord): number {
+  if (seed.messageId) {
+    const i = c.byMessageId.get(seed.messageId);
+    if (i !== undefined && sameRecord(c.records[i], seed)) return i;
+  }
+  for (let i = 0; i < c.records.length; i++) {
+    if (sameRecord(c.records[i], seed)) return i;
+  }
+  return -1;
 }
 
 // ── Public: search ────────────────────────────────────────────────────
@@ -785,9 +830,11 @@ export function searchFast(
     for (let i = 0; i < c.records.length; i++) candidates.add(i);
   }
 
+  const acct = enforceAccount();
   const hits: SearchHit[] = [];
   for (const idx of candidates) {
     const r = c.records[idx];
+    if (acct !== null && r.account !== acct) continue;
     if (folderFilter !== undefined && r.folder !== folderFilter) continue;
     const ms = c.dateMs[idx];
     if (!passesFilters(r, ms, filters)) continue;
@@ -863,18 +910,21 @@ export function getThread(query: string, opts?: { folder?: string; limit?: numbe
   if (top.length === 0) return [];
   const seed = top[0].record;
   const limit = clampLimit(opts?.limit);
+  const acct = enforceAccount();
 
   const memberIdx = new Set<number>();
   // 1. Message-ID graph BFS over actual In-Reply-To EDGES only: a node links to
   //    its parent (the record whose messageId == this.inReplyTo) and to its
   //    children (records whose inReplyTo == this.messageId). We deliberately do
   //    NOT treat a shared messageId as a link -- malformed/duplicate Message-IDs
-  //    must not collapse unrelated mail into one thread.
+  //    must not collapse unrelated mail into one thread. Cross-account records
+  //    are never admitted (the graph could otherwise bridge two mailboxes).
   const stack: number[] = [];
-  const seedIdx = c.records.indexOf(seed);
+  const seedIdx = findRecordIndex(c, seed);
   if (seedIdx >= 0) { memberIdx.add(seedIdx); stack.push(seedIdx); }
   const visit = (i: number | undefined): void => {
     if (i === undefined || i < 0 || memberIdx.has(i)) return;
+    if (acct !== null && c.records[i].account !== acct) return;
     memberIdx.add(i);
     stack.push(i);
   };
@@ -887,11 +937,17 @@ export function getThread(query: string, opts?: { folder?: string; limit?: numbe
     }
   }
 
-  // 2. Same-folder normalized-subject fallback (always unioned).
+  // 2. Same-folder normalized-subject fallback. Skipped when the seed has no
+  //    real subject (an empty/placeholder normalized subject would otherwise
+  //    collapse every subjectless message in the folder into one bogus thread);
+  //    such seeds rely on the Message-ID graph above.
   const target = normalizeSubject(seed.subject);
-  for (let i = 0; i < c.records.length; i++) {
-    const r = c.records[i];
-    if (r.folder === seed.folder && normalizeSubject(r.subject) === target) memberIdx.add(i);
+  if (target.length > 0) {
+    for (let i = 0; i < c.records.length; i++) {
+      const r = c.records[i];
+      if (acct !== null && r.account !== acct) continue;
+      if (r.folder === seed.folder && c.normalizedSubjects[i] === target) memberIdx.add(i);
+    }
   }
 
   const members: IndexRecord[] = [...memberIdx].map(i => c.records[i]);
@@ -917,4 +973,10 @@ export function getThread(query: string, opts?: { folder?: string; limit?: numbe
 // rebuild within the same process) is picked up on the next search.
 export function _resetForTests(): void {
   invalidateCache();
+}
+
+// _setAccountForTests: override the resolved account (null = resolve normally)
+// so account-isolation can be exercised without provisioning a token file.
+export function _setAccountForTests(account: string | null): void {
+  accountOverrideForTests = account;
 }
