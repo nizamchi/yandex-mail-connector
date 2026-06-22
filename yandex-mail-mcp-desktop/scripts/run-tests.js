@@ -51,6 +51,7 @@ const TESTS = [
   'unanswered.test.ts',
   'attachment-parser.test.ts',
   'get-attachment.test.ts',
+  'attachments-manifest.test.ts',
 ];
 
 const distDir = path.join(root, 'dist', '__tests__');
