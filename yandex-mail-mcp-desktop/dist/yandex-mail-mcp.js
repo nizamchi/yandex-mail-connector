@@ -318,7 +318,7 @@ Args:
   year / month / year_month / weekday / hour / date
   to_first / subject_prefix / subject_normalized
   size_bucket (<10KB / 10-100KB / 100KB-1MB / >1MB)
-  has_attachments (best-effort: envelope-only, \u0432\u0441\u0435\u0433\u0434\u0430 "no" \u0432 v2.3.0 -- bodyStructure \u0441\u043B\u0438\u0448\u043A\u043E\u043C \u0442\u044F\u0436\u0451\u043B \u0434\u043B\u044F streaming)
+  has_attachments (derived from BODYSTRUCTURE on the streaming fetch; reflects real values in v3.0.0+)
   flag_seen / flag_flagged
 \u041F\u0440\u0438\u043C\u0435\u0440\u044B:
   group_by=["sender"]              -- \u0442\u043E\u043F \u043E\u0442\u043F\u0440\u0430\u0432\u0438\u0442\u0435\u043B\u0435\u0439

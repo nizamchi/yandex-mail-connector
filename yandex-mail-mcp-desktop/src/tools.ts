@@ -1260,7 +1260,7 @@ Args:
   year / month / year_month / weekday / hour / date
   to_first / subject_prefix / subject_normalized
   size_bucket (<10KB / 10-100KB / 100KB-1MB / >1MB)
-  has_attachments (best-effort: envelope-only, всегда "no" в v2.3.0 -- bodyStructure слишком тяжёл для streaming)
+  has_attachments (derived from BODYSTRUCTURE on the streaming fetch; reflects real values in v3.0.0+)
   flag_seen / flag_flagged
 Примеры:
   group_by=["sender"]              -- топ отправителей

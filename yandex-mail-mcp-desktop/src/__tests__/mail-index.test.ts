@@ -605,6 +605,57 @@ test('T31: a pre-threading (schema 1) folder is auto-rebuilt on update', withTem
   assert.equal(getIndexStatus().threadingReady, true, 'auto-migration restores threading');
 }));
 
+// ── v3.0.0 (L3-P1): schema 2->3 auto-migration + has_attachments persistence ──
+
+test('T-mig: schema 2->3 auto-migration — threadingReady stays true; folder re-streams to schema 3', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<q1@x>', subject: 'question' }),
+    hdr({ uid: 2, messageId: '<q2@x>', inReplyTo: '<q1@x>', subject: 'Re: question' }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+
+  // Simulate an index written by v2.x: downgrade the stored schema to 2.
+  const metaP = path.join(getIndexDir(), 'meta.json');
+  const meta = JSON.parse(fs.readFileSync(metaP, 'utf-8'));
+  meta.folders['INBOX'].schema = 2;
+  fs.writeFileSync(metaP, JSON.stringify(meta));
+  _resetForTests();
+
+  // schema 2 still meets THREADING_SCHEMA (= 2), so threadingReady must be true
+  // even before the migration -- this is the THREADING_SCHEMA decouple guarantee.
+  assert.equal(getIndexStatus().threadingReady, true, 'schema 2 meets THREADING_SCHEMA; threadingReady must not regress');
+
+  // updateIndex should detect stored.schema (2) < INDEX_SCHEMA (3) and rebuild.
+  const r = await updateIndex(['INBOX'], src);
+  assert.ok(r.added >= 2, 'stale-schema folder (schema 2) is re-streamed to schema 3');
+  assert.equal(r.errors.length, 0, 'migration is clean');
+  _resetForTests();
+
+  const status = getIndexStatus();
+  assert.ok(status.folders[0].schema >= 3, 'folder is now at schema 3 after migration');
+  assert.equal(status.threadingReady, true, 'threadingReady stays true after 2->3 bump');
+}));
+
+test('T-bit: has_attachments bit persists through EmailHeader -> toRecord -> IndexRecord', withTempStateDir(async () => {
+  const src = new FakeSource();
+  // One message with attachments, one without.
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<att@x>', subject: 'has attachment', hasAttachments: true }),
+    hdr({ uid: 2, messageId: '<natt@x>', subject: 'no attachment', hasAttachments: false }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // searchFast returns SearchHit[]; .record carries has_attachments.
+  const hits = searchFast('attachment');
+  // Both messages match the term; sort by uid so assertions are deterministic.
+  hits.sort((a, b) => a.record.uid - b.record.uid);
+  assert.equal(hits.length, 2, 'both messages found');
+  assert.equal(hits[0].record.has_attachments, true, 'uid 1: has_attachments persisted as true');
+  assert.equal(hits[1].record.has_attachments, false, 'uid 2: has_attachments persisted as false');
+}));
+
 // ── v2.8.0 (L2-A): expunge reconciliation + measured count + resilience ──────
 
 test('T32: a deleted message is reconciled out of the index on update', withTempStateDir(async () => {

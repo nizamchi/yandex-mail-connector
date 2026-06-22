@@ -28,7 +28,7 @@ export interface EnvelopeRow {
   size: number;
   seen: boolean;
   flagged: boolean;
-  hasAttachments: boolean;  // best-effort; see note in tools.ts description
+  hasAttachments: boolean;  // derived from BODYSTRUCTURE captured on streamEnvelopes (schema 3+)
 }
 
 // Available group_by fields. Adding one = update FIELD_BUCKETERS below.
@@ -175,8 +175,8 @@ function bucketField(field: GroupByField, env: EnvelopeRow): string {
     case 'size_bucket':
       return bucketSize(env.size ?? 0);
     case 'has_attachments':
-      // Best-effort: envelope-only fetch cannot reliably tell. tools.ts
-      // documents this limitation. Reports the field as imap.ts set it.
+      // Derived from BODYSTRUCTURE captured on the streaming fetch (v3.0.0+).
+      // Reports the field as set by imap.ts parseHeader via extractAttachments.
       return env.hasAttachments ? 'yes' : 'no';
     case 'flag_seen':
       return env.seen ? 'seen' : 'unseen';
