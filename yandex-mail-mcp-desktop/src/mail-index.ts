@@ -557,10 +557,14 @@ export function dropIndex(): void {
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch {
-    // Best-effort: a stale handle on Windows can refuse the unlink. Fall back
-    // to truncating the two known files so indexExists() returns false.
+    // Best-effort: a stale handle on Windows can refuse the directory unlink.
+    // Fall back to TRUNCATING both files (write empty), not unlinking: a delete
+    // is what the open handle blocks, whereas truncation usually succeeds. This
+    // matters -- if envelopes.jsonl survived with content, searchFast would keep
+    // serving the "dropped" records (indexExists() reads meta, but the FTS cache
+    // reads envelopes.jsonl). Emptying it guarantees no stale/orphan reads.
     try { fs.writeFileSync(metaPath(), JSON.stringify(emptyMeta(), null, 2)); } catch { /* ignore */ }
-    try { fs.unlinkSync(envelopesPath()); } catch { /* ignore */ }
+    try { fs.writeFileSync(envelopesPath(), ''); } catch { /* ignore */ }
   }
   invalidateCache();
 }
@@ -752,6 +756,12 @@ function clampLimit(limit?: number): number {
   return Math.min(Math.max(Math.floor(limit), 1), MAX_LIMIT);
 }
 
+// rangeIndices: 0..n-1 without materialising an array/Set. Used by the
+// pure-filter scan so it does not allocate one Set entry per record.
+function* rangeIndices(n: number): Generator<number> {
+  for (let i = 0; i < n; i++) yield i;
+}
+
 function hasAnyFilter(f?: SearchFilters): boolean {
   return !!f && (
     (f.from !== undefined && f.from.length > 0) ||
@@ -787,52 +797,59 @@ function idfWeight(c: IndexCache, token: string): number {
   return 0.5 + Math.min(idf, IDF_CAP) / IDF_CAP;
 }
 
-// searchFast: free-text query (subject + sender, ranked) AND/OR structured
-// filters (from/since/before/seen/flagged). A query with content ranks by
-// token/substring/recency. A query that is ONLY filters ("all unread since
-// March" -- every word consumed as a filter, nothing left to rank) scans every
-// record and orders by recency; without that branch the candidate set would be
-// empty and a pure-filter query would return nothing.
-export function searchFast(
+// searchFastResult: free-text query (subject + sender, ranked) AND/OR
+// structured filters (from/since/before/seen/flagged), returning a page of hits
+// plus the TOTAL number of matches -- so a caller can distinguish "20 hits"
+// from "20 of thousands" and paginate via offset. A query with content ranks by
+// token/substring/recency; a query that is ONLY filters ("all unread since
+// March") scans every record and orders by recency.
+export interface SearchPage {
+  hits: SearchHit[];
+  total: number;
+}
+
+export function searchFastResult(
   query: string,
-  opts?: { folder?: string; limit?: number; filters?: SearchFilters },
-): SearchHit[] {
+  opts?: { folder?: string; limit?: number; offset?: number; filters?: SearchFilters },
+): SearchPage {
   const c = getCache();
-  if (c.records.length === 0) return [];
+  if (c.records.length === 0) return { hits: [], total: 0 };
 
   const qLower = query.toLowerCase().trim();
   const qTokens = tokenize(query);
   const limit = clampLimit(opts?.limit);
+  const offset = Math.max(0, Math.floor(opts?.offset ?? 0));
   const folderFilter = opts?.folder;
   const filters = opts?.filters;
   const hasContent = qTokens.length > 0 || qLower.length > 0;
   const hasFilters = hasAnyFilter(filters);
 
   // Nothing to match on at all.
-  if (!hasContent && !hasFilters) return [];
+  if (!hasContent && !hasFilters) return { hits: [], total: 0 };
 
-  const candidates = new Set<number>();
+  // Candidate record indices: a content query unions token postings + subject
+  // substrings into a Set; a pure-filter query iterates all indices directly
+  // (no Set-of-every-index allocation).
+  let candidateIdx: Iterable<number>;
   if (hasContent) {
-    // Union of records matching any query token.
+    const set = new Set<number>();
     for (const t of qTokens) {
-      const set = c.inverted.get(t);
-      if (set) for (const idx of set) candidates.add(idx);
+      const posting = c.inverted.get(t);
+      if (posting) for (const idx of posting) set.add(idx);
     }
-    // Substring fallback so a single short query token (or a phrase) still finds
-    // subject-substring matches even when token indexing missed it.
     if (qLower.length > 0) {
       for (let i = 0; i < c.records.length; i++) {
-        if (c.records[i].subject.toLowerCase().includes(qLower)) candidates.add(i);
+        if (c.records[i].subject.toLowerCase().includes(qLower)) set.add(i);
       }
     }
+    candidateIdx = set;
   } else {
-    // Pure-filter query: scan all records; the filter pass below narrows them.
-    for (let i = 0; i < c.records.length; i++) candidates.add(i);
+    candidateIdx = rangeIndices(c.records.length);
   }
 
   const acct = enforceAccount();
   const hits: SearchHit[] = [];
-  for (const idx of candidates) {
+  for (const idx of candidateIdx) {
     const r = c.records[idx];
     if (acct !== null && r.account !== acct) continue;
     if (folderFilter !== undefined && r.folder !== folderFilter) continue;
@@ -882,7 +899,16 @@ export function searchFast(
     if (b.score !== a.score) return b.score - a.score;
     return dateCompareDesc(a.record.date, b.record.date);
   });
-  return hits.slice(0, limit);
+  return { hits: hits.slice(offset, offset + limit), total: hits.length };
+}
+
+// searchFast: page-less convenience wrapper (existing callers + tests). Returns
+// only the hits for the first `limit` (post-offset) matches.
+export function searchFast(
+  query: string,
+  opts?: { folder?: string; limit?: number; offset?: number; filters?: SearchFilters },
+): SearchHit[] {
+  return searchFastResult(query, opts).hits;
 }
 
 function dateCompareDesc(a: string, b: string): number {

@@ -104,9 +104,35 @@ function fmtHeaders(emails: imap.EmailHeader[]): string {
 }
 
 function parseSearchDate(s: string, field: string): Date {
-  const d = new Date(s);
+  const str = s.trim();
+  // Require ISO-8601 (YYYY-MM-DD, optional time). new Date() alone silently
+  // misparses ambiguous/locale forms -- "01/03/2025" (month vs day), "2025"
+  // (-> Jan 1), "March 2025" -- producing a wrong, unflagged date bound.
+  if (!/^\d{4}-\d{2}-\d{2}([T ][0-9:.,+Zz:-]*)?$/.test(str)) {
+    throw new Error(`Дата для поля ${field} должна быть в формате YYYY-MM-DD (ISO 8601): "${s}"`);
+  }
+  const d = new Date(str);
   if (isNaN(d.getTime())) throw new Error(`Неверная дата для поля ${field}: "${s}"`);
   return d;
+}
+
+// ── Layer-2 search result size discipline ──────────────────────────────────
+// Enforces the advertised anthropic/maxResultSizeChars budget (it is otherwise
+// only a hint): per-field length caps + drop trailing rows until the serialized
+// payload fits, so a large/crafted result set cannot blow the agent's context.
+const SEARCH_RESULT_BUDGET = 50_000;
+const MAX_SUBJECT_LEN = 256;
+const MAX_FROM_LEN = 192;
+
+function capLen(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max - 1) + '…' : s;
+}
+
+function fitRows<T>(rows: T[], budget: number): { rows: T[]; truncated: boolean } {
+  if (JSON.stringify(rows).length <= budget) return { rows, truncated: false };
+  const kept = rows.slice();
+  while (kept.length > 0 && JSON.stringify(kept).length > budget) kept.pop();
+  return { rows: kept, truncated: true };
 }
 
 // ── Public types (consumed by index.ts and tools-registry.test.ts) ─────────
@@ -285,7 +311,8 @@ const findSenderSchema = z.object({
 const searchFastSchema = z.object({
   query:  z.string().optional().describe('Слова из темы или имени/адреса отправителя. Кириллица поддерживается. Можно опустить, если задан хотя бы один фильтр.'),
   folder: z.string().optional().describe('Ограничить поиск одной папкой; по умолчанию все проиндексированные'),
-  limit:  z.number().int().min(1).max(100).optional().describe('Максимум результатов (default 20)'),
+  limit:  z.number().int().min(1).max(100).optional().describe('Максимум результатов на странице (default 20)'),
+  offset: z.number().int().min(0).optional().describe('Сдвиг для пагинации (default 0). total в ответе = полное число совпадений.'),
   from:   z.string().optional().describe('Фильтр: фрагмент адреса/имени отправителя'),
   since:  z.string().optional().describe('Фильтр: ISO дата, напр. "2025-03-01" -- письма не раньше этой даты (включительно)'),
   before: z.string().optional().describe('Фильтр: ISO дата -- письма строго раньше этой даты'),
@@ -1277,16 +1304,17 @@ Output: { rows: [{ key:[...], count, total_size_bytes, earliest, latest }], tota
 Поддерживает фильтры: from / since / before / seen / flagged. Можно искать ТОЛЬКО по фильтрам без query (напр. «непрочитанные за март»: seen=false, since="2025-03-01").
 Требует построенного индекса: в терминале \`yandex-mail-mcp index build\` (и \`index update\` для досинхронизации).
 Если индекс не построен -- вернёт подсказку; тогда используй yandex_search_emails (живой поиск).
-Args: query? (опционально, если задан фильтр), folder?, limit (default 20, max 100), from?, since?, before?, seen?, flagged?.
-Output: { index_built, total, hits: [{ uid, folder, from, subject, date, score, match_reasons }] }`,
+Args: query? (опционально, если задан фильтр), folder?, limit (default 20, max 100), offset (пагинация, default 0), from?, since? (YYYY-MM-DD), before? (YYYY-MM-DD), seen?, flagged?.
+Output: { index_built, total (полное число совпадений), returned, offset, truncated, hits: [{ uid, folder, from, subject, date, score, match_reasons }] }`,
     inputSchema: searchFastSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     meta: { 'anthropic/maxResultSizeChars': 50_000 },
     requires: { authLevel: 0 },
     handler: async (params, _ctx) => {
       try {
-        const { query, folder, limit, from, since, before, seen, flagged } = searchFastSchema.parse(params);
+        const { query, folder, limit, offset, from, since, before, seen, flagged } = searchFastSchema.parse(params);
         const q = (query ?? '').trim();
+        const off = offset ?? 0;
         const filters: mailIndex.SearchFilters = {};
         if (from) filters.from = from;
         if (since) filters.since = parseSearchDate(since, 'since').getTime();
@@ -1300,28 +1328,31 @@ Output: { index_built, total, hits: [{ uid, folder, from, subject, date, score, 
         if (!mailIndex.indexExists()) {
           return {
             content: [{ type: 'text', text: 'Локальный индекс не построен. Запусти `yandex-mail-mcp index build` в терминале, либо используй yandex_search_emails для живого поиска по IMAP.' }],
-            structuredContent: { index_built: false, total: 0, hits: [] },
+            structuredContent: { index_built: false, total: 0, returned: 0, offset: off, truncated: false, hits: [] },
           };
         }
-        const hits = mailIndex.searchFast(q, { folder, limit, filters });
-        const rows = hits.map(h => ({
+        const { hits, total } = mailIndex.searchFastResult(q, { folder, limit, offset: off, filters });
+        const allRows = hits.map(h => ({
           uid: h.record.uid,
           folder: h.record.folder,
-          from: h.record.fromName ? `${h.record.fromName} <${h.record.fromEmail}>` : h.record.fromEmail,
-          subject: h.record.subject,
+          from: capLen(h.record.fromName ? `${h.record.fromName} <${h.record.fromEmail}>` : h.record.fromEmail, MAX_FROM_LEN),
+          subject: capLen(h.record.subject, MAX_SUBJECT_LEN),
           date: h.record.date,
           score: h.score,
           match_reasons: h.matchReasons,
         }));
+        const { rows, truncated } = fitRows(allRows, SEARCH_RESULT_BUDGET);
         const label = q.length > 0 ? `"${q}"` : 'заданным фильтрам';
-        const out = { index_built: true, query: q, total: rows.length, hits: rows };
+        const out = { index_built: true, query: q, total, returned: rows.length, offset: off, truncated, hits: rows };
         if (rows.length === 0) {
-          return { content: [{ type: 'text', text: `По ${label} в индексе ничего не найдено.` }], structuredContent: out };
+          return { content: [{ type: 'text', text: `По ${label} в индексе ничего не найдено (всего совпадений: ${total}).` }], structuredContent: out };
         }
         const lines = rows.map((r, i) =>
-          `${i + 1}. [${r.folder}#${r.uid}] ${sanitizeForDisplay(r.subject) || '(без темы)'} — ${sanitizeForDisplay(r.from)}, ${r.date.slice(0, 10)} (релевантность ${r.score})`,
+          `${off + i + 1}. [${r.folder}#${r.uid}] ${sanitizeForDisplay(r.subject) || '(без темы)'} — ${sanitizeForDisplay(r.from)}, ${r.date.slice(0, 10)} (релевантность ${r.score})`,
         );
-        return { content: [{ type: 'text', text: `Найдено ${rows.length} (локальный индекс):\n\n${lines.join('\n')}` }], structuredContent: out };
+        const shownEnd = off + rows.length;
+        const more = total > shownEnd ? `\n\n…показаны ${off + 1}–${shownEnd} из ${total}. Для следующей страницы: offset=${shownEnd}.` : '';
+        return { content: [{ type: 'text', text: `Найдено ${total} (локальный индекс):\n\n${lines.join('\n')}${more}` }], structuredContent: out };
       } catch (e) { return errorResult(e); }
     },
   },
@@ -1336,7 +1367,7 @@ Output: { index_built, total, hits: [{ uid, folder, from, subject, date, score, 
 в пределах папки совпадения. Возвращает письма в хронологическом порядке. Требует индекса
 (см. yandex_search_fast; для связей по In-Reply-To нужен \`index build\`, не только update).
 Args: query (слова из темы), folder?, limit (default 20, max 100).
-Output: { index_built, total, thread: [{ uid, folder, from, subject, date }] }`,
+Output: { index_built, total, truncated, thread: [{ uid, folder, from, subject, date }] }`,
     inputSchema: getThreadSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     meta: { 'anthropic/maxResultSizeChars': 50_000 },
@@ -1347,18 +1378,19 @@ Output: { index_built, total, thread: [{ uid, folder, from, subject, date }] }`,
         if (!mailIndex.indexExists()) {
           return {
             content: [{ type: 'text', text: 'Локальный индекс не построен. Запусти `yandex-mail-mcp index build` в терминале.' }],
-            structuredContent: { index_built: false, total: 0, thread: [] },
+            structuredContent: { index_built: false, total: 0, truncated: false, thread: [] },
           };
         }
         const hits = mailIndex.getThread(query, { folder, limit });
-        const thread = hits.map(h => ({
+        const allThread = hits.map(h => ({
           uid: h.record.uid,
           folder: h.record.folder,
-          from: h.record.fromName ? `${h.record.fromName} <${h.record.fromEmail}>` : h.record.fromEmail,
-          subject: h.record.subject,
+          from: capLen(h.record.fromName ? `${h.record.fromName} <${h.record.fromEmail}>` : h.record.fromEmail, MAX_FROM_LEN),
+          subject: capLen(h.record.subject, MAX_SUBJECT_LEN),
           date: h.record.date,
         }));
-        const out = { index_built: true, query, total: thread.length, thread };
+        const { rows: thread, truncated } = fitRows(allThread, SEARCH_RESULT_BUDGET);
+        const out = { index_built: true, query, total: thread.length, truncated, thread };
         if (thread.length === 0) {
           return { content: [{ type: 'text', text: `Тред по запросу "${query}" в индексе не найден.` }], structuredContent: out };
         }

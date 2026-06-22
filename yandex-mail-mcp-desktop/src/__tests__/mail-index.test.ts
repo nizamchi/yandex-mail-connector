@@ -19,6 +19,7 @@ import {
   indexExists,
   getIndexStatus,
   searchFast,
+  searchFastResult,
   getThread,
   getIndexDir,
   _resetForTests,
@@ -721,4 +722,31 @@ test('T37: getThread finds its seed after a cache rebuild (stable key, not ident
 
   const thread = getThread('Бюджет');
   assert.deepEqual(thread.map(h => h.record.uid), [1, 2], 'Message-ID graph still links the reply');
+}));
+
+// ── v2.8.0 (L2-C): true total + offset pagination ───────────────────────────
+
+test('T38: searchFastResult reports full total and paginates via offset', withTempStateDir(async () => {
+  const src = new FakeSource();
+  const headers: EmailHeader[] = [];
+  for (let i = 1; i <= 10; i++) {
+    headers.push(hdr({ uid: i, subject: 'meeting ' + i, date: `2025-06-${String(i).padStart(2, '0')}T00:00:00.000Z` }));
+  }
+  src.setFolder('INBOX', headers, 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const page1 = searchFastResult('meeting', { limit: 3, offset: 0 });
+  assert.equal(page1.total, 10, 'total is the full match count, not the page size');
+  assert.equal(page1.hits.length, 3, 'page is limited');
+
+  const page2 = searchFastResult('meeting', { limit: 3, offset: 3 });
+  assert.equal(page2.total, 10, 'total is stable across pages');
+  assert.equal(page2.hits.length, 3);
+
+  const p1uids = new Set(page1.hits.map(h => h.record.uid));
+  assert.ok(page2.hits.every(h => !p1uids.has(h.record.uid)), 'pages do not overlap');
+
+  // searchFast wrapper still returns just the hits (back-compat).
+  assert.equal(searchFast('meeting', { limit: 3 }).length, 3);
 }));
