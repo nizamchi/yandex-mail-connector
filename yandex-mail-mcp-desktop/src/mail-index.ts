@@ -94,6 +94,21 @@ export interface EnvelopeSource {
   stream(folder: string, opts?: { minUid?: number }): AsyncGenerator<EmailHeader, void, void>;
 }
 
+// Per-folder failure surfaced by build/update instead of aborting the whole
+// run. A folder that throws (network drop, missing mailbox, UID reset mid-sync)
+// is reported here and the other folders still sync. The CLI turns a non-empty
+// list into a non-zero exit so a cron job can detect a partial sync.
+export interface IndexError {
+  folder: string;
+  error: string;
+}
+
+export interface IndexResult {
+  folders: FolderStatus[];
+  added: number;
+  errors: IndexError[];
+}
+
 // ── Storage shapes ────────────────────────────────────────────────────
 
 interface FolderMeta {
@@ -189,6 +204,22 @@ function defaultSource(): EnvelopeSource {
 
 function ensureIndexDir(): void {
   fs.mkdirSync(indexDir(), { recursive: true, mode: 0o700 });
+}
+
+// errMessage: extract a short, credential-free message from an unknown throw.
+// IMAP/network errors carry no password (auth failures read "Authentication
+// failed"), so the raw message is safe to surface to the CLI; we still avoid
+// stringifying the whole error object.
+function errMessage(e: unknown): string {
+  const m = (e as { message?: unknown } | null)?.message;
+  return typeof m === 'string' && m.length > 0 ? m : String(e);
+}
+
+// dedupKey: primary key of a record. Includes account so a future multi-account
+// index (or a misconfigured shared state dir) never collides two mailboxes'
+// (folder, uid) pairs onto one slot.
+function dedupKey(account: string, folder: string, uid: number): string {
+  return account + '\x00' + folder + '\x00' + uid;
 }
 
 function atomicWrite(target: string, data: string, mode: number): void {
@@ -330,56 +361,76 @@ export function getIndexStatus(): IndexStatus {
 // ── Public: build / update ────────────────────────────────────────────
 
 // buildIndex: full rebuild of the given folders. Records for any OTHER folder
-// are preserved. For each rebuilt folder: read the cursor, stream every
-// envelope, replace that folder's records, and stamp meta with the cursor.
+// (or the same folder under a different account) are preserved. For each
+// folder: read the cursor, stream every envelope into a scratch list, and only
+// on success replace that folder's records + stamp meta. A folder that throws
+// mid-stream leaves its prior records and meta untouched and is reported in
+// `errors` -- a partial failure never corrupts the folders that did sync.
 export async function buildIndex(
   folders: string[],
   source?: EnvelopeSource,
-): Promise<{ folders: FolderStatus[]; added: number }> {
+): Promise<IndexResult> {
   const src = source ?? defaultSource();
   const account = getConfiguredAccount();
   const meta = loadMeta();
   meta.account = account;
 
-  // Keep records for folders we are NOT rebuilding.
-  const rebuildSet = new Set(folders);
-  const records: IndexRecord[] = loadAllRecords().filter(r => !rebuildSet.has(r.folder));
-
   let added = 0;
   const result: FolderStatus[] = [];
+  const errors: IndexError[] = [];
+  const succeeded = new Set<string>();
+  const freshByFolder = new Map<string, IndexRecord[]>();
+
   for (const folder of folders) {
-    const cursor = await src.getCursor(folder);
-    let count = 0;
-    for await (const h of src.stream(folder)) {
-      records.push(toRecord(account, folder, h));
-      count++;
-      added++;
+    try {
+      const cursor = await src.getCursor(folder);
+      // Stream into a scratch list so a mid-stream throw discards the partial
+      // folder rather than committing half of it.
+      const fresh: IndexRecord[] = [];
+      for await (const h of src.stream(folder)) fresh.push(toRecord(account, folder, h));
+      const count = fresh.length;
+      freshByFolder.set(folder, fresh);
+      succeeded.add(folder);
+      added += count;
+      const m: FolderMeta = {
+        uidValidity: cursor.uidValidity,
+        uidNext: cursor.uidNext,
+        count,
+        lastSyncMs: Date.now(),
+        schema: INDEX_SCHEMA,
+      };
+      meta.folders[folder] = m;
+      result.push({ folder, count, uidValidity: m.uidValidity, uidNext: m.uidNext, lastSyncMs: m.lastSyncMs, schema: m.schema });
+    } catch (e) {
+      errors.push({ folder, error: errMessage(e) });
     }
-    const m: FolderMeta = {
-      uidValidity: cursor.uidValidity,
-      uidNext: cursor.uidNext,
-      count,
-      lastSyncMs: Date.now(),
-      schema: INDEX_SCHEMA,
-    };
-    meta.folders[folder] = m;
-    result.push({ folder, count, uidValidity: m.uidValidity, uidNext: m.uidNext, lastSyncMs: m.lastSyncMs, schema: m.schema });
+  }
+
+  // Drop only THIS account's records for folders we successfully rebuilt; keep
+  // everything else (other folders, other accounts, and folders that errored).
+  const records: IndexRecord[] = loadAllRecords()
+    .filter(r => !(r.account === account && succeeded.has(r.folder)));
+  for (const fresh of freshByFolder.values()) {
+    for (const r of fresh) records.push(r);
   }
 
   rewriteEnvelopes(records);
   persistMeta(meta);
-  return { folders: result, added };
+  return { folders: result, added, errors };
 }
 
 // updateIndex: incremental sync. Per folder:
-//   - no stored meta OR uidValidity changed -> full rebuild of that folder.
-//   - else stream UIDs >= stored.uidNext, keep only uid >= stored.uidNext
-//     (the IMAP "N:*" range can echo the last existing message), dedup against
-//     existing (folder, uid) pairs, append, and advance the cursor.
+//   - no stored meta, uidValidity changed, stale schema, or a corrupt cursor
+//     (uidNext <= 0) -> full rebuild of that folder.
+//   - else stream UIDs >= stored.uidNext, keep only uid >= stored.uidNext (the
+//     IMAP "N:*" range can echo the last existing message), dedup, append, then
+//     RECONCILE: if stored.count + newCount != cursor.exists the folder lost
+//     messages (expunge/move) the append path cannot observe -> fall back to a
+//     full rebuild so the record set and count match the server exactly.
 export async function updateIndex(
   folders: string[],
   source?: EnvelopeSource,
-): Promise<{ folders: FolderStatus[]; added: number }> {
+): Promise<IndexResult> {
   const src = source ?? defaultSource();
   const account = getConfiguredAccount();
   const meta = loadMeta();
@@ -389,75 +440,98 @@ export async function updateIndex(
   const toRebuild: string[] = [];
   const toAppend: string[] = [];
   const cursors = new Map<string, { uidValidity: number; uidNext: number; exists: number }>();
+  const errors: IndexError[] = [];
   for (const folder of folders) {
-    const cursor = await src.getCursor(folder);
-    cursors.set(folder, cursor);
-    const stored = meta.folders[folder];
-    // Rebuild on: never indexed, server renumbered (uidValidity), OR the stored
-    // records predate the current index schema (auto-migration -- e.g. capturing
-    // inReplyTo for threading without the user running a manual `index build`).
-    if (!stored || stored.uidValidity !== cursor.uidValidity || stored.schema < INDEX_SCHEMA) {
-      toRebuild.push(folder);
-    } else {
-      toAppend.push(folder);
+    try {
+      const cursor = await src.getCursor(folder);
+      cursors.set(folder, cursor);
+      const stored = meta.folders[folder];
+      // Rebuild on: never indexed, server renumbered (uidValidity), stale schema
+      // (auto-migration -- e.g. capturing inReplyTo for threading without a
+      // manual `index build`), or a corrupt/zero cursor that can't anchor an
+      // incremental fetch.
+      if (
+        !stored || stored.uidValidity !== cursor.uidValidity ||
+        stored.schema < INDEX_SCHEMA || stored.uidNext <= 0
+      ) {
+        toRebuild.push(folder);
+      } else {
+        toAppend.push(folder);
+      }
+    } catch (e) {
+      errors.push({ folder, error: errMessage(e) });
     }
   }
 
   let added = 0;
   const result: FolderStatus[] = [];
-
-  // Rebuild path delegates to buildIndex semantics for the affected folders.
-  if (toRebuild.length > 0) {
-    const rebuilt = await buildIndex(toRebuild, src);
-    added += rebuilt.added;
-    for (const fs0 of rebuilt.folders) result.push(fs0);
-    // buildIndex rewrote files + meta; re-read so the append path below sees
-    // the post-rebuild state.
-    Object.assign(meta.folders, loadMeta().folders);
-  }
+  // Folders whose append revealed deletions -> rebuilt below alongside toRebuild.
+  const reconcile: string[] = [];
 
   if (toAppend.length > 0) {
     const records = loadAllRecords();
-    // Existing (folder, uid) keys for dedup.
     const existing = new Set<string>();
-    for (const r of records) existing.add(r.folder + '\x00' + r.uid);
+    for (const r of records) existing.add(dedupKey(r.account, r.folder, r.uid));
 
     for (const folder of toAppend) {
-      const stored = meta.folders[folder];
-      const cursor = cursors.get(folder)!;
-      const minUid = stored.uidNext;
-      let newCount = 0;
-      for await (const h of src.stream(folder, { minUid })) {
-        // The IMAP "minUid:*" range can echo the last existing message; drop
-        // anything below the high-water mark.
-        if (h.uid < minUid) continue;
-        const key = folder + '\x00' + h.uid;
-        if (existing.has(key)) continue;
-        existing.add(key);
-        records.push(toRecord(account, folder, h));
-        newCount++;
-        added++;
+      try {
+        const stored = meta.folders[folder];
+        const cursor = cursors.get(folder)!;
+        const minUid = stored.uidNext;
+        let newCount = 0;
+        for await (const h of src.stream(folder, { minUid })) {
+          // The IMAP "minUid:*" range can echo the last existing message; drop
+          // anything below the high-water mark.
+          if (h.uid < minUid) continue;
+          const key = dedupKey(account, folder, h.uid);
+          if (existing.has(key)) continue;
+          existing.add(key);
+          records.push(toRecord(account, folder, h));
+          newCount++;
+        }
+        // Reconcile: cursor.exists is the server's authoritative message count.
+        // If our (stored.count + appended) disagrees, messages were deleted or
+        // the stored count had drifted -- the append path can only add, so hand
+        // the folder to a full rebuild that measures the true count.
+        const expected = stored.count + newCount;
+        if (expected !== cursor.exists) {
+          reconcile.push(folder);
+        } else {
+          added += newCount;
+          const m: FolderMeta = {
+            uidValidity: cursor.uidValidity,
+            uidNext: cursor.uidNext,
+            count: cursor.exists, // measured, not fabricated.
+            lastSyncMs: Date.now(),
+            schema: INDEX_SCHEMA,
+          };
+          meta.folders[folder] = m;
+          result.push({ folder, count: m.count, uidValidity: m.uidValidity, uidNext: m.uidNext, lastSyncMs: m.lastSyncMs, schema: m.schema });
+        }
+      } catch (e) {
+        errors.push({ folder, error: errMessage(e) });
       }
-      const m: FolderMeta = {
-        uidValidity: cursor.uidValidity,
-        uidNext: cursor.uidNext,
-        count: stored.count + newCount,
-        lastSyncMs: Date.now(),
-        schema: INDEX_SCHEMA,
-      };
-      meta.folders[folder] = m;
-      result.push({ folder, count: m.count, uidValidity: m.uidValidity, uidNext: m.uidNext, lastSyncMs: m.lastSyncMs, schema: m.schema });
     }
 
     rewriteEnvelopes(records);
     persistMeta(meta);
-  } else if (toRebuild.length > 0) {
-    // Only rebuilds happened; buildIndex already persisted. Still persist meta
-    // to capture the merged account field (cheap, idempotent).
+  }
+
+  // Full-rebuild folders: the originally-stale ones plus any the append found to
+  // have lost messages. buildIndex re-streams and persists records + meta.
+  const rebuildAll = [...toRebuild, ...reconcile];
+  if (rebuildAll.length > 0) {
+    const rebuilt = await buildIndex(rebuildAll, src);
+    added += rebuilt.added;
+    for (const fs0 of rebuilt.folders) result.push(fs0);
+    for (const e of rebuilt.errors) errors.push(e);
+    // Re-read so meta reflects the post-rebuild cursors, then persist to keep
+    // the merged account field (cheap, idempotent).
+    Object.assign(meta.folders, loadMeta().folders);
     persistMeta(meta);
   }
 
-  return { folders: result, added };
+  return { folders: result, added, errors };
 }
 
 // dropIndex: delete the entire index directory. Idempotent.

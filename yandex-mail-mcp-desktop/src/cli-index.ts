@@ -27,6 +27,12 @@ function printStatus(): void {
   }
 }
 
+function reportErrors(errors: mailIndex.IndexError[]): void {
+  for (const e of errors) {
+    process.stderr.write(`[index] FAILED ${e.folder}: ${e.error}\n`);
+  }
+}
+
 function usage(): void {
   process.stderr.write(
     'Usage: yandex-mail-mcp index <command>\n' +
@@ -47,11 +53,17 @@ export async function runIndexCli(args: string[]): Promise<number> {
 
     case 'build': {
       const folders = rest.length > 0 ? rest : ['INBOX'];
+      // A bare `index build` covers only INBOX; cross-folder threads (the
+      // headline get_thread feature) also need Sent indexed.
+      if (rest.length === 0) {
+        process.stderr.write('[index] note: indexing INBOX only -- add folders for cross-folder threads, e.g. `index build INBOX Sent`.\n');
+      }
       process.stderr.write(`[index] building ${folders.join(', ')} ...\n`);
       const r = await mailIndex.buildIndex(folders);
       process.stderr.write(`[index] indexed ${r.added} message(s).\n`);
+      reportErrors(r.errors);
       printStatus();
-      return 0;
+      return r.errors.length > 0 ? 1 : 0;
     }
 
     case 'update': {
@@ -66,8 +78,9 @@ export async function runIndexCli(args: string[]): Promise<number> {
       process.stderr.write(`[index] updating ${folders.join(', ')} ...\n`);
       const r = await mailIndex.updateIndex(folders);
       process.stderr.write(`[index] added ${r.added} new message(s).\n`);
+      reportErrors(r.errors);
       printStatus();
-      return 0;
+      return r.errors.length > 0 ? 1 : 0;
     }
 
     case 'drop':

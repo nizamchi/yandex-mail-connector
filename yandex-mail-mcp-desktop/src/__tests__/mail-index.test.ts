@@ -54,17 +54,29 @@ class FakeSource implements EnvelopeSource {
   // When true, stream() echoes the message at exactly minUid (server boundary
   // echo) to verify updateIndex drops the duplicate.
   echoBoundary = false;
+  // Folders whose getCursor throws (simulates a network drop / missing mailbox
+  // for the per-folder error-resilience tests).
+  private failFolders = new Set<string>();
+  // Override the cursor.exists a folder advertises, decoupled from the streamed
+  // header list -- lets a test simulate "server says N but we stream M".
+  private existsOverride = new Map<string, number>();
 
-  setFolder(folder: string, headers: EmailHeader[], uidValidity: number): void {
+  setFolder(folder: string, headers: EmailHeader[], uidValidity: number, uidNextOverride?: number): void {
     this.folders.set(folder, headers.slice());
     const maxUid = headers.reduce((m, h) => Math.max(m, h.uid), 0);
-    this.cursors.set(folder, { uidValidity, uidNext: maxUid + 1, exists: headers.length });
+    const uidNext = uidNextOverride ?? maxUid + 1;
+    this.cursors.set(folder, { uidValidity, uidNext, exists: headers.length });
   }
 
+  failOn(folder: string): void { this.failFolders.add(folder); }
+  setExists(folder: string, exists: number): void { this.existsOverride.set(folder, exists); }
+
   async getCursor(folder: string): Promise<{ uidValidity: number; uidNext: number; exists: number }> {
+    if (this.failFolders.has(folder)) throw new Error(`fake cursor failure for ${folder}`);
     const c = this.cursors.get(folder);
     if (!c) return { uidValidity: 1, uidNext: 1, exists: 0 };
-    return c;
+    const override = this.existsOverride.get(folder);
+    return override === undefined ? c : { ...c, exists: override };
   }
 
   async *stream(folder: string, opts?: { minUid?: number }): AsyncGenerator<EmailHeader, void, void> {
@@ -588,4 +600,66 @@ test('T31: a pre-threading (schema 1) folder is auto-rebuilt on update', withTem
   const r = await updateIndex(['INBOX'], src);
   assert.ok(r.added >= 2, 'stale-schema folder is re-streamed, not incrementally appended');
   assert.equal(getIndexStatus().threadingReady, true, 'auto-migration restores threading');
+}));
+
+// ── v2.8.0 (L2-A): expunge reconciliation + measured count + resilience ──────
+
+test('T32: a deleted message is reconciled out of the index on update', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, subject: 'first' }),
+    hdr({ uid: 2, subject: 'second' }),
+    hdr({ uid: 3, subject: 'third' }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+  assert.equal(searchFast('second').length, 1, 'precondition: uid 2 is searchable');
+
+  // uid 2 is expunged. uidNext stays 4 (a deletion does not lower the high-water
+  // mark), so the append path streams nothing new -- only the exists mismatch
+  // (stored 3 vs server 2) reveals the deletion and forces a rebuild.
+  src.setFolder('INBOX', [hdr({ uid: 1, subject: 'first' }), hdr({ uid: 3, subject: 'third' })], 100, 4);
+
+  const res = await updateIndex(['INBOX'], src);
+  assert.equal(res.errors.length, 0);
+  _resetForTests();
+  const status = getIndexStatus();
+  assert.equal(status.totalCount, 2, 'count reflects the deletion (measured, not fabricated)');
+  assert.equal(status.folders[0].count, 2);
+  assert.equal(searchFast('second').length, 0, 'the deleted message is gone from search');
+  assert.equal(searchFast('third').length, 1, 'surviving messages stay searchable');
+}));
+
+test('T33: a folder that fails to sync is reported, others still build', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 1, subject: 'good message' })], 100);
+  src.failOn('Spam');
+
+  const res = await buildIndex(['INBOX', 'Spam'], src);
+  assert.equal(res.errors.length, 1, 'the failing folder is surfaced, not swallowed');
+  assert.equal(res.errors[0].folder, 'Spam');
+  assert.equal(res.folders.length, 1, 'only the healthy folder is reported as synced');
+  assert.equal(res.folders[0].folder, 'INBOX');
+  _resetForTests();
+  assert.equal(getIndexStatus().totalCount, 1, 'the healthy folder is fully usable');
+  assert.equal(searchFast('good').length, 1);
+}));
+
+test('T34: a count drift from a prior bug self-heals on the next update', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 1 }), hdr({ uid: 2 })], 100);
+  await buildIndex(['INBOX'], src);
+
+  // Corrupt the stored count to mimic the pre-fix fabricated-count drift.
+  const metaP = path.join(getIndexDir(), 'meta.json');
+  const meta = JSON.parse(fs.readFileSync(metaP, 'utf-8'));
+  meta.folders['INBOX'].count = 99;
+  fs.writeFileSync(metaP, JSON.stringify(meta));
+  _resetForTests();
+
+  // No real change on the server (exists still 2); the reconcile detects the
+  // drift (99 != 2) and rebuilds to the true count.
+  const res = await updateIndex(['INBOX'], src);
+  assert.equal(res.errors.length, 0);
+  assert.equal(getIndexStatus().totalCount, 2, 'drifted count is corrected to the measured value');
 }));
