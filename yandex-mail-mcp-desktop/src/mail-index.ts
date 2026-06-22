@@ -1005,6 +1005,192 @@ export function getThread(query: string, opts?: { folder?: string; limit?: numbe
   }));
 }
 
+// ── Public: unanswered threads ────────────────────────────────────────
+
+export interface UnansweredHit {
+  record: IndexRecord;
+  daysWaiting: number;
+}
+
+export interface UnansweredPage {
+  hits: UnansweredHit[];
+  total: number;
+  ownerKnown: boolean;
+}
+
+// unansweredThreads: find received threads the owner has NOT replied to that
+// have been sitting longer than olderThanDays.
+//
+// Thread grouping uses the SAME graph getThread uses (Message-ID edges +
+// normalized-subject bucket) but runs a SINGLE pass over all account records
+// rather than calling getThread per message -- that would re-invoke searchFast
+// N times and be O(N^2).
+//
+// Sender-identity classification (CLAUDE.md: never hardcode folder names):
+// A message whose fromEmail === owner is one the owner authored regardless of
+// what folder it lives in (Sent/Drafts/Отправленные/etc.). Condition (a) below
+// (latest.fromEmail !== owner) therefore covers Sent and Drafts without ever
+// naming a folder.
+//
+// Known acceptable limitation: newsletters/notifications the owner never replies
+// to appear as "unanswered" by definition. Document this in the tool description
+// and suggest the `from` filter.
+export function unansweredThreads(opts?: {
+  olderThanDays?: number;
+  folder?: string;
+  from?: string;
+  limit?: number;
+  offset?: number;
+  nowMs?: number;
+}): UnansweredPage {
+  // Step 1: resolve owner. Cannot classify "mine" without a known identity.
+  const owner = getConfiguredAccount();
+  if (owner === 'default') return { hits: [], total: 0, ownerKnown: false };
+
+  const c = getCache();
+  const acct = enforceAccount();
+  const olderThanDays = Math.max(0, Math.floor(opts?.olderThanDays ?? 7));
+  const limit = clampLimit(opts?.limit);
+  const offset = Math.max(0, Math.floor(opts?.offset ?? 0));
+  const nowMs = opts?.nowMs ?? Date.now();
+  const folderFilter = opts?.folder;
+  const fromFilter = opts?.from?.toLowerCase();
+
+  // Step 2: collect account record indices.
+  const accountIdx: number[] = [];
+  for (let i = 0; i < c.records.length; i++) {
+    const r = c.records[i];
+    if (acct !== null && r.account !== acct) continue;
+    accountIdx.push(i);
+  }
+  if (accountIdx.length === 0) return { hits: [], total: 0, ownerKnown: true };
+
+  // Step 3: thread grouping over account records via union-find.
+  // We use a simple union-find (parent array over accountIdx positions).
+  // Edges: Message-ID graph (inReplyTo -> byMessageId child edges) PLUS
+  // normalized-subject bucket (same non-empty normalized subject = same thread).
+  // Cross-account edges are never admitted: byMessageId/childrenOf span ALL
+  // records in the cache; we only union indices within accountIdx.
+
+  // Map from cache index -> position in accountIdx for O(1) membership checks.
+  const idxPos = new Map<number, number>();
+  for (let p = 0; p < accountIdx.length; p++) idxPos.set(accountIdx[p], p);
+
+  // Union-find arrays indexed by position within accountIdx.
+  const parent = accountIdx.map((_, p) => p);
+  function find(p: number): number {
+    while (parent[p] !== p) { parent[p] = parent[parent[p]]; p = parent[p]; }
+    return p;
+  }
+  function union(a: number, b: number): void {
+    a = find(a); b = find(b);
+    if (a !== b) parent[a] = b;
+  }
+
+  // Message-ID graph edges (cross-folder, precise).
+  for (const pos of accountIdx.map((_, p) => p)) {
+    const cIdx = accountIdx[pos];
+    const r = c.records[cIdx];
+    // Parent edge: this record's inReplyTo points to a parent messageId.
+    if (r.inReplyTo) {
+      const parentCIdx = c.byMessageId.get(r.inReplyTo);
+      if (parentCIdx !== undefined) {
+        const parentPos = idxPos.get(parentCIdx);
+        if (parentPos !== undefined) union(pos, parentPos);
+      }
+    }
+    // Child edges: records that replied to this record's messageId.
+    if (r.messageId) {
+      const kids = c.childrenOf.get(r.messageId);
+      if (kids) {
+        for (const kidCIdx of kids) {
+          const kidPos = idxPos.get(kidCIdx);
+          if (kidPos !== undefined) union(pos, kidPos);
+        }
+      }
+    }
+  }
+
+  // Normalized-subject bucket: same non-empty normalized subject -> same thread.
+  // Empty normalized subject must NOT collapse subjectless mail into one thread
+  // (mirrors getThread's `target.length > 0` guard).
+  const subjectBucket = new Map<string, number>(); // normalizedSubject -> first pos
+  for (let p = 0; p < accountIdx.length; p++) {
+    const cIdx = accountIdx[p];
+    const ns = c.normalizedSubjects[cIdx];
+    if (!ns) continue; // guard: empty subject never groups
+    const existing = subjectBucket.get(ns);
+    if (existing === undefined) {
+      subjectBucket.set(ns, p);
+    } else {
+      union(p, existing);
+    }
+  }
+
+  // Step 4 & 5: per thread, pick latest record and apply the unanswered test.
+  // Group positions by their root component.
+  const components = new Map<number, number[]>(); // root -> [positions]
+  for (let p = 0; p < accountIdx.length; p++) {
+    const root = find(p);
+    const list = components.get(root);
+    if (list) list.push(p); else components.set(root, [p]);
+  }
+
+  const candidates: UnansweredHit[] = [];
+
+  for (const positions of components.values()) {
+    // Find the latest record in the thread by valid date (ties: highest uid).
+    let latestPos = -1;
+    let latestMs = -Infinity;
+    let latestUid = -1;
+    for (const p of positions) {
+      const cIdx = accountIdx[p];
+      const ms = c.dateMs[cIdx];
+      if (isNaN(ms)) continue; // skip records with no valid date
+      if (ms > latestMs || (ms === latestMs && c.records[cIdx].uid > latestUid)) {
+        latestMs = ms;
+        latestUid = c.records[cIdx].uid;
+        latestPos = p;
+      }
+    }
+    // Skip threads with no valid-date member.
+    if (latestPos < 0) continue;
+
+    const latestCIdx = accountIdx[latestPos];
+    const latest = c.records[latestCIdx];
+
+    // Unanswered test:
+    // (a) latest.fromEmail !== owner: the last word came from someone else, not me.
+    // (b) ageDays >= olderThanDays: the thread has been sitting long enough.
+    if (latest.fromEmail === owner) continue; // owner sent the last message
+    const ageDays = Math.floor((nowMs - latestMs) / 86_400_000);
+    if (ageDays < 0) continue; // future-dated: fails the cutoff
+    if (ageDays < olderThanDays) continue;
+
+    // Step 6: apply candidate filters to `latest`.
+    if (folderFilter !== undefined && latest.folder !== folderFilter) continue;
+    if (fromFilter) {
+      const emailMatch = latest.fromEmail.includes(fromFilter);
+      const nameMatch = latest.fromName.toLowerCase().includes(fromFilter);
+      if (!emailMatch && !nameMatch) continue;
+    }
+
+    candidates.push({ record: latest, daysWaiting: ageDays });
+  }
+
+  // Step 7: sort OLDEST-INBOUND FIRST (most overdue at top): ascending by date.
+  candidates.sort((a, b) => {
+    const ma = a.record.date ? new Date(a.record.date).getTime() : -Infinity;
+    const mb = b.record.date ? new Date(b.record.date).getTime() : -Infinity;
+    return ma - mb;
+  });
+
+  // Step 8: paginate.
+  const total = candidates.length;
+  const hits = candidates.slice(offset, offset + limit);
+  return { hits, total, ownerKnown: true };
+}
+
 // ── Test-only ─────────────────────────────────────────────────────────
 
 // _resetForTests: flush the in-memory FTS cache so a fresh state dir (or a
