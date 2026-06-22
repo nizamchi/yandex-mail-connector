@@ -1,6 +1,7 @@
 import { ImapFlow, type FetchMessageObject, type ListResponse } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { loadCredentials, type Credentials } from './token.js';
+import { extractAttachments, type ParsedAttachment } from './attachment-parser.js';
 
 // ── Constants ──────────────────────────────────────────────
 const IMAP_HOST = 'imap.yandex.com';
@@ -26,6 +27,10 @@ export interface EmailHeader {
   seen: boolean;
   flagged: boolean;
   hasAttachments: boolean;
+  // Attachment metadata extracted from BODYSTRUCTURE. Only populated on the
+  // streamEnvelopes path (bodyStructure:true is fetched there). Undefined on
+  // the 4 other fetch paths (listEmails, getEmail, findSenders, searchEmails).
+  attachments?: ParsedAttachment[];
   size: number;
 }
 
@@ -123,6 +128,7 @@ function toAddrs(list?: Array<{ name?: string; address?: string }>): EmailAddres
 
 function parseHeader(msg: FetchMessageObject): EmailHeader {
   const e = msg.envelope;
+  const { attachments } = extractAttachments(msg);
   return {
     uid: msg.uid,
     messageId: e?.messageId ?? '',
@@ -134,7 +140,8 @@ function parseHeader(msg: FetchMessageObject): EmailHeader {
     date: e?.date?.toISOString() ?? '',
     seen: msg.flags?.has('\\Seen') ?? false,
     flagged: msg.flags?.has('\\Flagged') ?? false,
-    hasAttachments: false,
+    hasAttachments: attachments.length > 0,
+    attachments,
     size: msg.size ?? 0,
   };
 }
@@ -297,9 +304,9 @@ export async function getEmail(folder: string, uid: number): Promise<EmailMessag
 // trade-off (extra round trip vs. extra parse) and v2.3.0 ships the simpler
 // per-envelope filter.
 //
-// has_attachments cannot be derived from the envelope alone (would need
-// bodyStructure, which is much heavier per message). EnvelopeRow.hasAttachments
-// is always false here -- documented in the stats tool description.
+// BODYSTRUCTURE is captured on this fetch (one BODYSTRUCTURE atom in the same
+// FETCH command, zero extra round-trips, zero body bytes). hasAttachments is
+// therefore real on this path -- derived by extractAttachments() in parseHeader.
 export async function* streamEnvelopes(
   folder: string,
   since?: string,
@@ -331,7 +338,7 @@ export async function* streamEnvelopes(
     for (let i = 0; i < uids.length; i += CHUNK_SIZE) {
       const chunk = uids.slice(i, i + CHUNK_SIZE);
       if (chunk.length === 0) continue;
-      for await (const msg of c.fetch(chunk, { uid: true, envelope: true, flags: true, size: true }, { uid: true })) {
+      for await (const msg of c.fetch(chunk, { uid: true, envelope: true, flags: true, size: true, bodyStructure: true }, { uid: true })) {
         const hdr = parseHeader(msg);
         // Per-envelope date filter: IMAP UID order is not date-sorted, so we
         // must check each envelope. Envelopes with no date pass through and
