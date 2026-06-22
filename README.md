@@ -2,8 +2,8 @@
 
 MCP-сервер для Яндекс.Почты с защитой опасных операций на стороне сервера.
 
-[![Версия](https://img.shields.io/badge/версия-2.7.1-blue)](CHANGELOG.md)
-[![Тесты](https://img.shields.io/badge/тесты-420_/_0_упавших-success)](#)
+[![Версия](https://img.shields.io/badge/версия-2.8.0-blue)](CHANGELOG.md)
+[![Тесты](https://img.shields.io/badge/тесты-429_/_0_упавших-success)](#)
 [![Уязвимости](https://img.shields.io/badge/npm_audit-0-success)](#)
 [![Лицензия](https://img.shields.io/badge/лицензия-PolyForm_NC_1.0.0-orange)](LICENSE)
 
@@ -103,7 +103,7 @@ npm install --omit=dev --ignore-scripts
 **Вариант B — `npx` без клонирования (с v2.2.1+):**
 
 ```bash
-npx -y github:nizamchi/yandex-mail-connector#v2.7.1 --check
+npx -y github:nizamchi/yandex-mail-connector#v2.8.0 --check
 ```
 
 Бандл закэшируется в `~/.npm/_npx/`. Удобно для быстрого health-check или
@@ -331,7 +331,7 @@ yandex-mail-mcp-trust --policy set thresholds.augment 25 --yes  # подкрут
 
 ## Статус
 
-Текущая версия — **2.7.1**, июнь 2026 года. 426 тестов (420 проходят, 6 unix-only пропускаются на Windows), ноль известных уязвимостей в зависимостях (`npm audit --omit=dev`). Есть статическая проверка типов нашего кода (`npm run typecheck`).
+Текущая версия — **2.8.0**, июнь 2026 года. Релиз надёжности Layer 2: по итогам полного код-ревью движка поиска закрыты корректность синхронизации индекса (вычистка удалённых писем, измеряемый счётчик), изоляция почтовых ящиков на чтении и ограничение размера выдачи; добавлены пагинация и устойчивость к сбою отдельной папки. 435 тестов (429 проходят, 6 unix-only пропускаются на Windows), ноль известных уязвимостей в зависимостях (`npm audit --omit=dev`). Есть статическая проверка типов нашего кода (`npm run typecheck`).
 
 Дальнейшие планы — в [ROADMAP.md](ROADMAP.md).
 
