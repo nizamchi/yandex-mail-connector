@@ -28,6 +28,8 @@ import { randomBytes } from 'node:crypto';
 
 import { getStateDir } from './state-dir.js';
 import type { EmailHeader } from './imap.js';
+import type { ParsedAttachment } from './attachment-parser.js';
+import { sanitizeForDisplay } from './sanitize.js';
 
 // ── Public types ──────────────────────────────────────────────────────
 
@@ -50,6 +52,46 @@ export interface IndexRecord {
   // in schema 3 (v3.0.0). Pre-schema-3 records read from disk have this as
   // undefined until auto-migrated; the ?? false default handles forward-compat.
   has_attachments: boolean;
+}
+
+// AttachmentRecord: durable per-attachment manifest row (one per attachment leaf).
+// One email with N attachment leaves → N AttachmentRecord rows, all co-located in
+// attachments.jsonl alongside envelopes.jsonl.
+//
+// Field ordering:
+//   identity prefix — mirrors IndexRecord :35-38 so reviewers read both the same way.
+//   denormalized envelope fields — snapshotted from EmailHeader at build/append time;
+//     refreshed only on rebuild. Phase-3 since/before/from filters scan the manifest
+//     alone (no cross-cache join needed).
+//   attachment payload — mirrors ParsedAttachment field order.
+//
+// Key invariants:
+//   - md5 key is ALWAYS present (null when absent from BODYSTRUCTURE — Yandex sends null).
+//   - filename may be null (sanitized-to-empty filename is stored null, row NOT dropped).
+//   - sha256 is ABSENT entirely (populated values require a body download; Yandex IMAP
+//     sends none — metadata-only per Phase 2 contract).
+export interface AttachmentRecord {
+  // Identity prefix — mirrors IndexRecord :35-38
+  account: string;
+  folder: string;
+  uid: number;
+  messageId: string;
+  // Denormalized envelope fields (MR-2) — from EmailHeader, snapshot at build/append time,
+  // refreshed only on rebuild. Phase-3 since/before/from filters scan the manifest alone.
+  date: string;
+  fromEmail: string;
+  fromName: string;
+  subject: string;
+  // Attachment payload — mirrors ParsedAttachment :13-26
+  // filename: sanitizeForDisplay(raw ?? '', {maxLen:200}) || null  (LD-6/LD-7)
+  filename: string | null;
+  mimeType: string;
+  // RFC 3501 §7.4.2 BODYSTRUCTURE transfer-encoded octets; base64 parts ~33% over
+  // decoded bytes; NO correction factor. Number.isFinite(a.size) ? a.size : 0 backstop.
+  size: number;
+  partId: string;
+  // a.md5 ?? null — Yandex sends null (verified live 2026-06-22); key always present.
+  md5: string | null;
 }
 
 export interface SearchHit {
@@ -175,6 +217,10 @@ function metaPath(): string {
 
 function envelopesPath(): string {
   return path.join(indexDir(), 'envelopes.jsonl');
+}
+
+function attachmentsPath(): string {
+  return path.join(indexDir(), 'attachments.jsonl');
 }
 
 export function getIndexDir(): string { return indexDir(); }
@@ -332,6 +378,37 @@ function toRecord(account: string, folder: string, h: EmailHeader): IndexRecord 
   };
 }
 
+// toAttachmentRecord: sibling of toRecord for the attachment manifest.
+// METADATA-ONLY: reads only h.attachments (already-parsed metadata from BODYSTRUCTURE).
+// No c.download, no simpleParser, no msg.source, no sha256 computation.
+function toAttachmentRecord(
+  account: string,
+  folder: string,
+  h: EmailHeader,
+  a: ParsedAttachment,
+): AttachmentRecord {
+  return {
+    account,
+    folder,
+    uid: h.uid,
+    messageId: h.messageId,
+    // Denormalized envelope fields — snapshotted from the same EmailHeader that produced toRecord.
+    date: h.date ?? '',
+    fromEmail: h.from[0]?.address?.toLowerCase() ?? '',
+    fromName: h.from[0]?.name ?? '',
+    subject: h.subject ?? '',
+    // Store boundary: sanitize the raw filename to strip bidi/control/format chars (LD-6/LD-7).
+    // sanitized-to-empty filename → null (row not dropped; preserves the attachment's existence).
+    filename: sanitizeForDisplay(a.filename ?? '', { maxLen: 200 }) || null,
+    mimeType: a.mimeType,
+    // RFC 3501 §7.4.2 BODYSTRUCTURE octets backstop: non-finite (undefined/NaN/Infinity) → 0.
+    size: Number.isFinite(a.size) ? a.size : 0,
+    partId: a.partId ?? '',
+    // md5 key always present; Yandex sends null from BODYSTRUCTURE (verified live 2026-06-22).
+    md5: a.md5 ?? null,
+  };
+}
+
 function loadAllRecords(): IndexRecord[] {
   const p = envelopesPath();
   if (!fs.existsSync(p)) return [];
@@ -356,6 +433,39 @@ function serializeRecords(records: IndexRecord[]): string {
 
 function rewriteEnvelopes(records: IndexRecord[]): void {
   atomicWrite(envelopesPath(), serializeRecords(records), 0o600);
+}
+
+// ── Attachment manifest helpers (mirrors of the envelope helpers above) ────────
+
+// loadAllAttachments: verbatim mirror of loadAllRecords. Returns [] when the
+// manifest does not exist; skips a corrupt line rather than aborting.
+export function loadAllAttachments(): AttachmentRecord[] {
+  const p = attachmentsPath();
+  if (!fs.existsSync(p)) return [];
+  const raw = fs.readFileSync(p, 'utf-8');
+  const out: AttachmentRecord[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      out.push(JSON.parse(trimmed) as AttachmentRecord);
+    } catch {
+      // Skip a corrupt line rather than abort the whole load -- a partially
+      // written JSONL (crash mid-append) must not brick the manifest.
+    }
+  }
+  return out;
+}
+
+// serializeAttachments: verbatim mirror of serializeRecords.
+function serializeAttachments(records: AttachmentRecord[]): string {
+  return records.length === 0 ? '' : records.map(r => JSON.stringify(r)).join('\n') + '\n';
+}
+
+// rewriteAttachments: verbatim mirror of rewriteEnvelopes at mode 0o600.
+// Filenames + sender metadata are sensitive — same secret hygiene as envelopes.
+function rewriteAttachments(records: AttachmentRecord[]): void {
+  atomicWrite(attachmentsPath(), serializeAttachments(records), 0o600);
 }
 
 // ── Public: status / existence ────────────────────────────────────────
