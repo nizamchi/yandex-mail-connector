@@ -297,6 +297,65 @@ export async function getEmail(folder: string, uid: number): Promise<EmailMessag
   });
 }
 
+// getAttachmentBytes -- fetch one attachment from a message by UID.
+//
+// Reuses getEmail's exact fetch pattern (source:true + simpleParser) but only
+// retrieves the single uid needed and does NOT modify getEmail. Returns the
+// raw bytes of ONE attachment or null when the message / attachment is absent.
+//
+// Selector:
+//   index    — 0-based index into parsed.attachments (matches yandex_get_email order).
+//   filename — match by exact filename first, then case-insensitive substring.
+//   If both are provided, index takes precedence.
+//
+// Returns null (not throws) when the message is absent or the attachment does
+// not exist so callers can produce a friendly not-found result.
+export async function getAttachmentBytes(
+  folder: string,
+  uid: number,
+  selector: { index?: number; filename?: string },
+): Promise<{ content: Buffer; filename: string | null; contentType: string; size: number } | null> {
+  return getConnectionManager().withClient(async c => {
+    await c.mailboxOpen(folder, { readOnly: true });
+    let raw: Buffer | null = null;
+    for await (const msg of c.fetch(String(uid), { uid: true, source: true }, { uid: true })) {
+      raw = (msg as { source?: Buffer }).source ?? null;
+    }
+    if (!raw) return null;
+
+    const parsed = await simpleParser(raw);
+    const attachments: Array<{ content?: Buffer; filename?: string; contentType?: string; size?: number }> =
+      (parsed.attachments ?? []) as Array<{ content?: Buffer; filename?: string; contentType?: string; size?: number }>;
+
+    if (attachments.length === 0) return null;
+
+    let att: { content?: Buffer; filename?: string; contentType?: string; size?: number } | undefined;
+
+    if (typeof selector.index === 'number') {
+      att = attachments[selector.index];
+    } else if (selector.filename) {
+      const needle = selector.filename;
+      // Exact match first, then case-insensitive substring.
+      att = attachments.find(a => a.filename === needle)
+        ?? attachments.find(a => typeof a.filename === 'string' && a.filename.toLowerCase().includes(needle.toLowerCase()));
+    } else {
+      // Default to first attachment if no selector given.
+      att = attachments[0];
+    }
+
+    if (!att) return null;
+    const content = att.content;
+    if (!content) return null;
+
+    return {
+      content,
+      filename: att.filename ?? null,
+      contentType: att.contentType ?? 'application/octet-stream',
+      size: content.length,
+    };
+  });
+}
+
 // streamEnvelopes -- bounded-memory async generator over a folder's envelopes.
 // Yields per envelope (not per batch) so the consumer can short-circuit. UIDs
 // are fetched in chunks of CHUNK_SIZE to bound the imapflow internal buffer;

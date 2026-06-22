@@ -67,6 +67,86 @@ export function sanitizeForDisplay(
   return out;
 }
 
+// ── safeAttachmentFilename ──────────────────────────────────────────────────
+//
+// Pure filesystem-safe basename helper for ATTACKER-CONTROLLED attachment names.
+// Distinct from sanitizeForDisplay — this is for path safety, not LLM display.
+//
+// Security contract (T-psg-01):
+//   1. Takes only the basename (split on / and \ , keep last non-empty segment).
+//   2. Strips a leading Windows drive prefix (single letter + colon).
+//   3. Drops any ".." segment that survived segmentation.
+//   4. Removes NUL (U+0000) and all C0/C1 control chars (same code-point class
+//      approach as above — no source-encoding dependency).
+//   5. Strips leading dots so the result cannot be a hidden/empty "." or ".." name.
+//   6. Allows: Unicode letters (incl. Cyrillic U+0400-04FF), digits, dots,
+//      dashes, underscores, spaces, parentheses.
+//   7. Caps length to 200 characters.
+//   8. If the cleaned result is empty, returns `fallback`.
+//
+// Pure module — no fs/path import.
+
+const SAFE_FILENAME_MAX = 200;
+
+// Match characters that are NOT allowed in a filesystem-safe filename.
+// Allowed: word chars (\w = [A-Za-z0-9_]), dot, dash, space, parens,
+//          and any Unicode letter or digit above the ASCII range (includes Cyrillic).
+// We strip everything else (forward/back slash already handled by splitting,
+// but we keep this as defence-in-depth).
+const UNSAFE_FILENAME_CHARS = new RegExp(
+  '[\\u0000-\\u001F\\u007F-\\u009F/\\\\:*?"<>|]',
+  'g',
+);
+
+export function safeAttachmentFilename(
+  raw: string | null | undefined,
+  fallback: string,
+): string {
+  // 1. Coerce null/undefined to empty string.
+  const s = raw ?? '';
+
+  // 2. Take only the basename: split on both / and \ , keep last non-empty segment.
+  const segments = s.split(/[/\\]+/);
+  let base = '';
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const seg = segments[i].trim();
+    if (seg.length > 0) { base = seg; break; }
+  }
+
+  // 3. Strip a leading Windows drive prefix (single letter + colon, e.g. "C:").
+  base = base.replace(/^[A-Za-z]:/, '');
+
+  // 4. Reject/drop ".." segment that survived.
+  if (base === '..') base = '';
+
+  // 5. Remove NUL (U+0000) and all C0/C1 control chars (includes tab, CR, LF).
+  base = base.replace(CTRL_C0, '').replace(CTRL_C1, '');
+
+  // 6. Strip remaining unsafe chars (path separators again as defence-in-depth,
+  //    Windows reserved chars, bidi overrides already removed by CTRL regexes).
+  base = base.replace(UNSAFE_FILENAME_CHARS, '');
+
+  // 7. Strip leading dots so result cannot become a hidden or empty "."/".." name.
+  base = base.replace(/^\.+/, '');
+
+  // 8. Collapse multiple spaces, trim.
+  base = base.replace(/ +/g, ' ').trim();
+
+  // 9. Cap length.
+  if (base.length > SAFE_FILENAME_MAX) {
+    // Try to preserve the extension.
+    const dot = base.lastIndexOf('.');
+    if (dot > 0 && base.length - dot <= 10) {
+      const ext = base.slice(dot);
+      base = base.slice(0, SAFE_FILENAME_MAX - ext.length) + ext;
+    } else {
+      base = base.slice(0, SAFE_FILENAME_MAX);
+    }
+  }
+
+  return base.length > 0 ? base : fallback;
+}
+
 export function wrapUntrusted(body: string | null | undefined): string {
   const safe = body ?? '';
   return `${UNTRUSTED_BEGIN}\n${safe}\n${UNTRUSTED_END}`;
