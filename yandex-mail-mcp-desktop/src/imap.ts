@@ -34,7 +34,12 @@ export interface EmailHeader {
   size: number;
 }
 
-export interface EmailMessage extends EmailHeader {
+// getEmail's full-message shape. It carries its OWN attachments representation —
+// derived from simpleParser (filename/contentType/size) on the full-body path —
+// which is deliberately distinct from EmailHeader's BODYSTRUCTURE ParsedAttachment[]
+// (mimeType/partId/md5, index path). Omit the inherited field so the two
+// representations don't collide (TS2430).
+export interface EmailMessage extends Omit<EmailHeader, 'attachments'> {
   textBody?: string;
   htmlBody?: string;
   attachments: { filename: string; contentType: string; size: number }[];
