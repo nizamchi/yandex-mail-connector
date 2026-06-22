@@ -46,6 +46,10 @@ export interface IndexRecord {
   seen: boolean;
   flagged: boolean;
   size: number;
+  // Whether the message carries attachments, derived from BODYSTRUCTURE. Added
+  // in schema 3 (v3.0.0). Pre-schema-3 records read from disk have this as
+  // undefined until auto-migrated; the ?? false default handles forward-compat.
+  has_attachments: boolean;
 }
 
 export interface SearchHit {
@@ -116,10 +120,9 @@ interface FolderMeta {
   uidNext: number;
   count: number;
   lastSyncMs: number;
-  // Index schema the folder's records were written under. 1 = pre-threading
-  // (no inReplyTo captured); 2 = inReplyTo present. A folder below the current
-  // schema is auto-rebuilt on the next `index update`, so threading links
-  // appear without the user having to know to run a full `index build`.
+  // Index schema the folder's records were written under. See INDEX_SCHEMA for
+  // the full history (1 = pre-threading; 2 = inReplyTo; 3 = has_attachments).
+  // A folder below the current schema is auto-rebuilt on the next `index update`.
   schema: number;
 }
 
@@ -133,9 +136,18 @@ interface MetaFile {
 
 const META_VERSION = 1 as const;
 // Index content schema (distinct from META_VERSION, the file format). Bumped
-// when a build captures new per-record fields: 2 added inReplyTo (v2.7.0-p3).
-// Folders stamped below this are re-streamed on the next incremental update.
-const INDEX_SCHEMA = 2;
+// when a build captures new per-record fields:
+//   1 = pre-threading (no inReplyTo)
+//   2 = inReplyTo present (v2.7.0-p3)
+//   3 = has_attachments (v3.0.0, derived from BODYSTRUCTURE on streamEnvelopes)
+// Folders stamped below INDEX_SCHEMA are re-streamed on the next incremental
+// update (auto-migration gate at updateIndex -- no manual `index build` needed).
+const INDEX_SCHEMA = 3;
+// Threading-readiness floor (independent of INDEX_SCHEMA). threadingReady is
+// true when every indexed folder is at or above this schema. Threading depends
+// on inReplyTo = schema 2, NOT attachments = schema 3. Decoupled so future
+// INDEX_SCHEMA bumps do not silently regress the threadingReady flag.
+const THREADING_SCHEMA = 2;
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MIN_TOKEN_LEN = 2;
@@ -316,6 +328,7 @@ function toRecord(account: string, folder: string, h: EmailHeader): IndexRecord 
     seen: h.seen,
     flagged: h.flagged,
     size: h.size,
+    has_attachments: h.hasAttachments ?? false,
   };
 }
 
@@ -371,7 +384,7 @@ export function getIndexStatus(): IndexStatus {
     folders,
     totalCount,
     indexPath: indexDir(),
-    threadingReady: folders.length >= 1 && folders.every(f => f.schema >= INDEX_SCHEMA),
+    threadingReady: folders.length >= 1 && folders.every(f => f.schema >= THREADING_SCHEMA),
   };
 }
 
