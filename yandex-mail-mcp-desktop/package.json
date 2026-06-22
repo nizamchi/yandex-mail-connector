@@ -27,7 +27,7 @@
     "@modelcontextprotocol/sdk": "^1.0.0",
     "imapflow": "^1.0.162",
     "mailparser": "^3.7.1",
-    "nodemailer": "^8.0.7",
+    "nodemailer": "^9.0.1",
     "zod": "^3.22.4"
   },
   "devDependencies": {
@@ -37,6 +37,7 @@
     "typescript": "^5.9.3"
   },
   "overrides": {
-    "hono": "4.12.23"
+    "hono": "4.12.26",
+    "nodemailer": "$nodemailer"
   }
 }

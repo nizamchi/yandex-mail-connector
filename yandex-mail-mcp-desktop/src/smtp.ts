@@ -1,6 +1,7 @@
-// Verified against nodemailer v8.0.7 + @types/nodemailer v6.4.23 .d.ts on 2026-05-19.
-// Options interface (mailer/index.d.ts:98) and OAuth2 auth shape (smtp-connection/xoauth2)
-// are byte-compatible with v6 usage. No API changes required for Phase 1.
+// Verified against nodemailer v9.0.1 + @types/nodemailer v6.4.23 .d.ts on 2026-06-22.
+// createTransport/sendMail options and the OAuth2 auth shape are unchanged from
+// v6-v8 usage; the v8->v9 major bump (security advisories: CRLF List-* header
+// injection, OAuth2 TLS) required no API changes to this core send path.
 import nodemailer from 'nodemailer';
 import type { Credentials } from './token.js';
 
