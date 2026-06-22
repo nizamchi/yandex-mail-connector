@@ -16,6 +16,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import { loadCredentials } from './token.js';
@@ -23,7 +24,7 @@ import * as imap from './imap.js';
 import { aggregate, type GroupByField, type EnvelopeRow } from './stats.js';
 import * as mailIndex from './mail-index.js';
 import { sendEmail } from './smtp.js';
-import { sanitizeForDisplay, wrapUntrusted, sanitizeError } from './sanitize.js';
+import { sanitizeForDisplay, wrapUntrusted, sanitizeError, safeAttachmentFilename } from './sanitize.js';
 import { generateCode, verifyCode, actionFingerprint, type VerifyResult } from './confirm.js';
 import type { AuthLevel, Capability } from './auth.js';
 import * as allowlist from './allowlist.js';
@@ -360,6 +361,12 @@ const statsSchema = z.object({
 const getEmailSchema = z.object({
   folder: z.string().default('INBOX'),
   uid:    z.number().int().positive().describe('IMAP UID письма'),
+}).strict();
+const getAttachmentSchema = z.object({
+  folder:   z.string().default('INBOX'),
+  uid:      z.number().int().positive().describe('IMAP UID письма'),
+  index:    z.number().int().min(0).default(0).describe('0-based индекс вложения в порядке из yandex_get_email'),
+  filename: z.string().optional().describe('Необязательно: выбрать вложение по имени (точное совпадение, иначе подстрока)'),
 }).strict();
 const searchEmailsSchema = z.object({
   folder:      z.string().default('INBOX'),
@@ -739,6 +746,31 @@ async function renderPipelineResult(
       message_id: '<blocked-no-message-id>',
     },
   };
+}
+
+// ── Pure attachment helpers (exported for unit tests) ──────────────────────
+//
+// These two predicates are extracted so the unit test can call them without a
+// live IMAP connection. They capture the security gates from the
+// yandex_get_attachment handler.
+
+// isOversizeAttachment: returns true when the attachment byte length exceeds
+// the configured cap. The cap is checked BEFORE any write to disk (T-psg-02).
+export function isOversizeAttachment(len: number, max: number): boolean {
+  return len > max;
+}
+
+// isWithinDownloadDir: returns true when `target` resolves inside `dir`
+// (containment assertion — T-psg-01 second layer after safeAttachmentFilename).
+// Uses path.sep so the check is sound on both POSIX and Windows.
+export function isWithinDownloadDir(target: string, dir: string): boolean {
+  const resolvedDir = path.resolve(dir);
+  const resolvedTarget = path.resolve(target);
+  const dirWithSep = resolvedDir + path.sep;
+  // resolvedTarget must start with dirWithSep OR equal resolvedDir exactly
+  // (latter handles the case where safeName reduces to an empty string, which
+  // is prevented by the fallback, but we guard it anyway).
+  return resolvedTarget === resolvedDir || resolvedTarget.startsWith(dirWithSep);
 }
 
 // readonly array + Object.freeze at module bottom keeps the declarative
@@ -1820,6 +1852,101 @@ Args:
         return {
           content: [{ type: 'text', text: `Адрес ${sanitizeForDisplay(address)} добавлен в allowlist (scope=${scope}).` }],
           structuredContent: { success: true, address: address.toLowerCase(), scope },
+        };
+      } catch (e) {
+        return errorResult(e);
+      }
+    },
+  },
+
+  // yandex_get_attachment (L0) — save one attachment's raw bytes to a local file.
+  //
+  // Security properties (see threat model T-psg-*):
+  //   - T-psg-01: path traversal defense is TWO-LAYER:
+  //       (1) safeAttachmentFilename reduces to a safe basename (strips /\\ .. NUL control).
+  //       (2) isWithinDownloadDir containment assertion BEFORE write (rejects any escape).
+  //   - T-psg-02: size cap checked BEFORE any write; oversize returns an error.
+  //   - T-psg-03: bytes are NEVER returned inline (no base64 in result).
+  //   - T-psg-04: file mode 0o600, dir mode 0o700.
+  //   - T-psg-06: all throws routed through errorResult; not-found is a plain result.
+  {
+    name: 'yandex_get_attachment',
+    title: 'Скачать вложение',
+    description: `L0 (только чтение). Сохраняет байты ОДНОГО вложения по uid+index в локальный файл и возвращает путь.
+Байты НЕ возвращаются inline и НЕ парсятся (без OCR/извлечения текста) — санкционированное явное получение одного документа.
+Args: folder (default "INBOX"), uid (IMAP UID письма), index (0-based индекс вложения из yandex_get_email, default 0), filename (опционально — выбрать по имени файла вместо индекса).
+Env: YANDEX_ATTACHMENT_DIR — куда сохранять (default: временный каталог ОС / yandex-mail-mcp-attachments);
+     YANDEX_ATTACHMENT_MAX_BYTES — максимальный размер вложения в байтах (default: 26214400 = 25 MiB).`,
+    inputSchema: getAttachmentSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    meta: { 'anthropic/maxResultSizeChars': 2_000 },
+    requires: { authLevel: 0 },
+    handler: async (params, _ctx) => {
+      try {
+        const { folder, uid, index, filename } = getAttachmentSchema.parse(params);
+
+        // 1. Fetch the attachment bytes from IMAP.
+        const att = await imap.getAttachmentBytes(folder, uid, { index, filename });
+        if (!att) {
+          // Not-found: plain result, no isError (mirror get_email not-found pattern).
+          return {
+            content: [{
+              type: 'text',
+              text: `Вложение index ${index} (uid ${uid}) в ${folder} не найдено.`,
+            }],
+          };
+        }
+
+        // 2. Size cap — checked BEFORE any write (T-psg-02).
+        const maxBytes = Number(process.env.YANDEX_ATTACHMENT_MAX_BYTES) || 25 * 1024 * 1024;
+        if (isOversizeAttachment(att.content.length, maxBytes)) {
+          return {
+            content: [{
+              type: 'text',
+              text: `Ошибка: вложение слишком большое (${att.content.length} байт > лимит ${maxBytes} байт). Увеличь лимит через YANDEX_ATTACHMENT_MAX_BYTES.`,
+            }],
+            isError: true,
+          };
+        }
+
+        // 3. Resolve download dir and create it if needed (0o700).
+        const dir =
+          process.env.YANDEX_ATTACHMENT_DIR && process.env.YANDEX_ATTACHMENT_DIR.length > 0
+            ? path.resolve(process.env.YANDEX_ATTACHMENT_DIR)
+            : path.join(os.tmpdir(), 'yandex-mail-mcp-attachments');
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+        // 4. Build safe filename (T-psg-01, layer 1).
+        const safeName = safeAttachmentFilename(att.filename, 'attachment-' + uid + '-' + index);
+
+        // 5. Containment assertion (T-psg-01, layer 2) — reject if target escapes dir.
+        const target = path.resolve(dir, safeName);
+        if (!isWithinDownloadDir(target, dir)) {
+          return {
+            content: [{
+              type: 'text',
+              text: 'Ошибка: имя файла вложения не прошло проверку безопасности пути.',
+            }],
+            isError: true,
+          };
+        }
+
+        // 6. Write bytes to disk (0o600).
+        fs.writeFileSync(target, att.content, { mode: 0o600 });
+
+        // 7. Return path + metadata — NEVER inline bytes (T-psg-03).
+        const displayName = sanitizeForDisplay(att.filename ?? safeName);
+        return {
+          content: [{
+            type: 'text',
+            text: `Сохранено: ${target} (${displayName}, ${att.contentType}, ${att.content.length} байт)`,
+          }],
+          structuredContent: {
+            saved_path: target,
+            filename: displayName,
+            content_type: att.contentType,
+            size_bytes: att.content.length,
+          },
         };
       } catch (e) {
         return errorResult(e);
