@@ -142,6 +142,13 @@
       <td class="desc">Список полученных тредов, где последнее письмо — от другого человека и старше N дней. Работает по локальному индексу, группирует треды между папками. Результаты ранжируются и помечаются (tier + reasons): треды с флажком и переписки с вашим участием — наверху; авто-уведомления — внизу, но не скрываются (recall=100%).</td>
     </tr>
     <tr>
+      <td><code>yandex_get_attachment</code></td>
+      <td>Скачать вложение</td>
+      <td><span class="badge l0" title="Только чтение — доступно по умолчанию">L0</span></td>
+      <td class="rw">✓</td>
+      <td class="desc">Сохраняет байты ОДНОГО вложения по uid+index в локальный файл и возвращает путь; байты не возвращаются inline и не парсятся (без OCR) — санкционированное явное получение одного документа. Конфиг: YANDEX_ATTACHMENT_DIR (default: временный каталог ОС) / YANDEX_ATTACHMENT_MAX_BYTES (default: 25 МиБ).</td>
+    </tr>
+    <tr>
       <td><code>yandex_mark_email</code></td>
       <td>Пометить письмо</td>
       <td><span class="badge l1" title="Требует YANDEX_AUTH_LEVEL=safe">L1</span></td>
