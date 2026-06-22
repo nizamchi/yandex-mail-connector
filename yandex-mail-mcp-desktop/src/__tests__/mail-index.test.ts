@@ -788,3 +788,44 @@ test('T38: searchFastResult reports full total and paginates via offset', withTe
   // searchFast wrapper still returns just the hits (back-compat).
   assert.equal(searchFast('meeting', { limit: 3 }).length, 3);
 }));
+
+test('T41: a cross-account In-Reply-To link does not bridge two mailboxes in a thread', withTempStateDir(async () => {
+  const src = new FakeSource();
+  // alice owns the root message <a@x>.
+  _setAccountForTests('alice@ya.ru');
+  src.setFolder('INBOX', [hdr({ uid: 1, messageId: '<a@x>', subject: 'Alpha project' })], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // bob (sharing the state dir) has a reply whose In-Reply-To points at alice's <a@x>.
+  _setAccountForTests('bob@ya.ru');
+  src.setFolder('INBOX', [hdr({ uid: 2, messageId: '<b@x>', inReplyTo: '<a@x>', subject: 'Alpha reply' })], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // bob's thread must contain ONLY bob's message -- the Message-ID graph must not
+  // pull alice's root in via the cross-account In-Reply-To edge.
+  const thread = getThread('Alpha reply');
+  assert.equal(thread.length, 1, 'no cross-account bridge through the reply graph');
+  assert.equal(thread[0].record.messageId, '<b@x>');
+  assert.equal(thread[0].record.account, 'bob@ya.ru');
+}));
+
+test('T42: offset paginates a pure-filter query (rangeIndices branch)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  const headers: EmailHeader[] = [];
+  for (let i = 1; i <= 5; i++) {
+    headers.push(hdr({ uid: i, subject: 'm' + i, seen: false, date: `2025-05-0${i}T00:00:00.000Z` }));
+  }
+  src.setFolder('INBOX', headers, 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const page = searchFastResult('', { filters: { seen: false }, limit: 2, offset: 2 });
+  assert.equal(page.total, 5, 'total counts all filter matches, not the page');
+  assert.equal(page.hits.length, 2, 'offset+limit page of the pure-filter scan');
+  // Beyond the end: empty page, total intact.
+  const beyond = searchFastResult('', { filters: { seen: false }, limit: 2, offset: 10 });
+  assert.equal(beyond.hits.length, 0);
+  assert.equal(beyond.total, 5);
+}));
