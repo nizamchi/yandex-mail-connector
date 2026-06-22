@@ -327,6 +327,14 @@ const getThreadSchema = z.object({
   folder: z.string().optional(),
   limit:  z.number().int().min(1).max(100).optional(),
 }).strict();
+const unansweredSchema = z.object({
+  older_than_days: z.number().int().min(0).max(3650).optional()
+    .describe('Порог в днях: показывать треды, где последнее письмо старше N дней (default 7)'),
+  folder: z.string().optional().describe('Ограничить кандидатов одной папкой'),
+  from:   z.string().optional().describe('Фильтр: фрагмент адреса/имени отправителя'),
+  limit:  z.number().int().min(1).max(100).optional().describe('Максимум на странице (default 20)'),
+  offset: z.number().int().min(0).optional().describe('Сдвиг для пагинации (default 0)'),
+}).strict();
 const countEmailsSchema = z.object({
   folder:  z.string().default('INBOX'),
   from:    z.string().optional(),
@@ -1406,6 +1414,70 @@ Output: { index_built, total, truncated, thread: [{ uid, folder, from, subject, 
           `${i + 1}. ${r.date.slice(0, 10)} — ${sanitizeForDisplay(r.from)}: ${sanitizeForDisplay(r.subject) || '(без темы)'} [${r.folder}#${r.uid}]`,
         );
         return { content: [{ type: 'text', text: `Тред из ${thread.length} писем:\n\n${lines.join('\n')}` }], structuredContent: out };
+      } catch (e) { return errorResult(e); }
+    },
+  },
+
+  // 6h. Unanswered received threads over the local index (L0) -- v2.8.0 (260622-k20).
+  // Lists threads where the last message is NOT from the owner and is older than N days.
+  {
+    name: 'yandex_unanswered',
+    title: 'Без ответа (неотвеченные)',
+    description: `Список полученных тредов, в которых ПОСЛЕДНЕЕ письмо пришло от другого человека
+(не от меня) и старше N дней (по умолчанию 7). Треды группируются между папками по графу
+Message-ID (In-Reply-To) и нормализованной теме -- ответ в «Отправленных» помечает тред как
+отвеченный независимо от имени папки (кириллические папки поддерживаются).
+Работает только по локальному индексу (без IMAP); требует \`yandex-mail-mcp index build\`.
+Если индекс не построен -- вернёт подсказку.
+Если учётные данные не определены (нет token.json) -- вернёт owner_known:false без ошибки.
+ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ: рассылки и уведомления, на которые ты никогда не отвечаешь, попадут
+в список -- используй фильтр from, чтобы сузить по отправителю.
+Args: older_than_days (default 7), folder?, from?, limit (default 20, max 100), offset (default 0).
+Output: { index_built, owner_known, total, returned, offset, truncated,
+  unanswered: [{ uid, folder, from, subject, date, days_waiting }] }`,
+    inputSchema: unansweredSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    meta: { 'anthropic/maxResultSizeChars': 50_000 },
+    requires: { authLevel: 0 },
+    handler: async (params, _ctx) => {
+      try {
+        const { older_than_days, folder, from, limit, offset } = unansweredSchema.parse(params);
+        const olderThanDays = older_than_days ?? 7;
+        const off = offset ?? 0;
+        if (!mailIndex.indexExists()) {
+          return {
+            content: [{ type: 'text', text: 'Локальный индекс не построен. Запусти `yandex-mail-mcp index build` в терминале, либо используй yandex_search_emails для живого поиска по IMAP.' }],
+            structuredContent: { index_built: false, total: 0, returned: 0, offset: off, truncated: false, unanswered: [] },
+          };
+        }
+        const page = mailIndex.unansweredThreads({ olderThanDays, folder, from, limit, offset: off });
+        if (!page.ownerKnown) {
+          return {
+            content: [{ type: 'text', text: 'Учётные данные не определены — не могу понять, на какие письма отвечали именно вы. Проверь token.json или собери индекс под нужным аккаунтом.' }],
+            structuredContent: { index_built: true, owner_known: false, total: 0, returned: 0, offset: off, truncated: false, unanswered: [] },
+          };
+        }
+        const allRows = page.hits.map(h => ({
+          uid: h.record.uid,
+          folder: h.record.folder,
+          from: capLen(h.record.fromName ? `${h.record.fromName} <${h.record.fromEmail}>` : h.record.fromEmail, MAX_FROM_LEN),
+          subject: capLen(h.record.subject, MAX_SUBJECT_LEN),
+          date: h.record.date,
+          days_waiting: h.daysWaiting,
+        }));
+        const { rows, truncated } = fitRows(allRows, SEARCH_RESULT_BUDGET);
+        const out = { index_built: true, owner_known: true, total: page.total, returned: rows.length, offset: off, truncated, unanswered: rows };
+        if (rows.length === 0) {
+          return { content: [{ type: 'text', text: `Неотвеченных писем старше ${olderThanDays} дней не найдено.` }], structuredContent: out };
+        }
+        const shownEnd = off + rows.length;
+        const lines = rows.map((r, i) =>
+          `${off + i + 1}. [${r.folder}#${r.uid}] ${sanitizeForDisplay(r.subject) || '(без темы)'} — ${sanitizeForDisplay(r.from)}, ${r.date.slice(0, 10)} (ждёт ${r.days_waiting} дн.)`,
+        );
+        const more = truncated
+          ? '\n\n…страница обрезана по размеру результата; сузь запрос или уменьши limit.'
+          : (page.total > shownEnd ? `\n\n…показаны ${off + 1}–${shownEnd} из ${page.total}. Следующая страница: offset=${shownEnd}.` : '');
+        return { content: [{ type: 'text', text: `Неотвеченных тредов (старше ${olderThanDays} дн.): ${page.total}:\n\n${lines.join('\n')}${more}` }], structuredContent: out };
       } catch (e) { return errorResult(e); }
     },
   },
