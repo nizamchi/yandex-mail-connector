@@ -26,7 +26,23 @@ const DEFAULT_MAX_LEN = 200;
 // Build регексы из код-поинтов чтобы не зависеть от source-encoding файла.
 const CTRL_C0 = new RegExp('[\\u0000-\\u001F]', 'g');
 const CTRL_C1 = new RegExp('[\\u007F-\\u009F]', 'g');
+// CR / LF runs — collapsed first so C0 strip does not leave double-spaces.
 const NEWLINES = new RegExp('[\\r\\n]+', 'g');
+// U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR — NOT caught by [\r\n]+
+// and NOT escaped by JSON.stringify; fold to a single space like CR/LF.
+const LINE_SEP = new RegExp('[\\u2028\\u2029]+', 'g');
+// Bidi/zero-width/BOM format characters — Trojan-Source / CVE-2021-42574
+// extension-spoof class. Strip-only; no NFC normalization (LD-6).
+//   U+200B-200F : ZWSP, ZWNJ, ZWJ, LRM, RLM (zero-width + bidi marks)
+//   U+202A-202E : LRE, RLE, PDF, LRO, RLO (bidi embedding/override)
+//   U+2060-2064 : WJ, INVISIBLE TIMES/SEPARATOR/PLUS (invisible operators)
+//   U+2066-2069 : LRI, RLI, FSI, PDI (directional isolates)
+//   U+FEFF      : BOM / ZWNBSP
+// NOTE: Cyrillic U+0400-04FF is entirely outside every range above — safe.
+const FORMAT_CHARS = new RegExp(
+  '[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u2064\\u2066-\\u2069\\uFEFF]',
+  'g',
+);
 
 export function sanitizeForDisplay(
   s: string | null | undefined,
@@ -36,12 +52,15 @@ export function sanitizeForDisplay(
   const maxLen = opts?.maxLen ?? DEFAULT_MAX_LEN;
 
   // 1. Collapse newline runs → single space (prevents log/header injection).
-  let out = s.replace(NEWLINES, ' ');
+  //    Also fold U+2028/U+2029 LINE/PARAGRAPH SEPARATOR (not in [\r\n]+).
+  let out = s.replace(NEWLINES, ' ').replace(LINE_SEP, ' ');
   // 2. Strip all C0 (incl. tab) and C1 control chars.
   out = out.replace(CTRL_C0, '').replace(CTRL_C1, '');
-  // 3. Collapse multiple spaces, trim.
+  // 3. Strip bidi/zero-width/BOM format characters (Trojan-Source / CVE-2021-42574).
+  out = out.replace(FORMAT_CHARS, '');
+  // 4. Collapse multiple spaces, trim.
   out = out.replace(/ +/g, ' ').trim();
-  // 4. Truncate с маркером "...".
+  // 5. Truncate с маркером "...".
   if (out.length > maxLen) {
     out = out.slice(0, Math.max(0, maxLen - 3)) + '...';
   }
