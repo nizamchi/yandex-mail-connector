@@ -132,7 +132,7 @@ test('T-OVERRIDE-MINT-01: mint returns 64-hex token, JSONL has 1 record (token_h
     assert.match(rec.nonce as string, /^[0-9a-f]{8}$/);
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -153,7 +153,7 @@ test('T-OVERRIDE-CONSUME-01: consume returns ok and marks used_at_ms', () => {
     assert.equal(typeof rec.used_at_ms, 'number');
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -182,7 +182,7 @@ test('T-OVERRIDE-SUPERSEDE-01: mintOverrideToken supersedes prior unconsumed tok
     assert.equal(r2.ok, true, 'second (live) token must consume successfully');
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -202,7 +202,7 @@ test('T-OVERRIDE-SUPERSEDE-DIFF-FP-01: mint against DIFFERENT fingerprints does 
     assert.equal(rb.ok, true, 'token B on FP B must remain valid after FP A consume');
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -221,7 +221,7 @@ test('T-OVERRIDE-REPLAY-01: second consume returns {ok:false, reason:used} (sing
     if (r2.ok === false) assert.equal(r2.reason, 'used');
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -242,7 +242,7 @@ test('T-OVERRIDE-WRONG-FINGERPRINT-01: consume with mismatched FP returns wrong_
     assert.equal(rec.used_at_ms, null);
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -277,7 +277,7 @@ test('T-OVERRIDE-FORGE-TOKEN-HASH-01: tampered token_hash -> lookup miss -> unkn
   } finally {
     undoFatal();
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -326,7 +326,7 @@ test('T-OVERRIDE-FORGE-NONCE-01: tampered nonce -> lookup hit -> HMAC mismatch -
   } finally {
     undoFatal();
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -349,7 +349,7 @@ test('T-OVERRIDE-RACE-01: concurrent Promise.all consume -- exactly one ok, one 
     assert.equal(used.length, 1, 'the other must be rejected as used');
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -369,7 +369,7 @@ test('T-OVERRIDE-PERSIST-01: token survives process-restart simulation (write, _
     assert.equal(result.ok, true);
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -436,7 +436,7 @@ test('T-OVERRIDE-DENIED-AUDIT-USED-01: replay attempt emits one override_consume
     assert.ok(!rawLine.includes(VALID_FP), 'full fingerprint must not leak into audit');
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -469,7 +469,7 @@ test('T-OVERRIDE-DENIED-AUDIT-EXPIRED-01: expired token emits one denied audit r
     assert.match(denied[0]!.fingerprint_hash as string, /^[0-9a-f]{16}$/);
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -497,7 +497,7 @@ test('T-OVERRIDE-DENIED-AUDIT-WRONG-FP-01: wrong fingerprint emits one denied au
     assert.ok(!rawLine.includes(OTHER_FP), 'full supplied fingerprint must not leak into audit');
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -545,7 +545,7 @@ test('T-OVERRIDE-FRESH-PARSE-FATAL-01: _readJsonlFresh FATALs on parse error (sy
   } finally {
     undoFatal();
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
 
@@ -570,6 +570,6 @@ test('T-OVERRIDE-EXPIRY-01: expired token returns {ok:false, reason:expired}', (
     if (result.ok === false) assert.equal(result.reason, 'expired');
   } finally {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    try { fs.rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* Windows can transiently hold a temp handle while async audit/atomic writes settle */ }
   }
 });
