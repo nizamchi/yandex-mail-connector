@@ -322,6 +322,7 @@ const searchFastSchema = z.object({
   before: z.string().optional().describe('Фильтр: ISO дата -- письма строго раньше этой даты'),
   seen:   z.boolean().optional().describe('Фильтр: true=только прочитанные, false=только непрочитанные'),
   flagged:z.boolean().optional().describe('Фильтр: true=только со звёздочкой, false=только без'),
+  has_attachments: z.boolean().optional().describe('Фильтр: true=только письма с вложениями, false=только без. Считает и встроенные именованные части (логотипы) — для поиска именно файлов по типу используй yandex_find_attachments с mime.'),
 }).strict();
 const getThreadSchema = z.object({
   query:  z.string().min(1).describe('Слова из темы письма, тред которого нужен'),
@@ -1344,10 +1345,11 @@ Output: { rows: [{ key:[...], count, total_size_bytes, earliest, latest }], tota
     title: 'Быстрый поиск (локальный индекс)',
     description: `Мгновенный поиск по локальному индексу писем -- единицы мс вместо ~1 с живого IMAP.
 Ищет по теме и отправителю, ранжирует по релевантности, поддерживает кириллицу.
-Поддерживает фильтры: from / since / before / seen / flagged. Можно искать ТОЛЬКО по фильтрам без query (напр. «непрочитанные за март»: seen=false, since="2025-03-01").
+Поддерживает фильтры: from / since / before / seen / flagged / has_attachments. Можно искать ТОЛЬКО по фильтрам без query (напр. «непрочитанные за март»: seen=false, since="2025-03-01").
+has_attachments=true оставляет только письма с вложениями (по BODYSTRUCTURE; считает и встроенные именованные части — логотипы и трекинг-картинки). Чтобы искать именно файлы по имени/типу — yandex_find_attachments (там есть фильтр mime, напр. application/pdf отсекает логотипы).
 Требует построенного индекса: в терминале \`yandex-mail-mcp index build\` (и \`index update\` для досинхронизации).
 Если индекс не построен -- вернёт подсказку; тогда используй yandex_search_emails (живой поиск).
-Args: query? (опционально, если задан фильтр), folder?, limit (default 20, max 100), offset (пагинация, default 0), from?, since? (YYYY-MM-DD), before? (YYYY-MM-DD), seen?, flagged?.
+Args: query? (опционально, если задан фильтр), folder?, limit (default 20, max 100), offset (пагинация, default 0), from?, since? (YYYY-MM-DD), before? (YYYY-MM-DD), seen?, flagged?, has_attachments?.
 Output: { index_built, total (полное число совпадений), returned, offset, truncated, hits: [{ uid, folder, from, subject, date, score, match_reasons }] }`,
     inputSchema: searchFastSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -1355,7 +1357,7 @@ Output: { index_built, total (полное число совпадений), ret
     requires: { authLevel: 0 },
     handler: async (params, _ctx) => {
       try {
-        const { query, folder, limit, offset, from, since, before, seen, flagged } = searchFastSchema.parse(params);
+        const { query, folder, limit, offset, from, since, before, seen, flagged, has_attachments } = searchFastSchema.parse(params);
         const q = (query ?? '').trim();
         const off = offset ?? 0;
         const filters: mailIndex.SearchFilters = {};
@@ -1364,9 +1366,10 @@ Output: { index_built, total (полное число совпадений), ret
         if (before) filters.before = parseSearchDate(before, 'before').getTime();
         if (seen !== undefined) filters.seen = seen;
         if (flagged !== undefined) filters.flagged = flagged;
+        if (has_attachments !== undefined) filters.has_attachments = has_attachments;
         const hasFilter = Object.keys(filters).length > 0;
         if (q.length === 0 && !hasFilter) {
-          throw new Error('Укажите query или хотя бы один фильтр (from/since/before/seen/flagged).');
+          throw new Error('Укажите query или хотя бы один фильтр (from/since/before/seen/flagged/has_attachments).');
         }
         if (!mailIndex.indexExists()) {
           return {

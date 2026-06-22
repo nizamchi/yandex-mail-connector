@@ -110,6 +110,10 @@ export interface SearchFilters {
   before?: number;     // ms, exclusive upper bound on date
   seen?: boolean;
   flagged?: boolean;
+  // True/false = only emails that do / don't carry attachments (derived from
+  // BODYSTRUCTURE, schema 3). Counts named-inline parts (logos) by spec; see the
+  // tool description + yandex_find_attachments for the mime escape hatch.
+  has_attachments?: boolean;
 }
 
 export interface FolderStatus {
@@ -962,7 +966,8 @@ function hasAnyFilter(f?: SearchFilters): boolean {
   return !!f && (
     (f.from !== undefined && f.from.length > 0) ||
     f.since !== undefined || f.before !== undefined ||
-    f.seen !== undefined || f.flagged !== undefined
+    f.seen !== undefined || f.flagged !== undefined ||
+    f.has_attachments !== undefined
   );
 }
 
@@ -973,6 +978,11 @@ function passesFilters(r: IndexRecord, ms: number, f?: SearchFilters): boolean {
   if (!f) return true;
   if (f.seen !== undefined && r.seen !== f.seen) return false;
   if (f.flagged !== undefined && r.flagged !== f.flagged) return false;
+  // `?? false`, NOT strict ===: loadAllRecords raw-casts JSON, so a pre-schema-3
+  // (pre-v3.0.0) index carries has_attachments:undefined at read time. The ?? false
+  // coercion treats those as "no attachments" rather than silently dropping them
+  // from a has_attachments:false query; they self-heal on the next auto-migration.
+  if (f.has_attachments !== undefined && (r.has_attachments ?? false) !== f.has_attachments) return false;
   if (f.from !== undefined && f.from.length > 0) {
     const needle = f.from.toLowerCase();
     if (!r.fromEmail.includes(needle) && !r.fromName.toLowerCase().includes(needle)) return false;

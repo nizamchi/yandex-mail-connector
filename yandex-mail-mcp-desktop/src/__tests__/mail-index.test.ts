@@ -505,6 +505,57 @@ test('T26: pure-filter results are ordered newest-first', withTempStateDir(async
   assert.deepEqual(flagged.map(h => h.record.uid), [3, 2, 1], 'descending by date');
 }));
 
+// ── Layer 3 (v3.0.0): has_attachments filter on searchFast ───────────
+
+test('T-HA1: has_attachments filter splits records with/without attachments', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, subject: 'with', hasAttachments: true }),
+    hdr({ uid: 2, subject: 'without', hasAttachments: false }),
+    hdr({ uid: 3, subject: 'also-with', hasAttachments: true }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const withAtt = searchFast('', { filters: { has_attachments: true } });
+  assert.deepEqual(withAtt.map(h => h.record.uid).sort(), [1, 3], 'only attachment-carrying records');
+
+  const withoutAtt = searchFast('', { filters: { has_attachments: false } });
+  assert.deepEqual(withoutAtt.map(h => h.record.uid), [2], 'only the no-attachment record');
+}));
+
+// Guards the `?? false` default in passesFilters: a pre-schema-3 on-disk record
+// has NO has_attachments key (loadAllRecords raw-casts JSON -> undefined). It must
+// be treated as "no attachments": returned by has_attachments:false, excluded by
+// has_attachments:true -- never silently dropped from BOTH.
+test('T-HA2: a record missing has_attachments on disk is treated as false', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, subject: 'legacy', hasAttachments: false }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // Simulate a pre-v3.0.0 (schema 2) record: strip the has_attachments key from
+  // the on-disk envelope JSONL, exactly as an index built before this milestone
+  // would look. The auto-migration would normally rebuild it; here we read it raw.
+  const envPath = path.join(getIndexDir(), 'envelopes.jsonl');
+  const lines = fs.readFileSync(envPath, 'utf-8').split('\n').filter(l => l.trim());
+  const rewritten = lines.map(l => {
+    const rec = JSON.parse(l);
+    delete rec.has_attachments;
+    return JSON.stringify(rec);
+  }).join('\n') + '\n';
+  fs.writeFileSync(envPath, rewritten);
+  _resetForTests();
+
+  const asFalse = searchFast('', { filters: { has_attachments: false } });
+  assert.deepEqual(asFalse.map(h => h.record.uid), [1], 'undefined has_attachments is returned by false-query');
+
+  const asTrue = searchFast('', { filters: { has_attachments: true } });
+  assert.equal(asTrue.length, 0, 'undefined has_attachments is NOT returned by true-query');
+}));
+
 // ── Phase 2 (v2.7.0): idf-weighted relevance ranking ─────────────────
 
 test('T27: a rarer matched token outranks a common one (idf weighting)', withTempStateDir(async () => {
