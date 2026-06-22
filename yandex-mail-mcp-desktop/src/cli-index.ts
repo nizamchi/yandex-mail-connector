@@ -14,6 +14,11 @@ function printStatus(): void {
   process.stdout.write(`  account:  ${s.account}\n`);
   process.stdout.write(`  location: ${s.indexPath}\n`);
   process.stdout.write(`  total:    ${s.totalCount} messages across ${s.folders.length} folder(s)\n`);
+  // Raw manifest row count (not account-filtered): per-folder counts above are
+  // also raw (cli-index.ts:24-27 pattern). A multi-account state dir shows the
+  // full total so an operator can detect misconfiguration. Do NOT widen IndexStatus
+  // (MR-3: it is consumed by tools.ts status surfaces that don't need this count).
+  process.stdout.write(`  attachments: ${mailIndex.loadAllAttachments().length} in manifest\n`);
   if (s.exists) {
     process.stdout.write(
       `  threads:  ${s.threadingReady

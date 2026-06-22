@@ -520,6 +520,10 @@ export async function buildIndex(
   const errors: IndexError[] = [];
   const succeeded = new Set<string>();
   const freshByFolder = new Map<string, IndexRecord[]>();
+  // Parallel attachment scratch lists — collected in the SAME stream loop as
+  // freshByFolder so there is zero extra IMAP cost (h.attachments is already
+  // on the yielded EmailHeader from streamEnvelopes).
+  const freshAttachmentsByFolder = new Map<string, AttachmentRecord[]>();
 
   for (const folder of folders) {
     try {
@@ -527,9 +531,18 @@ export async function buildIndex(
       // Stream into a scratch list so a mid-stream throw discards the partial
       // folder rather than committing half of it.
       const fresh: IndexRecord[] = [];
-      for await (const h of src.stream(folder)) fresh.push(toRecord(account, folder, h));
+      const freshAttachments: AttachmentRecord[] = [];
+      for await (const h of src.stream(folder)) {
+        fresh.push(toRecord(account, folder, h));
+        // Collect attachment rows from the same header. Treat undefined as zero
+        // rows (the T-bit fixture confirms boolean-only headers carry no array).
+        for (const a of h.attachments ?? []) {
+          freshAttachments.push(toAttachmentRecord(account, folder, h, a));
+        }
+      }
       const streamed = fresh.length;
       freshByFolder.set(folder, fresh);
+      freshAttachmentsByFolder.set(folder, freshAttachments);
       succeeded.add(folder);
       added += streamed;
       // count := the server's EXISTS, the SAME authoritative number updateIndex's
@@ -561,7 +574,20 @@ export async function buildIndex(
     for (const r of fresh) records.push(r);
   }
 
-  rewriteEnvelopes(records);
+  // MR-4 write order: manifest FIRST, envelopes LAST.
+  // A crash between the two non-transactional atomicWrites leaves at worst
+  // orphan manifest rows (Phase-3 join degrades to skip — harmless) rather
+  // than a visible email silently showing no attachments in the manifest.
+  //
+  // Mirror the envelope merge: use the SAME `succeeded` set (NOT the input
+  // `folders` arg) so a mid-stream-failed folder keeps its prior attachment rows.
+  const attachments: AttachmentRecord[] = loadAllAttachments()
+    .filter(a => !(a.account === account && succeeded.has(a.folder)));
+  for (const freshSlice of freshAttachmentsByFolder.values()) {
+    for (const a of freshSlice) attachments.push(a);
+  }
+  rewriteAttachments(attachments); // manifest first (MR-4)
+  rewriteEnvelopes(records);       // envelopes last (MR-4)
   persistMeta(meta);
   return { folders: result, added, errors };
 }
@@ -617,6 +643,9 @@ export async function updateIndex(
 
   if (toAppend.length > 0) {
     const records = loadAllRecords();
+    // Load the manifest once at the top (paralleling loadAllRecords() above).
+    // Attachment rows are pushed alongside records.push() after BOTH guards below.
+    const attachments = loadAllAttachments();
     const existing = new Set<string>();
     for (const r of records) existing.add(dedupKey(r.account, r.folder, r.uid));
 
@@ -634,6 +663,14 @@ export async function updateIndex(
           if (existing.has(key)) continue;
           existing.add(key);
           records.push(toRecord(account, folder, h));
+          // Push attachment rows ONLY after BOTH the minUid guard and the
+          // existing-dedup guard pass — alongside records.push() above (LD-2).
+          // This closes the Pitfall-7 silent-staleness bug: without this,
+          // a new attachment-carrying email would appear in the envelope index
+          // but be invisible in the manifest until a full rebuild.
+          for (const a of h.attachments ?? []) {
+            attachments.push(toAttachmentRecord(account, folder, h, a));
+          }
           newCount++;
         }
         // Reconcile: cursor.exists is the server's authoritative message count.
@@ -665,12 +702,20 @@ export async function updateIndex(
       }
     }
 
-    rewriteEnvelopes(records);
+    // MR-4 write order: manifest first, envelopes last (mirrors buildIndex).
+    rewriteAttachments(attachments); // manifest first (MR-4)
+    rewriteEnvelopes(records);       // envelopes last (MR-4)
     persistMeta(meta);
   }
 
   // Full-rebuild folders: the originally-stale ones plus any the append found to
   // have lost messages. buildIndex re-streams and persists records + meta.
+  // LD-3: NO manifest code here — this branch delegates entirely to buildIndex.
+  // buildIndex's account+succeeded filter (:448-449 equivalent) supersedes the
+  // appended rows written above, making the buildIndex copy authoritative/final.
+  // A crash between the append rewrite and the buildIndex rewrite leaves the
+  // folder un-stamped in meta so the next update re-rebuilds and converges
+  // (the same guarantee the envelope path already relies on).
   const rebuildAll = [...toRebuild, ...reconcile];
   if (rebuildAll.length > 0) {
     const rebuilt = await buildIndex(rebuildAll, src);
@@ -700,6 +745,10 @@ export function dropIndex(): void {
     // reads envelopes.jsonl). Emptying it guarantees no stale/orphan reads.
     try { fs.writeFileSync(metaPath(), JSON.stringify(emptyMeta(), null, 2)); } catch { /* ignore */ }
     try { fs.writeFileSync(envelopesPath(), ''); } catch { /* ignore */ }
+    // Truncate the attachment manifest too — without this, Phase-3 findAttachments
+    // would serve orphan rows after a drop (the same failure the comment above
+    // warns about for envelopes.jsonl).
+    try { fs.writeFileSync(attachmentsPath(), ''); } catch { /* ignore */ }
   }
   invalidateCache();
 }
