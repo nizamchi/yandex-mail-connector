@@ -317,6 +317,95 @@ test('FA-h: graceful degradation -- empty manifest reports manifestBuilt:false',
   assert.equal(findAttachments({}).manifestBuilt, false, 'dropped manifest degrades to false');
 }));
 
+test('FA-i: a built index with ZERO attachments is manifestBuilt:true,total:0 (not a false re-sync prompt)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  // Index a folder whose messages carry NO attachments -> attachments.jsonl exists
+  // but is empty. This must read as "built, nothing matched", NOT "not built".
+  src.setFolder('INBOX', [
+    hdr({ uid: 1, messageId: '<noatt1@ex>', hasAttachments: false }),
+    hdr({ uid: 2, messageId: '<noatt2@ex>', hasAttachments: false }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const page = findAttachments({});
+  assert.equal(page.manifestBuilt, true, 'a built (empty) manifest is built, not degraded');
+  assert.equal(page.total, 0);
+  assert.deepEqual(page.hits, []);
+}));
+
+test('FA-j: inter-group order is by NEWEST occurrence; representative stays earliest', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    // Group "old.pdf": first sent in 2020, re-sent recently (2025-12) -> newest activity.
+    hdr({ uid: 1, messageId: '<o1@ex>', date: '2020-01-01T00:00:00.000Z', hasAttachments: true,
+      attachments: [att({ filename: 'old.pdf', size: 1, partId: '1' })] }),
+    hdr({ uid: 2, messageId: '<o2@ex>', date: '2025-12-01T00:00:00.000Z', hasAttachments: true,
+      attachments: [att({ filename: 'old.pdf', size: 1, partId: '1' })] }),
+    // Group "mid.pdf": single mid-dated copy.
+    hdr({ uid: 3, messageId: '<m@ex>', date: '2023-06-01T00:00:00.000Z', hasAttachments: true,
+      attachments: [att({ filename: 'mid.pdf', size: 2, partId: '1' })] }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const page = findAttachments({});
+  assert.equal(page.total, 2);
+  // old.pdf sorts FIRST (its newest copy is 2025-12 > mid.pdf's 2023-06)...
+  assert.equal(page.hits[0].filename, 'old.pdf', 'most-recently-active group ranks first');
+  // ...even though its representative (shown date) is the 2020 original.
+  assert.equal(page.hits[0].date, '2020-01-01T00:00:00.000Z', 'representative is the earliest copy');
+  assert.equal(page.hits[0].occurrenceCount, 2);
+  assert.equal(page.hits[1].filename, 'mid.pdf');
+}));
+
+test('FA-k: unknown size (0) never collapses same-named files; known sizes still collapse', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    // Two distinct 'scan.pdf' whose octet count is unknown (size 0) -> must NOT merge.
+    hdr({ uid: 1, messageId: '<s1@ex>', hasAttachments: true,
+      attachments: [att({ filename: 'scan.pdf', size: 0, partId: '1' })] }),
+    hdr({ uid: 2, messageId: '<s2@ex>', hasAttachments: true,
+      attachments: [att({ filename: 'scan.pdf', size: 0, partId: '1' })] }),
+    // Two 'known.pdf' with the same KNOWN size -> collapse to one group.
+    hdr({ uid: 3, messageId: '<k1@ex>', hasAttachments: true,
+      attachments: [att({ filename: 'known.pdf', size: 100, partId: '1' })] }),
+    hdr({ uid: 4, messageId: '<k2@ex>', hasAttachments: true,
+      attachments: [att({ filename: 'known.pdf', size: 100, partId: '1' })] }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  assert.equal(findAttachments({ filename_contains: 'scan' }).total, 2, 'unknown-size files do not collapse');
+  const known = findAttachments({ filename_contains: 'known' });
+  assert.equal(known.total, 1, 'known same-size files collapse');
+  assert.equal(known.hits[0].occurrenceCount, 2);
+}));
+
+test('FA-l: the representative is always present in occurrences[] even when scanned after the cap', withTempStateDir(async () => {
+  const src = new FakeSource();
+  const many: EmailHeader[] = [];
+  // uid 1..11 recent; uid 12 is the EARLIEST -> the representative, scanned LAST,
+  // so it falls outside the first 10 sampled occurrences and must be swapped in.
+  for (let u = 1; u <= 11; u++) {
+    many.push(hdr({ uid: u, messageId: `<late${u}@ex>`, date: `2025-02-${String(u).padStart(2, '0')}T00:00:00.000Z`,
+      hasAttachments: true, attachments: [att({ filename: 'doc.pdf', size: 5, partId: '1' })] }));
+  }
+  many.push(hdr({ uid: 12, messageId: '<earliest@ex>', date: '2020-01-01T00:00:00.000Z',
+    hasAttachments: true, attachments: [att({ filename: 'doc.pdf', size: 5, partId: '1' })] }));
+  src.setFolder('INBOX', many, 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const hit = findAttachments({ filename_contains: 'doc' }).hits[0];
+  assert.equal(hit.uid, 12, 'representative is the earliest-dated (uid 12)');
+  assert.equal(hit.occurrenceCount, 12, 'true count is 12');
+  assert.equal(hit.occurrences.length, 10, 'occurrences capped at 10');
+  assert.equal(hit.occurrencesTruncated, true);
+  assert.ok(hit.occurrences.some(o => o.folder === 'INBOX' && o.uid === 12),
+    'the representative location is guaranteed present in occurrences[]');
+}));
+
 // ── <50ms ship gate (its own test so a perf flake never masks a logic bug) ──
 
 test('FA-perf: find_attachments(from, mime=application/pdf) < 50ms on a 1000-row manifest', withTempStateDir(async () => {

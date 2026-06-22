@@ -817,14 +817,20 @@ function localPart(email: string): string {
   return at > 0 ? email.slice(0, at) : email;
 }
 
-function cacheKeyFor(): string | null {
-  const p = envelopesPath();
+// statKey: mtime+size cache key for a JSONL file, or null when it does not exist.
+// Shared by the envelope (cacheKeyFor) and attachment (attachmentCacheKeyFor)
+// caches so the cross-process invalidation key format has a single definition.
+function statKey(p: string): string | null {
   try {
     const st = fs.statSync(p);
     return st.mtimeMs + ':' + st.size;
   } catch {
     return null; // no file yet.
   }
+}
+
+function cacheKeyFor(): string | null {
+  return statKey(envelopesPath());
 }
 
 function buildCache(): IndexCache {
@@ -936,13 +942,7 @@ interface AttachmentCache {
 let attachmentCache: AttachmentCache | null = null;
 
 function attachmentCacheKeyFor(): string | null {
-  const p = attachmentsPath();
-  try {
-    const st = fs.statSync(p);
-    return st.mtimeMs + ':' + st.size;
-  } catch {
-    return null; // no manifest yet.
-  }
+  return statKey(attachmentsPath());
 }
 
 function buildAttachmentCache(): AttachmentCache {
@@ -1213,7 +1213,10 @@ export interface AttachmentHit {
 }
 
 export interface AttachmentPage {
-  manifestBuilt: boolean;      // false when the manifest has no rows (built but empty / not built)
+  // false ONLY when the manifest file is absent (no index, or a pre-v3 index whose
+  // attachment stream never ran). A built index with genuinely zero attachments
+  // reports manifestBuilt:true + total:0 (a valid empty result, NOT a degradation).
+  manifestBuilt: boolean;
   total: number;               // number of dedup GROUPS after filtering (the paginated unit)
   hits: AttachmentHit[];
 }
@@ -1225,9 +1228,10 @@ const ATTACHMENT_OCCURRENCE_CAP = 10;
 
 // findAttachments: pure, offline, account-isolated scan of the attachment manifest.
 // Mirrors searchFastResult's shape: getAttachmentCache -> enforceAccount isolation
-// -> filter -> dedup by (filename_lower, size) -> sort -> page. NO IMAP, NO inverted
-// index (substring filters cannot use postings; the linear scan over the manifest
-// is well under the <50ms ship gate).
+// -> filter -> dedup by (filename_lower, size) -> sort by recency -> page. NO IMAP,
+// NO inverted index (substring filters cannot use postings; the linear scan over
+// the manifest is well under the <50ms ship gate). Only the returned page is
+// materialized into AttachmentHit objects.
 export function findAttachments(opts?: {
   from?: string;
   filename_contains?: string;
@@ -1238,10 +1242,13 @@ export function findAttachments(opts?: {
   offset?: number;
 }): AttachmentPage {
   const c = getAttachmentCache();
-  // Degradation signal: an empty manifest (no rows) -> not built. Detected on
-  // records, NOT fs.existsSync — dropIndex truncates the file to empty so the
-  // path can exist with zero rows.
-  if (c.records.length === 0) return { manifestBuilt: false, total: 0, hits: [] };
+  // Degradation signal: the manifest FILE is absent. getAttachmentCache uses an
+  // '' key sentinel iff statKey(attachmentsPath()) was null. A built index whose
+  // mailbox simply has zero attachments has a present (possibly empty) file -> a
+  // non-'' key -> manifestBuilt:true with total:0 (a valid empty result, not a
+  // "rebuild the index" prompt). After dropIndex the file is gone or the meta is
+  // emptied (the tool gates on indexExists() first), so this stays correct.
+  if (c.key === '') return { manifestBuilt: false, total: 0, hits: [] };
 
   const limit = clampLimit(opts?.limit);
   const offset = Math.max(0, Math.floor(opts?.offset ?? 0));
@@ -1254,58 +1261,74 @@ export function findAttachments(opts?: {
 
   interface Group {
     rep: AttachmentRecord;
-    repMs: number;
-    messages: Set<string>;     // distinct folder\x00uid
+    repMs: number;             // earliest member ms (NaN treated as +Inf for rep selection)
+    latestMs: number;          // newest member ms (NaN treated as -Inf), drives recency sort
+    messages: Set<string>;     // distinct folder\x00uid; .size IS occurrence_count
     occurrences: AttachmentOccurrence[];
-    occurrenceCount: number;
   }
   const groups = new Map<string, Group>();
 
   for (let i = 0; i < c.records.length; i++) {
     const r = c.records[i];
+    // Cheapest rejections first: account isolation, then O(1) numeric date bounds,
+    // then the costlier substring/toLowerCase work.
     if (acct !== null && r.account !== acct) continue;
-    if (fromNeedle !== null && !r.fromEmail.includes(fromNeedle) && !r.fromName.toLowerCase().includes(fromNeedle)) continue;
-    if (nameNeedle !== null) {
-      if (r.filename === null) continue;
-      if (!r.filename.toLowerCase().includes(nameNeedle)) continue;
-    }
-    if (mimeNeedle !== null && !r.mimeType.toLowerCase().includes(mimeNeedle)) continue;
     const ms = c.dateMs[i];
     if (since !== undefined && (isNaN(ms) || ms < since)) continue;
     if (before !== undefined && (isNaN(ms) || ms >= before)) continue;
+    if (fromNeedle !== null && !r.fromEmail.includes(fromNeedle) && !r.fromName.toLowerCase().includes(fromNeedle)) continue;
+    // Lowercase the filename ONCE: reused by both the filename filter and the key.
+    const fnLower = r.filename === null ? null : r.filename.toLowerCase();
+    if (nameNeedle !== null && (fnLower === null || !fnLower.includes(nameNeedle))) continue;
+    if (mimeNeedle !== null && !r.mimeType.toLowerCase().includes(mimeNeedle)) continue;
 
-    // Dedup key: non-null filenames collapse by (filename_lower, size); a null
-    // filename NEVER collapses (distinct unnamed parts that merely share a byte
-    // size are not the same file) — keyed uniquely by folder|uid|partId.
-    const key = r.filename === null
-      ? '\x00null\x00' + r.folder + '\x00' + r.uid + '\x00' + r.partId
-      : r.filename.toLowerCase() + '\x00' + r.size;
+    // Dedup key: a named file with a KNOWN size collapses by (filename_lower, size).
+    // A null filename OR an unknown size (0 = the non-finite backstop at store time)
+    // NEVER collapses — distinct unnamed parts, or files whose byte count we could
+    // not read, must not be merged just because a name+placeholder-size coincide.
+    const key = (fnLower === null || r.size === 0)
+      ? '\x00uniq\x00' + r.folder + '\x00' + r.uid + '\x00' + r.partId
+      : fnLower + '\x00' + r.size;
     const msgKey = r.folder + '\x00' + r.uid;
 
     let g = groups.get(key);
     if (!g) {
-      g = { rep: r, repMs: ms, messages: new Set(), occurrences: [], occurrenceCount: 0 };
+      g = { rep: r, repMs: ms, latestMs: isNaN(ms) ? Number.NEGATIVE_INFINITY : ms, messages: new Set(), occurrences: [] };
       groups.set(key, g);
     }
-    // Representative = earliest-dated message. NaN dates sort last (treated as
-    // +Infinity) so a real date always wins the representative slot.
+    // Representative = earliest-dated message (original send). NaN dates are treated
+    // as +Infinity so a real date always wins the representative slot.
     const repCmp = isNaN(g.repMs) ? Number.POSITIVE_INFINITY : g.repMs;
     const curCmp = isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
     if (curCmp < repCmp) { g.rep = r; g.repMs = ms; }
-    // occurrenceCount = distinct (folder, uid) messages — NOT raw partId rows
-    // (one mail attaching the same file in two parts must add 1, not 2).
+    // latestMs drives inter-group recency ordering (newest activity first).
+    if (!isNaN(ms) && ms > g.latestMs) g.latestMs = ms;
+    // occurrence_count = distinct (folder, uid) messages (Set.size) — NOT raw partId
+    // rows (one mail attaching the same file in two parts must add 1, not 2).
     if (!g.messages.has(msgKey)) {
       g.messages.add(msgKey);
-      g.occurrenceCount++;
       if (g.occurrences.length < ATTACHMENT_OCCURRENCE_CAP) {
         g.occurrences.push({ folder: r.folder, uid: r.uid, date: r.date, messageId: r.messageId });
       }
     }
   }
 
-  const hits: AttachmentHit[] = [];
-  for (const g of groups.values()) {
-    hits.push({
+  // Sort groups by most-recent activity, then materialize ONLY the page into hits.
+  // Inf-safe comparator (avoids NaN from (-Inf)-(-Inf)).
+  const groupList = [...groups.values()];
+  groupList.sort((a, b) => a.latestMs === b.latestMs ? 0 : (a.latestMs < b.latestMs ? 1 : -1));
+  const total = groupList.length;
+
+  const hits: AttachmentHit[] = groupList.slice(offset, offset + limit).map(g => {
+    // Guarantee the representative's own location is enumerated in occurrences[]
+    // (it may have been scanned after the cap filled). The top-level folder/uid
+    // already points at it; this keeps the occurrences list self-consistent.
+    if (!g.occurrences.some(o => o.folder === g.rep.folder && o.uid === g.rep.uid)) {
+      const repOcc = { folder: g.rep.folder, uid: g.rep.uid, date: g.rep.date, messageId: g.rep.messageId };
+      if (g.occurrences.length >= ATTACHMENT_OCCURRENCE_CAP) g.occurrences[g.occurrences.length - 1] = repOcc;
+      else g.occurrences.push(repOcc);
+    }
+    return {
       messageId: g.rep.messageId,
       subject: g.rep.subject,
       date: g.rep.date,
@@ -1317,15 +1340,12 @@ export function findAttachments(opts?: {
       mimeType: g.rep.mimeType,
       size: g.rep.size,
       partId: g.rep.partId,
-      occurrenceCount: g.occurrenceCount,
+      occurrenceCount: g.messages.size,
       occurrences: g.occurrences,
-      occurrencesTruncated: g.occurrenceCount > g.occurrences.length,
-    });
-  }
-  // Inter-group order: newest representative first (recency), then page.
-  hits.sort((a, b) => dateCompareDesc(a.date, b.date));
-  const total = hits.length;
-  return { manifestBuilt: true, total, hits: hits.slice(offset, offset + limit) };
+      occurrencesTruncated: g.messages.size > g.occurrences.length,
+    };
+  });
+  return { manifestBuilt: true, total, hits };
 }
 
 function dateCompareDesc(a: string, b: string): number {
