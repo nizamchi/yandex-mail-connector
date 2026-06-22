@@ -337,6 +337,15 @@ const unansweredSchema = z.object({
   limit:  z.number().int().min(1).max(100).optional().describe('Максимум на странице (default 20)'),
   offset: z.number().int().min(0).optional().describe('Сдвиг для пагинации (default 0)'),
 }).strict();
+const findAttachmentsSchema = z.object({
+  from:              z.string().optional().describe('Фильтр: фрагмент адреса/имени отправителя (подстрока, без регистра)'),
+  filename_contains: z.string().optional().describe('Фильтр: фрагмент имени файла (подстрока, без регистра). Напр. "договор", ".xlsx"'),
+  mime:              z.string().optional().describe('Фильтр: тип содержимого (подстрока, без регистра). Напр. "application/pdf", "pdf", "image/". Точный тип отсекает встроенные логотипы.'),
+  since:             z.string().optional().describe('Фильтр: ISO дата (YYYY-MM-DD) — письма не раньше этой даты (включительно)'),
+  before:            z.string().optional().describe('Фильтр: ISO дата (YYYY-MM-DD) — письма строго раньше этой даты'),
+  limit:             z.number().int().min(1).max(100).optional().describe('Максимум результатов на странице (default 20)'),
+  offset:            z.number().int().min(0).optional().describe('Сдвиг для пагинации (default 0)'),
+}).strict();
 const countEmailsSchema = z.object({
   folder:  z.string().default('INBOX'),
   from:    z.string().optional(),
@@ -1524,6 +1533,93 @@ Output: { index_built, owner_known, total, returned, offset, truncated,
           ? '\n\n...страница обрезана по размеру результата; сузь запрос или уменьши limit.'
           : (page.total > shownEnd ? `\n\n...показаны ${off + 1}–${shownEnd} из ${page.total}. Следующая страница: offset=${shownEnd}.` : '');
         return { content: [{ type: 'text', text: `Неотвеченных тредов (старше ${olderThanDays} дн.): ${page.total}:\n\n${lines.join('\n')}${more}` }], structuredContent: out };
+      } catch (e) { return errorResult(e); }
+    },
+  },
+
+  // 6i. Attachment catalog search over the local manifest (L0) -- v3.0.0 Layer 3.
+  // Always registered; degrades gracefully (no IMAP, no error) when the manifest
+  // has no rows. Reads attachments.jsonl only -- offline, account-isolated.
+  {
+    name: 'yandex_find_attachments',
+    title: 'Поиск вложений (локальный каталог)',
+    description: `Поиск вложений по локальному каталогу (метаданные из BODYSTRUCTURE) — мгновенно, без скачивания писем и без IMAP.
+Фильтры: from (отправитель), filename_contains (имя файла), mime (тип), since/before (даты). Все фильтры — подстрока, без регистра; складываются по И.
+Одинаковые файлы (одно имя + размер) схлопываются в одну запись с occurrence_count и списком мест (folder#uid) — чтобы скачать конкретную копию через yandex_get_attachment.
+ВАЖНО: каталог по BODYSTRUCTURE считает вложением и встроенные именованные части (логотипы, трекинг-картинки), которые НЕ являются «настоящими» файлами. Чтобы отсечь их — задай mime точнее (напр. mime="application/pdf" исключает image/*).
+Требует построенного индекса: \`yandex-mail-mcp index build\` (и \`index update\` для досинхронизации манифеста). Если каталог пуст — вернёт подсказку, без ошибки и без обращения к серверу.
+Args: from?, filename_contains?, mime?, since? (YYYY-MM-DD), before? (YYYY-MM-DD), limit (default 20, max 100), offset (default 0).
+Output: { manifest_built, total (число групп), returned, offset, truncated, hits: [{ message_id, subject, date, from, folder, uid, filename, mime_type, size_kb, part_id, occurrence_count, occurrences:[{folder,uid,date}], occurrences_truncated }] }`,
+    inputSchema: findAttachmentsSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    meta: { 'anthropic/maxResultSizeChars': 50_000 },
+    requires: { authLevel: 0 },
+    handler: async (params, _ctx) => {
+      try {
+        const { from, filename_contains, mime, since, before, limit, offset } = findAttachmentsSchema.parse(params);
+        const off = offset ?? 0;
+        const flt: {
+          from?: string; filename_contains?: string; mime?: string;
+          since?: number; before?: number; limit?: number; offset?: number;
+        } = { limit, offset: off };
+        if (from) flt.from = from;
+        if (filename_contains) flt.filename_contains = filename_contains;
+        if (mime) flt.mime = mime;
+        if (since) flt.since = parseSearchDate(since, 'since').getTime();
+        if (before) flt.before = parseSearchDate(before, 'before').getTime();
+
+        const { manifestBuilt, total, hits } = mailIndex.findAttachments(flt);
+        if (!manifestBuilt) {
+          // Two distinct hints: no index at all vs. an index whose manifest is
+          // empty (e.g. a pre-v3.0.0 index not yet re-streamed). Never isError,
+          // never IMAP.
+          const hint = !mailIndex.indexExists()
+            ? 'Каталог вложений пуст: сначала построй индекс — в терминале `yandex-mail-mcp index build`.'
+            : 'В каталоге вложений нет записей. Досинхронизируй индекс — `yandex-mail-mcp index update` (он добьёт манифест вложений).';
+          return {
+            content: [{ type: 'text', text: hint }],
+            structuredContent: { manifest_built: false, total: 0, returned: 0, offset: off, truncated: false, hits: [] },
+          };
+        }
+
+        const allRows = hits.map(h => {
+          // Re-sanitize EVERY structured field (filename + sender + subject):
+          // storage-time sanitization is not retroactive to older manifests, and
+          // sender fields were never sanitized at store -- filenames are the
+          // highest prompt-injection-risk attacker-controlled field.
+          const fromStr = capLen(h.fromName ? `${h.fromName} <${h.fromEmail}>` : h.fromEmail, MAX_FROM_LEN);
+          return {
+            message_id: h.messageId,
+            subject: capLen(sanitizeForDisplay(h.subject), MAX_SUBJECT_LEN),
+            date: h.date,
+            from: sanitizeForDisplay(fromStr),
+            folder: h.folder,
+            uid: h.uid,
+            filename: sanitizeForDisplay(h.filename) || null,
+            mime_type: h.mimeType,
+            size_kb: Number.isFinite(h.size) ? Math.round(h.size / 1024 * 10) / 10 : 0,
+            part_id: h.partId,
+            occurrence_count: h.occurrenceCount,
+            occurrences: h.occurrences.map(o => ({ folder: o.folder, uid: o.uid, date: o.date })),
+            occurrences_truncated: h.occurrencesTruncated,
+          };
+        });
+        const { rows, truncated } = fitRows(allRows, SEARCH_RESULT_BUDGET);
+        const out = { manifest_built: true, total, returned: rows.length, offset: off, truncated, hits: rows };
+        if (rows.length === 0) {
+          return { content: [{ type: 'text', text: `По заданным фильтрам вложений не найдено (всего групп в каталоге: ${total}).` }], structuredContent: out };
+        }
+        const lines = rows.map((r, i) => {
+          const dup = r.occurrence_count > 1 ? ` ×${r.occurrence_count}` : '';
+          const name = r.filename || '(без имени)';
+          const day = r.date ? r.date.slice(0, 10) : '—';
+          return `${off + i + 1}. ${name}${dup} — ${r.mime_type}, ${r.size_kb} КБ [${r.folder}#${r.uid}], ${day} — ${r.from}`;
+        });
+        const shownEnd = off + rows.length;
+        const more = truncated
+          ? '\n\n…страница обрезана по размеру результата; сузь запрос или уменьши limit.'
+          : (total > shownEnd ? `\n\n…показаны ${off + 1}–${shownEnd} из ${total}. Следующая страница: offset=${shownEnd}.` : '');
+        return { content: [{ type: 'text', text: `Найдено вложений (групп по имени+размеру): ${total}:\n\n${lines.join('\n')}${more}` }], structuredContent: out };
       } catch (e) { return errorResult(e); }
     },
   },

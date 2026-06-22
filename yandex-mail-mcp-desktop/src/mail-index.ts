@@ -797,6 +797,10 @@ let cache: IndexCache | null = null;
 
 function invalidateCache(): void {
   cache = null;
+  // Same-process invalidation for the manifest cache too: dropIndex (truncate)
+  // and _resetForTests both funnel through here, so one line keeps the
+  // AttachmentCache coherent without re-stat or new export surface.
+  attachmentCache = null;
 }
 
 function tokenize(text: string): string[] {
@@ -914,6 +918,52 @@ function getCache(): IndexCache {
   if (cache && cache.key === key) return cache;
   cache = buildCache();
   return cache;
+}
+
+// ── Attachment manifest cache (lazy, mtime+size-keyed — sibling of IndexCache) ──
+// A verbatim mirror of the FTS cache for attachments.jsonl. findAttachments runs a
+// pure linear substring scan over `records` (substring filters cannot use an
+// inverted index), so the cache only needs the rows + a precomputed dateMs[] so
+// since/before do not re-parse Date on every call. Cross-process invalidation is
+// the same re-stat as getCache (a CLI rebuild changes mtime/size); same-process
+// drop/reset is covered by the attachmentCache=null line in invalidateCache().
+interface AttachmentCache {
+  key: string;                  // mtimeMs + ':' + size of attachments.jsonl
+  records: AttachmentRecord[];
+  dateMs: number[];             // parsed date per record; NaN when missing/invalid
+}
+
+let attachmentCache: AttachmentCache | null = null;
+
+function attachmentCacheKeyFor(): string | null {
+  const p = attachmentsPath();
+  try {
+    const st = fs.statSync(p);
+    return st.mtimeMs + ':' + st.size;
+  } catch {
+    return null; // no manifest yet.
+  }
+}
+
+function buildAttachmentCache(): AttachmentCache {
+  const records = loadAllAttachments();
+  const dateMs: number[] = [];
+  for (const r of records) dateMs.push(r.date ? new Date(r.date).getTime() : NaN);
+  return { key: attachmentCacheKeyFor() ?? '', records, dateMs };
+}
+
+function getAttachmentCache(): AttachmentCache {
+  const key = attachmentCacheKeyFor();
+  if (key === null) {
+    // No manifest file -> empty cache with an '' sentinel so repeated calls on a
+    // missing manifest do not thrash (mirrors getCache's null-key branch).
+    if (attachmentCache && attachmentCache.key === '' && attachmentCache.records.length === 0) return attachmentCache;
+    attachmentCache = { key: '', records: [], dateMs: [] };
+    return attachmentCache;
+  }
+  if (attachmentCache && attachmentCache.key === key) return attachmentCache;
+  attachmentCache = buildAttachmentCache();
+  return attachmentCache;
 }
 
 // ── Subject normalization (thread grouping) ───────────────────────────
@@ -1115,6 +1165,167 @@ export function searchFast(
   opts?: { folder?: string; limit?: number; offset?: number; filters?: SearchFilters },
 ): SearchHit[] {
   return searchFastResult(query, opts).hits;
+}
+
+// ── Public: attachment search (Layer 3, ATT-01/05/06) ─────────────────
+
+// Filters for findAttachments. All AND together; an empty filter set returns
+// every (account-scoped) attachment. mime/from/filename_contains are
+// case-insensitive SUBSTRING; since/before are epoch-ms (since inclusive, before
+// exclusive — mirrors SearchFilters), and a row with no parseable date fails any
+// bound rather than silently passing.
+export interface AttachmentFilters {
+  from?: string;               // substring of fromEmail or fromName
+  filename_contains?: string;  // substring of filename; a null filename never matches
+  mime?: string;               // substring of mimeType ('pdf' -> 'application/pdf')
+  since?: number;              // ms, inclusive lower bound on date
+  before?: number;             // ms, exclusive upper bound on date
+}
+
+// One location of a deduped attachment — enough for the agent to fetch that copy
+// via yandex_get_attachment (folder + uid + the part index it resolves itself).
+export interface AttachmentOccurrence {
+  folder: string;
+  uid: number;
+  date: string;
+  messageId: string;
+}
+
+// One dedup group. Representative fields are the EARLIEST-dated message in the
+// group (the original send); occurrenceCount is the TRUE count of distinct
+// (folder, uid) messages carrying this (filename_lower, size), even when
+// `occurrences` is capped.
+export interface AttachmentHit {
+  messageId: string;
+  subject: string;
+  date: string;                // representative (earliest) message date
+  fromEmail: string;
+  fromName: string;
+  folder: string;
+  uid: number;
+  filename: string | null;
+  mimeType: string;
+  size: number;                // raw RFC 3501 transfer-encoded octets (tool layer -> size_kb)
+  partId: string;
+  occurrenceCount: number;     // distinct (folder, uid) messages — true full count
+  occurrences: AttachmentOccurrence[]; // capped at ATTACHMENT_OCCURRENCE_CAP
+  occurrencesTruncated: boolean;
+}
+
+export interface AttachmentPage {
+  manifestBuilt: boolean;      // false when the manifest has no rows (built but empty / not built)
+  total: number;               // number of dedup GROUPS after filtering (the paginated unit)
+  hits: AttachmentHit[];
+}
+
+// Cap on the per-hit occurrences[] list. occurrenceCount stays the true full
+// count; this only bounds the enumerated locations so a hot file (a logo in 500
+// mails) cannot blow one row past the fitRows budget and starve the page.
+const ATTACHMENT_OCCURRENCE_CAP = 10;
+
+// findAttachments: pure, offline, account-isolated scan of the attachment manifest.
+// Mirrors searchFastResult's shape: getAttachmentCache -> enforceAccount isolation
+// -> filter -> dedup by (filename_lower, size) -> sort -> page. NO IMAP, NO inverted
+// index (substring filters cannot use postings; the linear scan over the manifest
+// is well under the <50ms ship gate).
+export function findAttachments(opts?: {
+  from?: string;
+  filename_contains?: string;
+  mime?: string;
+  since?: number;
+  before?: number;
+  limit?: number;
+  offset?: number;
+}): AttachmentPage {
+  const c = getAttachmentCache();
+  // Degradation signal: an empty manifest (no rows) -> not built. Detected on
+  // records, NOT fs.existsSync — dropIndex truncates the file to empty so the
+  // path can exist with zero rows.
+  if (c.records.length === 0) return { manifestBuilt: false, total: 0, hits: [] };
+
+  const limit = clampLimit(opts?.limit);
+  const offset = Math.max(0, Math.floor(opts?.offset ?? 0));
+  const fromNeedle = opts?.from && opts.from.length > 0 ? opts.from.toLowerCase() : null;
+  const nameNeedle = opts?.filename_contains && opts.filename_contains.length > 0 ? opts.filename_contains.toLowerCase() : null;
+  const mimeNeedle = opts?.mime && opts.mime.length > 0 ? opts.mime.toLowerCase() : null;
+  const since = opts?.since;
+  const before = opts?.before;
+  const acct = enforceAccount();
+
+  interface Group {
+    rep: AttachmentRecord;
+    repMs: number;
+    messages: Set<string>;     // distinct folder\x00uid
+    occurrences: AttachmentOccurrence[];
+    occurrenceCount: number;
+  }
+  const groups = new Map<string, Group>();
+
+  for (let i = 0; i < c.records.length; i++) {
+    const r = c.records[i];
+    if (acct !== null && r.account !== acct) continue;
+    if (fromNeedle !== null && !r.fromEmail.includes(fromNeedle) && !r.fromName.toLowerCase().includes(fromNeedle)) continue;
+    if (nameNeedle !== null) {
+      if (r.filename === null) continue;
+      if (!r.filename.toLowerCase().includes(nameNeedle)) continue;
+    }
+    if (mimeNeedle !== null && !r.mimeType.toLowerCase().includes(mimeNeedle)) continue;
+    const ms = c.dateMs[i];
+    if (since !== undefined && (isNaN(ms) || ms < since)) continue;
+    if (before !== undefined && (isNaN(ms) || ms >= before)) continue;
+
+    // Dedup key: non-null filenames collapse by (filename_lower, size); a null
+    // filename NEVER collapses (distinct unnamed parts that merely share a byte
+    // size are not the same file) — keyed uniquely by folder|uid|partId.
+    const key = r.filename === null
+      ? '\x00null\x00' + r.folder + '\x00' + r.uid + '\x00' + r.partId
+      : r.filename.toLowerCase() + '\x00' + r.size;
+    const msgKey = r.folder + '\x00' + r.uid;
+
+    let g = groups.get(key);
+    if (!g) {
+      g = { rep: r, repMs: ms, messages: new Set(), occurrences: [], occurrenceCount: 0 };
+      groups.set(key, g);
+    }
+    // Representative = earliest-dated message. NaN dates sort last (treated as
+    // +Infinity) so a real date always wins the representative slot.
+    const repCmp = isNaN(g.repMs) ? Number.POSITIVE_INFINITY : g.repMs;
+    const curCmp = isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
+    if (curCmp < repCmp) { g.rep = r; g.repMs = ms; }
+    // occurrenceCount = distinct (folder, uid) messages — NOT raw partId rows
+    // (one mail attaching the same file in two parts must add 1, not 2).
+    if (!g.messages.has(msgKey)) {
+      g.messages.add(msgKey);
+      g.occurrenceCount++;
+      if (g.occurrences.length < ATTACHMENT_OCCURRENCE_CAP) {
+        g.occurrences.push({ folder: r.folder, uid: r.uid, date: r.date, messageId: r.messageId });
+      }
+    }
+  }
+
+  const hits: AttachmentHit[] = [];
+  for (const g of groups.values()) {
+    hits.push({
+      messageId: g.rep.messageId,
+      subject: g.rep.subject,
+      date: g.rep.date,
+      fromEmail: g.rep.fromEmail,
+      fromName: g.rep.fromName,
+      folder: g.rep.folder,
+      uid: g.rep.uid,
+      filename: g.rep.filename,
+      mimeType: g.rep.mimeType,
+      size: g.rep.size,
+      partId: g.rep.partId,
+      occurrenceCount: g.occurrenceCount,
+      occurrences: g.occurrences,
+      occurrencesTruncated: g.occurrenceCount > g.occurrences.length,
+    });
+  }
+  // Inter-group order: newest representative first (recency), then page.
+  hits.sort((a, b) => dateCompareDesc(a.date, b.date));
+  const total = hits.length;
+  return { manifestBuilt: true, total, hits: hits.slice(offset, offset + limit) };
 }
 
 function dateCompareDesc(a: string, b: string): number {
