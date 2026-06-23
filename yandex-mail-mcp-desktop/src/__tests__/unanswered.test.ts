@@ -14,10 +14,36 @@ import { _resetForTests as _resetStateDir } from '../state-dir.js';
 import {
   buildIndex,
   unansweredThreads,
+  looksAutomated,
   _resetForTests,
   _setAccountForTests,
   type EnvelopeSource,
 } from '../mail-index.js';
+
+// ── looksAutomated (word-boundary heuristic) ──────────────────────────────
+
+test('looksAutomated: flags noreply / no-reply / donotreply prefixes', () => {
+  assert.equal(looksAutomated('noreply@bank.ru'), true);
+  assert.equal(looksAutomated('no-reply@shop.com'), true);
+  assert.equal(looksAutomated('donotreply@x.io'), true);
+});
+
+test('looksAutomated: flags newsletter/notification as a word (with separators)', () => {
+  assert.equal(looksAutomated('daily-newsletter@news.com'), true);
+  assert.equal(looksAutomated('notifications.team@app.io'), true);
+  assert.equal(looksAutomated('newsletter@news.com'), true);
+});
+
+test('looksAutomated: does NOT flag a human whose name merely contains the word', () => {
+  // The bug: bare includes() demoted real people; word boundaries fix it.
+  assert.equal(looksAutomated('anna-newsletterova@yandex.ru'), false);
+  assert.equal(looksAutomated('john.notificationsson@gmail.com'), false);
+  assert.equal(looksAutomated('newsletterova@ya.ru'), false);
+});
+
+test('looksAutomated: ordinary human address is not automated', () => {
+  assert.equal(looksAutomated('ivan.petrov@yandex.ru'), false);
+});
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 

@@ -593,6 +593,12 @@ export async function buildIndex(
   rewriteAttachments(attachments); // manifest first (MR-4)
   rewriteEnvelopes(records);       // envelopes last (MR-4)
   persistMeta(meta);
+  // Drop the in-process caches so a same-process read after a (re)build sees the
+  // fresh files. In production build/update run in a SEPARATE CLI process from the
+  // long-lived server, so cross-process freshness rests on statKey(mtime+size);
+  // this invalidation removes the latent staleness if anything ever builds
+  // in-server (tests, a future in-server refresh). dropIndex already did this.
+  invalidateCache();
   return { folders: result, added, errors };
 }
 
@@ -744,6 +750,9 @@ export async function updateIndex(
     persistMeta(meta);
   }
 
+  // Match buildIndex: drop in-process caches so the append-only path (which does
+  // not route through buildIndex) is consistent for any same-process reader.
+  invalidateCache();
   return { folders: result, added, errors };
 }
 
@@ -1452,12 +1461,16 @@ const NO_REPLY_LOCALPARTS = new Set([
   'digest', 'bounce', 'postmaster',
 ]);
 
-function looksAutomated(fromEmail: string): boolean {
+export function looksAutomated(fromEmail: string): boolean {
   const at = fromEmail.indexOf('@');
   const local = (at >= 0 ? fromEmail.slice(0, at) : fromEmail).toLowerCase();
   if (NO_REPLY_LOCALPARTS.has(local)) return true;
   if (local.startsWith('noreply') || local.startsWith('no-reply') || local.startsWith('donotreply')) return true;
-  if (local.includes('notification') || local.includes('newsletter')) return true;
+  // Word-boundary match, NOT a bare includes: flags "daily-newsletter@" /
+  // "notifications.team@" but NOT a human whose name merely contains the word
+  // ("anna-newsletterova@" / "john.notificationsson@"). Exact "notification(s)"/
+  // "newsletter(s)" are already in NO_REPLY_LOCALPARTS; this adds separator-joined variants.
+  if (/(^|[._-])(notifications?|newsletters?)([._-]|$)/.test(local)) return true;
   return false;
 }
 
