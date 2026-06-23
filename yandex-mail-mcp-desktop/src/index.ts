@@ -121,11 +121,58 @@ const SERVER_INSTRUCTIONS = [
   'folders, attachments, replies, forwarding, or any task involving',
   '@yandex.ru / @ya.ru / @yandex.com mailboxes. Read-only by default;',
   'destructive operations require server-issued one-time codes.',
+  'If the user wants an action that has no matching tool here (send, delete,',
+  'move, mark as read), the access level is too low — tell them to raise it',
+  '(set YANDEX_AUTH_LEVEL=safe|destructive, or run the /ymc-config slash command',
+  'in Claude Code) and restart, not that the action is impossible.',
+  'If the user is new here or asks what this can do, point them to the',
+  '/ymc-info slash command (or the info prompt) for a guided overview.',
+].join(' ');
+
+// `info` MCP prompt (UX, v2.10.0): a capability briefing reachable as a slash
+// command in ANY MCP client (Claude Desktop included), WITHOUT installing the
+// repo .claude/commands/ -- it ships inside the bundle. Mirrors the /ymc-info
+// slash command: the client's model renders the overview by calling
+// yandex_health_check (L0, no network) and listing the yandex_* tools it can
+// actually see, so it auto-adapts to version + auth level. Read-only, no args,
+// available at every level. Kept in sync with .claude/commands/ymc-info.md.
+const INFO_PROMPT_TEXT = [
+  'Расскажи, что умеет Yandex Mail коннектор — по-русски, живо, по пирамиде Минто',
+  '(сверху вывод, под ним опоры, в основании доверие), без воды и «волшебных миров».',
+  'Сначала вызови yandex_health_check (уровень 0, без сети): версия, аккаунт, текущий',
+  'уровень доступа. Источник правды о возможностях — инструменты yandex_*, которые',
+  'реально тебе видны сейчас (выше уровня сервер их не регистрирует; не выдумывай).',
+  'Подача: (1) вершина — одна строка-вывод вроде «твоя почта теперь отвечает на вопросы',
+  'словами — быстро и безопасно»; (2) завязка в 2 строки: писем тысячи, глазами не найти,',
+  'а пускать агента в личную почту боязно; (3) опоры, у каждой сначала боль, потом',
+  'решение и доступные инструменты — НАЙТИ (поиск, отправители, вложения, чтение, треды;',
+  'уровень 0), РАЗОБРАТЬ (пометить, переместить, удалить; уровень 1), ОТВЕТИТЬ (отправка',
+  'с одноразовым кодом; уровень 2); закрытую опору подавай как следующую главу, что',
+  'открывается через /ymc-config и перезапуск; (4) основание — почему не страшно: по',
+  'умолчанию только чтение, удаление и отправка требуют одноразового кода, отправка только',
+  'на доверенные адреса, текст письма для коннектора — данные, а не команды; (5) финал —',
+  'одна фраза, которую можно сказать прямо сейчас. Не показывай значения паролей и токенов.',
 ].join(' ');
 
 const server = new McpServer(
-  { name: 'yandex-mail-mcp', version: '2.9.0' },
+  { name: 'yandex-mail-mcp', version: '2.10.0' },
   { instructions: SERVER_INSTRUCTIONS },
+);
+
+// Register the `info` prompt right after construction (no deps on auth level
+// or protected folders). registerPrompt also flips on the server's `prompts`
+// capability so MCP clients list it as a slash command.
+server.registerPrompt(
+  'info',
+  {
+    title: 'Что умеет Yandex Mail коннектор',
+    description: 'Обзор возможностей под текущий уровень доступа + модель безопасности',
+  },
+  () => ({
+    messages: [
+      { role: 'user', content: { type: 'text', text: INFO_PROMPT_TEXT } },
+    ],
+  }),
 );
 
 // Mutable bag shared with every tool handler via ctx.serverContext. canElicit
