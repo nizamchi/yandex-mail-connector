@@ -234,6 +234,145 @@ function errorResult(e: unknown): HandlerResult {
   };
 }
 
+// ── read_top support: one-call "read the latest from X" ───────────────────
+//
+// renderUntrustedBody is the SINGLE security transform applied to an email body
+// before it enters LLM context: prepend the [!UNTRUSTED SENDER] marker for a
+// non-allowlisted sender, then wrap in the wrapUntrusted boundary. Shared by
+// yandex_get_email's normal path AND yandex_search_fast(read_top) so the two
+// can never drift. NOTE: the higher-priority 2FA-sender REDACTION short-circuit
+// is handled by each caller FIRST (its content + audit shape differ); this
+// helper assumes 2FA was already cleared.
+export function renderUntrustedBody(email: imap.EmailMessage): string {
+  let body = email.textBody ?? email.htmlBody ?? '(пусто)';
+  const fromAddr = email.from[0]?.address?.toLowerCase();
+  if (fromAddr && !allowlist.isAllowed(fromAddr)) {
+    body = `[!UNTRUSTED SENDER: ${sanitizeForDisplay(fromAddr)}]\n` + body;
+  }
+  return wrapUntrusted(body);
+}
+
+// The compact "top message" block read_top attaches to a search_fast result.
+interface ReadTopBlock {
+  folder: string;
+  uid: number;
+  from: string;
+  subject: string;
+  date: string;
+  seen: boolean;
+  has_attachments: boolean;
+  body: string;            // wrapUntrusted-wrapped text (or the 2FA-redacted stub)
+  body_truncated: boolean;
+  body_source: 'live_fetch';
+  redacted: boolean;       // true when the body was 2FA-redacted
+  index_fresh: boolean;    // false => index may be stale / freshness unverified
+  attachments: { filename: string; mimeType: string; size: number }[];
+}
+
+type ReadTopResult = { top?: ReadTopBlock; status: string; _audit?: Record<string, unknown> };
+
+// The three LIVE-IMAP functions read_top depends on, injectable so the decision
+// logic (ambiguity / freshness / fallback) is unit-testable without a real
+// server. Production wiring is defaultReadTopPorts (the real imap.* calls); the
+// index reads (searchFastResult/getIndexStatus) stay direct -- they are pure and
+// already DI-tested via EnvelopeSource.
+export interface ReadTopPorts {
+  getEmail: (folder: string, uid: number) => Promise<imap.EmailMessage | null>;
+  searchEmails: (folder: string, query: Record<string, unknown>, max: number) => Promise<imap.EmailHeader[]>;
+  getMailboxCursor: (folder: string) => Promise<{ uidValidity: number; uidNext: number; exists: number }>;
+}
+const defaultReadTopPorts: ReadTopPorts = {
+  getEmail: (f, u) => imap.getEmail(f, u),
+  searchEmails: (f, q, m) => imap.searchEmails(f, q, m),
+  getMailboxCursor: (f) => imap.getMailboxCursor(f),
+};
+
+// readTopBody: fetch ONE message body and render it through the SAME security
+// path as yandex_get_email (provenance.recordRead + 2FA redaction + untrusted
+// marker + wrapUntrusted). This is the only live IMAP fetch read_top performs.
+export async function readTopBody(folder: string, uid: number, indexFresh: boolean, okStatus: string, ports: ReadTopPorts = defaultReadTopPorts): Promise<ReadTopResult> {
+  const email = await ports.getEmail(folder, uid);
+  if (!email) return { status: 'not_found' };
+  const messageId = email.messageId && email.messageId.length > 0 ? email.messageId : '<no-message-id-uid-' + uid + '>';
+  // PMLF-PROV-04 parity: record read provenance (RAM-only) before any return.
+  provenance.recordRead(messageId, { folder, uid });
+  const fromAddrRaw = email.from[0]?.address ?? null;
+  const fromDomain = domainOnly(fromAddrRaw ?? '');
+  const redacted = is2FASender(fromAddrRaw);
+  if (redacted) {
+    // Parity with get_email's 2FA branch: explicit denied audit; omit
+    // body_length/subject_hash (side-channel on a known-length 2FA code).
+    auditLog({
+      action: 'yandex_search_fast', status: 'denied', level: 'warn',
+      ts: new Date().toISOString(), reason: '2fa_sender_redacted', folder, uid,
+      message_id: messageId, from_domain: fromDomain, redacted: ['body', 'subject_hash', 'body_length'],
+    });
+  }
+  const body = redacted ? wrapUntrusted('[REDACTED - 2FA sender]') : renderUntrustedBody(email);
+  const top: ReadTopBlock = {
+    folder, uid,
+    from: capLen(email.from[0]?.name ? `${email.from[0].name} <${fromAddrRaw ?? ''}>` : (fromAddrRaw ?? ''), MAX_FROM_LEN),
+    subject: sanitizeForDisplay(email.subject ?? ''),
+    date: email.date ?? '',
+    seen: email.seen,
+    has_attachments: email.attachments.length > 0,
+    body,
+    body_truncated: email.truncated,
+    body_source: 'live_fetch',
+    redacted,
+    index_fresh: indexFresh,
+    attachments: email.attachments.map(a => ({ filename: sanitizeForDisplay(a.filename), mimeType: a.contentType, size: a.size })),
+  };
+  const _audit = redacted
+    ? { folder, uid, message_id: messageId, from_domain: fromDomain }
+    : { folder, uid, message_id: messageId, subject_hash: subjectHash(email.subject), body_length: (email.textBody ?? email.htmlBody ?? '').length, from_domain: fromDomain };
+  return { top, status: redacted ? 'redacted' : okStatus, _audit };
+}
+
+// resolveReadTop: pick the single unambiguous top hit for "read the latest from
+// X" and read its body in one shot. Returns only a status when it declines:
+//   ambiguous      -- top-2 index hits are different senders; agent disambiguates
+//   no_hits        -- nothing in the index and no live fallback target
+//   stale_fallback -- index empty/stale; answered from a live lookup instead
+// Quality guard: a cheap STATUS probe detects mail that arrived since the last
+// sync and re-resolves the true latest live before reading (anti-stale).
+export async function resolveReadTop(q: string, folder: string | undefined, filters: mailIndex.SearchFilters, ports: ReadTopPorts = defaultReadTopPorts): Promise<ReadTopResult> {
+  const top2 = mailIndex.searchFastResult(q, { folder, limit: 2, offset: 0, filters }).hits;
+  if (top2.length === 0) {
+    // Index has no match -> one live lookup if we can target a sender, so
+    // read_top is never worse than the old find->search->read path.
+    if (filters.from) {
+      try {
+        const live = await ports.searchEmails(folder ?? 'INBOX', { from: filters.from }, 1);
+        if (live.length > 0) return await readTopBody(folder ?? 'INBOX', live[0].uid, false, 'stale_fallback', ports);
+      } catch { /* fall through to no_hits */ }
+    }
+    return { status: 'no_hits' };
+  }
+  // Ambiguous when the top two hits are DIFFERENT senders (two people matching
+  // the same name) -- don't auto-read the wrong person; let the agent choose.
+  if (top2.length >= 2 && top2[0].record.fromEmail !== top2[1].record.fromEmail) {
+    return { status: 'ambiguous' };
+  }
+  const rec = top2[0].record;
+  let targetUid = rec.uid;
+  let indexFresh = true;
+  try {
+    const fmeta = mailIndex.getIndexStatus().folders.find(f => f.folder === rec.folder);
+    const cursor = await ports.getMailboxCursor(rec.folder);
+    if (fmeta && cursor.uidNext > fmeta.uidNext) {
+      // Mail arrived since the last sync -> the index "latest" may be wrong.
+      indexFresh = false;
+      // Re-resolve the true latest from this EXACT sender (not the fuzzy filter).
+      const live = await ports.searchEmails(rec.folder, { from: rec.fromEmail }, 1);
+      if (live.length > 0) targetUid = live[0].uid;
+    }
+  } catch {
+    indexFresh = false; // probe failed -- flag freshness as unverified (honest)
+  }
+  return await readTopBody(rec.folder, targetUid, indexFresh, indexFresh ? 'ok' : 'stale_fallback', ports);
+}
+
 // wrapWithAudit (Phase 6) -- wraps every handler so each tool call emits an
 // 'attempt' audit record on entry and a 'success' | 'denied' | 'error' record
 // on exit. Reads handler-returned _audit extras and forwards them (incl. the
@@ -323,6 +462,7 @@ const searchFastSchema = z.object({
   seen:   z.boolean().optional().describe('Фильтр: true=только прочитанные, false=только непрочитанные'),
   flagged:z.boolean().optional().describe('Фильтр: true=только со звёздочкой, false=только без'),
   has_attachments: z.boolean().optional().describe('Фильтр: true=только письма с вложениями, false=только без. Считает и встроенные именованные части (логотипы) — для поиска именно файлов по типу используй yandex_find_attachments с mime.'),
+  read_top: z.boolean().optional().describe('true = заодно ПРОЧИТАТЬ тело самого свежего (верхнего) письма в этом же вызове. Один живой дочит, только если верхний результат однозначен (иначе вернёт список без тела). Для «прочитай последнее письмо от X».'),
 }).strict();
 const getThreadSchema = z.object({
   query:  z.string().min(1).describe('Слова из темы письма, тред которого нужен'),
@@ -1061,13 +1201,9 @@ Args: folder (default "INBOX"), uid (integer UID письма).
             },
           };
         }
-        let body = email.textBody ?? email.htmlBody ?? '(пусто)';
-        // Phase 5: prepend untrusted-sender marker INSIDE the wrapUntrusted
-        // boundary (per ROADMAP SC #9). ASCII per D-EMOJI-MARKER -- no glyph.
-        const fromAddr = email.from[0]?.address?.toLowerCase();
-        if (fromAddr && !allowlist.isAllowed(fromAddr)) {
-          body = `[!UNTRUSTED SENDER: ${sanitizeForDisplay(fromAddr)}]\n` + body;
-        }
+        // Phase 5 untrusted-sender marker + Phase 2 wrapUntrusted boundary are
+        // applied by the shared renderUntrustedBody (single-sourced with
+        // read_top so the two body-rendering paths cannot drift).
         const attachLine = email.attachments.length
           ? `Вложения: ${email.attachments.map(a => `${sanitizeForDisplay(a.filename)} (${(a.size/1024).toFixed(1)} KB)`).join(', ')}`
           : '';
@@ -1081,7 +1217,7 @@ Args: folder (default "INBOX"), uid (integer UID письма).
           attachLine,
           email.truncated ? '\n[Body truncated at 8000 chars]' : '',
           '',
-          wrapUntrusted(body),
+          renderUntrustedBody(email),
         ].filter(Boolean).join('\n');
         // SEC-06: text channel получает explicit BEGIN/END markers (LLM).
         // structuredContent -- для programmatic клиентов (не подвержены
@@ -1392,7 +1528,7 @@ Output: { index_built, total (полное число совпадений), ret
     requires: { authLevel: 0 },
     handler: async (params, _ctx) => {
       try {
-        const { query, folder, limit, offset, from, since, before, seen, flagged, has_attachments } = searchFastSchema.parse(params);
+        const { query, folder, limit, offset, from, since, before, seen, flagged, has_attachments, read_top } = searchFastSchema.parse(params);
         const q = (query ?? '').trim();
         const off = offset ?? 0;
         const filters: mailIndex.SearchFilters = {};
@@ -1424,9 +1560,35 @@ Output: { index_built, total (полное число совпадений), ret
         }));
         const { rows, truncated } = fitRows(allRows, SEARCH_RESULT_BUDGET);
         const label = q.length > 0 ? `"${q}"` : 'заданным фильтрам';
-        const out = { index_built: true, query: q, total, returned: rows.length, offset: off, truncated, hits: rows };
+        const out: {
+          index_built: boolean; query: string; total: number; returned: number;
+          offset: number; truncated: boolean; hits: typeof allRows;
+          top?: ReadTopBlock; read_top_status?: string;
+        } = { index_built: true, query: q, total, returned: rows.length, offset: off, truncated, hits: rows };
+
+        // read_top: collapse "read the latest from X" into THIS call -- one live
+        // body fetch of the single unambiguous top hit (or a graceful status).
+        let readTopAudit: Record<string, unknown> | undefined;
+        if (read_top) {
+          const rt = await resolveReadTop(q, folder, filters);
+          out.read_top_status = rt.status;
+          if (rt.top) out.top = rt.top;
+          readTopAudit = rt._audit;
+        }
+        const wrapRet = (text: string) =>
+          readTopAudit
+            ? { content: [{ type: 'text' as const, text }], structuredContent: out, _audit: readTopAudit }
+            : { content: [{ type: 'text' as const, text }], structuredContent: out };
+        const topText = out.top
+          ? `\n\nВерхнее письмо (прочитано вживую${out.top.index_fresh === false ? ', индекс мог устареть' : ''}${out.top.redacted ? ', тело скрыто: 2FA-отправитель' : ''}):\n${out.top.subject || '(без темы)'} — ${out.top.from}, ${(out.top.date || '').slice(0, 10)}\n${out.top.body}`
+          : (read_top
+              ? (out.read_top_status === 'ambiguous'
+                  ? '\n\nread_top: совпали несколько разных отправителей — уточни кого именно или сузь from=; тело не прочитано.'
+                  : `\n\nread_top: тело не прочитано (${out.read_top_status ?? 'нет данных'}).`)
+              : '');
+
         if (rows.length === 0) {
-          return { content: [{ type: 'text', text: `По ${label} в индексе ничего не найдено (всего совпадений: ${total}).` }], structuredContent: out };
+          return wrapRet(`По ${label} в индексе ничего не найдено (всего совпадений: ${total}).${topText}`);
         }
         const lines = rows.map((r, i) =>
           `${off + i + 1}. [${r.folder}#${r.uid}] ${sanitizeForDisplay(r.subject) || '(без темы)'} — ${sanitizeForDisplay(r.from)}, ${r.date.slice(0, 10)} (релевантность ${r.score})`,
@@ -1438,7 +1600,7 @@ Output: { index_built, total (полное число совпадений), ret
         const more = truncated
           ? '\n\n…страница обрезана по размеру результата; сузь запрос или уменьши limit.'
           : (total > shownEnd ? `\n\n…показаны ${off + 1}–${shownEnd} из ${total}. Следующая страница: offset=${shownEnd}.` : '');
-        return { content: [{ type: 'text', text: `Найдено ${total} (локальный индекс):\n\n${lines.join('\n')}${more}` }], structuredContent: out };
+        return wrapRet(`Найдено ${total} (локальный индекс):\n\n${lines.join('\n')}${more}${topText}`);
       } catch (e) { return errorResult(e); }
     },
   },

@@ -258,7 +258,7 @@ test('T-PROV-PRIVACY-DISK-01: directory + file-hash + cwd snapshot privacy (B-4)
   }
 });
 
-test('T-PROV-HOOK-PRESENT-01: tools.ts call-site grep (EXACTLY 2 per B-1)', () => {
+test('T-PROV-HOOK-PRESENT-01: tools.ts call-site grep (EXACTLY 3 per B-1 + read_top)', () => {
   const dir = mkTmpStateDir();
   try {
     const toolsPath = path.join(process.cwd(), 'src', 'tools.ts');
@@ -266,12 +266,18 @@ test('T-PROV-HOOK-PRESENT-01: tools.ts call-site grep (EXACTLY 2 per B-1)', () =
     const toolsSrc = fs.readFileSync(toolsPath, 'utf-8');
 
     // Count non-comment call sites of provenance.recordRead(.
+    // The invariant: EVERY path that reads email content records provenance.
+    // Sites: (1) yandex_get_email handler (B-1); (2) yandex_search_emails
+    // per-result read; (3) yandex_search_fast(read_top) via readTopBody -- the
+    // one-call recall body fetch (v2.11.0). Bump this count deliberately when a
+    // new content-reading path is added; a DROP below the expected count means a
+    // read path stopped recording provenance (the bug this guard exists to catch).
     const callSiteCount = toolsSrc
       .split('\n')
       .filter((line) => !/^\s*\/\//.test(line))
       .filter((line) => /provenance\.recordRead\(/.test(line))
       .length;
-    assert.equal(callSiteCount, 2, 'expected EXACTLY 2 non-comment provenance.recordRead( call sites (B-1)');
+    assert.equal(callSiteCount, 3, 'expected EXACTLY 3 non-comment provenance.recordRead( call sites (get_email + read_top + the existing third read path)');
 
     assert.match(toolsSrc, /from\s+['"]\.\/provenance/, 'tools.ts must import ./provenance');
     assert.match(toolsSrc, /PMLF-PROV-04/, 'tools.ts must carry the PMLF-PROV-04 marker comment');

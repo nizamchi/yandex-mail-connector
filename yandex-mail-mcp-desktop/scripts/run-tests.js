@@ -53,6 +53,7 @@ const TESTS = [
   'get-attachment.test.ts',
   'attachments-manifest.test.ts',
   'find-attachments.test.ts',
+  'read-top.test.ts',
 ];
 
 const distDir = path.join(root, 'dist', '__tests__');
