@@ -1014,7 +1014,7 @@ const TOOLS_RAW: ToolDef[] = [
     requires: { authLevel: 0 },
     handler: async (_params, ctx) => {
       const report: Record<string, unknown> = {
-        server_version: '2.10.0',
+        server_version: '2.11.0',
         auth_level: ctx.authLevel,
         capabilities: Array.from(ctx.capabilities),
         platform: process.platform,
