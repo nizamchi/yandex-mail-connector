@@ -122,8 +122,15 @@ export function safeAttachmentFilename(
   // 5. Remove NUL (U+0000) and all C0/C1 control chars (includes tab, CR, LF).
   base = base.replace(CTRL_C0, '').replace(CTRL_C1, '');
 
+  // 5b. Strip bidi / zero-width / BOM format chars (Trojan-Source, CVE-2021-42574).
+  //     These are OUTSIDE the C0/C1 ranges above, so the CTRL strips do NOT catch
+  //     them. An RLO (U+202E) left in an attachment name reaches disk and spoofs the
+  //     extension: "invoice" + U+202E + "gpj.exe" renders as "invoiceexe.jpg". The
+  //     display path (sanitizeForDisplay) already strips these; the save path must too.
+  base = base.replace(FORMAT_CHARS, '');
+
   // 6. Strip remaining unsafe chars (path separators again as defence-in-depth,
-  //    Windows reserved chars, bidi overrides already removed by CTRL regexes).
+  //    Windows reserved chars).
   base = base.replace(UNSAFE_FILENAME_CHARS, '');
 
   // 7. Strip leading dots so result cannot become a hidden or empty "."/".." name.

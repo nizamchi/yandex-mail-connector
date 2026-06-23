@@ -2,6 +2,7 @@ import { ImapFlow, type FetchMessageObject, type ListResponse } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { loadCredentials, type Credentials } from './token.js';
 import { extractAttachments, type ParsedAttachment } from './attachment-parser.js';
+import { selectAttachment } from './attachment-select.js';
 
 // ── Constants ──────────────────────────────────────────────
 const IMAP_HOST = 'imap.yandex.com';
@@ -27,9 +28,10 @@ export interface EmailHeader {
   seen: boolean;
   flagged: boolean;
   hasAttachments: boolean;
-  // Attachment metadata extracted from BODYSTRUCTURE. Only populated on the
-  // streamEnvelopes path (bodyStructure:true is fetched there). Undefined on
-  // the 4 other fetch paths (listEmails, getEmail, findSenders, searchEmails).
+  // Attachment metadata extracted from BODYSTRUCTURE. Populated on the paths
+  // that FETCH bodyStructure: streamEnvelopes (index), listEmails, searchEmails,
+  // getEmail. Undefined on the lighter paths (findSenders, thread/raw envelope
+  // fetches) that omit it.
   attachments?: ParsedAttachment[];
   size: number;
 }
@@ -133,6 +135,11 @@ function toAddrs(list?: Array<{ name?: string; address?: string }>): EmailAddres
 
 function parseHeader(msg: FetchMessageObject): EmailHeader {
   const e = msg.envelope;
+  // hasAttachments needs bodyStructure in the FETCH. listEmails / searchEmails /
+  // streamEnvelopes request it so the `[attach]` marker and has_attachments agree
+  // on those paths (BODYSTRUCTURE is cheap MIME metadata, not a body download).
+  // getEmail instead derives attachments from its full-body simpleParser and
+  // overrides this field; findSenders / thread paths omit bodyStructure (no marker).
   const { attachments } = extractAttachments(msg);
   return {
     uid: msg.uid,
@@ -237,7 +244,7 @@ export async function listEmails(
     const pageUids = sortedDesc.slice(start, end);
 
     const emails: EmailHeader[] = [];
-    for await (const msg of c.fetch(pageUids, { uid: true, flags: true, envelope: true, size: true }, { uid: true })) {
+    for await (const msg of c.fetch(pageUids, { uid: true, flags: true, envelope: true, size: true, bodyStructure: true }, { uid: true })) {
       emails.push(parseHeader(msg));
     }
     // ImapFlow не гарантирует порядок итерации внутри fetch — досортировать.
@@ -303,10 +310,20 @@ export async function getEmail(folder: string, uid: number): Promise<EmailMessag
 // retrieves the single uid needed and does NOT modify getEmail. Returns the
 // raw bytes of ONE attachment or null when the message / attachment is absent.
 //
+// Efficiency note (known, accepted tradeoff): this downloads the ENTIRE RFC822
+// message (source:true) to extract one attachment, so a small attachment in a
+// large message still transfers the whole message. A BODYSTRUCTURE part-fetch
+// (FETCH BODY[partId]) would move only the wanted part; deferred because it needs
+// explicit transfer-encoding decode (base64 / quoted-printable) that the current
+// simpleParser path provides for free. Acceptable for occasional downloads.
+//
 // Selector:
-//   index    — 0-based index into parsed.attachments (matches yandex_get_email order).
-//   filename — match by exact filename first, then case-insensitive substring.
-//   If both are provided, index takes precedence.
+//   filename — if provided, selects by exact filename first, then case-insensitive
+//              substring. Takes PRECEDENCE over index (the caller named a file).
+//   index    — 0-based index into parsed.attachments (matches yandex_get_email
+//              order); used only when filename is absent. Defaults to 0 (first).
+// (Earlier this checked index first, but the tool schema defaults index to 0, so
+//  index was always set and the filename branch was unreachable dead code.)
 //
 // Returns null (not throws) when the message is absent or the attachment does
 // not exist so callers can produce a friendly not-found result.
@@ -329,20 +346,7 @@ export async function getAttachmentBytes(
 
     if (attachments.length === 0) return null;
 
-    let att: { content?: Buffer; filename?: string; contentType?: string; size?: number } | undefined;
-
-    if (typeof selector.index === 'number') {
-      att = attachments[selector.index];
-    } else if (selector.filename) {
-      const needle = selector.filename;
-      // Exact match first, then case-insensitive substring.
-      att = attachments.find(a => a.filename === needle)
-        ?? attachments.find(a => typeof a.filename === 'string' && a.filename.toLowerCase().includes(needle.toLowerCase()));
-    } else {
-      // Default to first attachment if no selector given.
-      att = attachments[0];
-    }
-
+    const att = selectAttachment(attachments, selector);
     if (!att) return null;
     const content = att.content;
     if (!content) return null;
@@ -506,7 +510,7 @@ export async function searchEmails(
     if (uids.length === 0) return [];
     const slice = uids.slice(-maxResults).reverse();
     const emails: EmailHeader[] = [];
-    for await (const msg of c.fetch(slice.join(','), { uid: true, flags: true, envelope: true, size: true }, { uid: true })) {
+    for await (const msg of c.fetch(slice.join(','), { uid: true, flags: true, envelope: true, size: true, bodyStructure: true }, { uid: true })) {
       emails.push(parseHeader(msg));
     }
     return emails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
