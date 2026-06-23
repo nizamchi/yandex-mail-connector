@@ -809,6 +809,10 @@ const TOOLS_RAW: ToolDef[] = [
     description: 'Self-diagnostic: версия, auth level, state-dir, token.json (тип учётных данных), allowlist signature, policy file. НЕ обращается к IMAP/SMTP — для сетевой проверки запусти `node dist/yandex-mail-mcp.js --check`. Используй когда нужно понять что не работает или что используется по умолчанию.',
     inputSchema: healthCheckSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    // alwaysLoad: the /ymc-info + info-prompt overview calls this first; keeping
+    // it un-deferred makes the first "what can you do?" instant. Harmless no-op
+    // on clients that don't recognise the key.
+    meta: { 'anthropic/alwaysLoad': true },
     requires: { authLevel: 0 },
     handler: async (_params, ctx) => {
       const report: Record<string, unknown> = {
@@ -1116,7 +1120,8 @@ Args:
   seen   (boolean?) -- true=только прочитанные, false=только непрочитанные
   flagged(boolean?) -- true=со звёздочкой
   max_results (1-100, default 20)
-НЕ передавай имя без @ в поле from -- сначала вызови yandex_find_sender чтобы узнать адрес.
+Для recall (найти/последнее от X) ПРЕДПОЧИТАЙ yandex_search_fast -- индекс фильтрует по подстроке имени/адреса (from=) без точного email и без живого IMAP. Сюда приходи, если индекс не построен или нужен полнотекстовый поиск по телу (text=).
+НЕ передавай имя без @ в поле from на ЖИВОЙ поиск без нужды -- search_fast принимает имя как подстроку.
 НЕ используй чтобы только посчитать письма -- используй yandex_count.`,
     inputSchema: searchEmailsSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -1201,7 +1206,9 @@ Args:
   {
     name: 'yandex_find_sender',
     title: 'Найти отправителя',
-    description: `Используй ПЕРЕД поиском писем, если пользователь назвал человека по имени без email-адреса.
+    description: `Разрешает НЕОДНОЗНАЧНОЕ имя в список отправителей-кандидатов, когда нужно уточнить у пользователя «кого именно».
+ЖИВОЙ поиск по одной папке (медленнее индекса). Для «последнего письма от X» это НЕ нужно -- сразу yandex_search_fast с from="<имя>" (индекс уже фильтрует по подстроке имени/адреса по всем папкам за миллисекунды).
+Бери этот инструмент, только если search_fast вернул нескольких разных людей и надо выбрать.
 Принимает часть имени или адреса, возвращает список уникальных отправителей с числом писем.
 Агент должен показать список пользователю и спросить кого именно искать, затем передать точный email в yandex_search_emails.
 Поиск нечёткий: "Катя" найдёт "Катя Иванова <k.ivanova@co.ru>" и "katya@mail.ru".
@@ -1364,6 +1371,9 @@ Output: { rows: [{ key:[...], count, total_size_bytes, earliest, latest }], tota
     name: 'yandex_search_fast',
     title: 'Быстрый поиск (локальный индекс)',
     description: `Мгновенный поиск по локальному индексу писем -- единицы мс вместо ~1 с живого IMAP.
+ИНДЕКС -- ПЕРВЫМ ДЕЛОМ: на «найди / вспомни / последнее письмо от X» вызывай ЭТОТ инструмент СРАЗУ, до любого живого поиска (yandex_search_emails/yandex_find_sender).
+«Последнее письмо от X» = ОДИН вызов: from="<имя или адрес>" БЕЗ query -> первый хит уже самый свежий (тема+дата+адрес сразу). НЕ цепляй find_sender + search_emails ради этого.
+Чтобы заодно ПРОЧИТАТЬ тело самого свежего письма от X в том же вызове -- добавь read_top=true (вернёт блок top с телом; один живой дочит только верхнего письма).
 Ищет по теме и отправителю, ранжирует по релевантности, поддерживает кириллицу.
 Поддерживает фильтры: from / since / before / seen / flagged / has_attachments. Можно искать ТОЛЬКО по фильтрам без query (напр. «непрочитанные за март»: seen=false, since="2025-03-01").
 has_attachments=true оставляет только письма с вложениями (по BODYSTRUCTURE; считает и встроенные именованные части — логотипы и трекинг-картинки). Чтобы искать именно файлы по имени/типу — yandex_find_attachments (там есть фильтр mime, напр. application/pdf отсекает логотипы).
@@ -1373,7 +1383,12 @@ Args: query? (опционально, если задан фильтр), folder?
 Output: { index_built, total (полное число совпадений), returned, offset, truncated, hits: [{ uid, folder, from, subject, date, score, match_reasons }] }`,
     inputSchema: searchFastSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    meta: { 'anthropic/maxResultSizeChars': 50_000 },
+    // alwaysLoad: keep this hot tool out of Claude Code's default Tool-Search
+    // deferral so the FIRST recall query pays no discovery hop (the real
+    // first-call latency Tool Search adds). Harmless no-op on clients that
+    // don't recognise the key. maxResultSizeChars raised because read_top can
+    // attach one message body (~8k) to the result.
+    meta: { 'anthropic/maxResultSizeChars': 120_000, 'anthropic/alwaysLoad': true },
     requires: { authLevel: 0 },
     handler: async (params, _ctx) => {
       try {
