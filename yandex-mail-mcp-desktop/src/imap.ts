@@ -66,6 +66,14 @@ function makeClient(creds: Credentials): ImapFlow {
       ? { user: creds.email, pass: creds.password }
       : { user: creds.email, accessToken: creds.oauthToken! },
     logger: false,
+    // Fail fast on a wedged connect/greeting instead of hanging the whole tool
+    // call (imapflow defaults are 90s/16s). A hung TLS handshake to a flaky
+    // Yandex POP is the worst latency tail -- 20s/10s caps surface it as a
+    // normal error the handler can report. socketTimeout is deliberately LEFT
+    // at the 5-minute default: index builds stream thousands of envelopes over
+    // one socket and a low inactivity timeout would abort a healthy long fetch.
+    connectionTimeout: 20000,
+    greetingTimeout: 10000,
   });
 }
 
