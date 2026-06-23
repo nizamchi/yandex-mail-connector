@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Install the /ymc-config and /ymc-update slash commands into the user's
-// Claude Code commands directory (~/.claude/commands/). Cross-platform.
+// Install the connector's slash commands (/ymc-info, /ymc-config, /ymc-index,
+// /ymc-update, /ymc-trust, /ymc-doctor) into the user's Claude Code commands
+// directory (~/.claude/commands/). Cross-platform.
 //
 // Usage:
 //   node bin/install-slash.js          # install (skip if up-to-date)
@@ -22,8 +23,13 @@ const repoRoot = path.resolve(__dirname, '..', '..');
 const sourceDir = path.join(repoRoot, '.claude', 'commands');
 const targetDir = path.join(os.homedir(), '.claude', 'commands');
 
-// Commands shipped by this connector. Keep in sync with .claude/commands/.
-const COMMANDS = ['ymc-config.md', 'ymc-update.md'];
+// Commands shipped by this connector = every .md in the repo's .claude/commands/.
+// Globbed (not a hardcoded list) so a newly added command installs without
+// anyone remembering to edit this file. Empty if the source dir is absent
+// (install() reports that case with a friendly error below).
+const COMMANDS = exists(sourceDir)
+  ? fs.readdirSync(sourceDir).filter(f => f.endsWith('.md')).sort()
+  : [];
 
 function exists(p) {
   try { fs.accessSync(p); return true; } catch { return false; }
@@ -95,6 +101,9 @@ function install() {
   if (installed + updated > 0) {
     console.log('Restart Claude Code (/exit then `claude`) to load the new commands.');
   }
+  // Onboarding funnel: /ymc-info is the guided tour. Point first-timers at it
+  // here (the last step of install) so they don't have to discover it.
+  console.log('First step after restart: type /ymc-info — a guided tour of what the connector can do.');
 }
 
 if (UNINSTALL) uninstall();
