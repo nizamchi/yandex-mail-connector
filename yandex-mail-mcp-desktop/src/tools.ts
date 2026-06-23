@@ -351,7 +351,9 @@ export async function readTopBody(folder: string, uid: number, indexFresh: boole
 }
 
 // How many index matches read_top reasons over to pick the newest + judge sender
-// ambiguity. Bounded; the live IMAP fetch below dominates the cost.
+// ambiguity. Bounded; the live IMAP fetch below dominates the cost. A match
+// ranked beyond this window (by relevance score) can be missed by both the
+// newest-by-date pick and the ambiguity count -- acceptable for recall.
 const READ_TOP_CANDIDATES = 100;
 
 // resolveReadTop: answer "read the latest from X / about Y" in one shot. Picks
@@ -1633,9 +1635,15 @@ Output: { index_built, total (полное число совпадений), ret
         // self-audits as a yandex_get_email content read, so no _audit is attached
         // to the search_fast envelope.
         if (read_top) {
-          const rt = await resolveReadTop(q, folder, filters);
-          out.read_top_status = rt.status;
-          if (rt.top) out.top = rt.top;
+          try {
+            const rt = await resolveReadTop(q, folder, filters);
+            out.read_top_status = rt.status;
+            if (rt.top) out.top = rt.top;
+          } catch {
+            // A transient live-IMAP failure during the body read must NOT collapse
+            // the already-computed search result -- degrade to a status instead.
+            out.read_top_status = 'error';
+          }
         }
         const topText = out.top
           ? `\n\nВерхнее письмо (прочитано вживую${out.top.index_fresh === false ? ', индекс мог устареть' : ''}${out.top.redacted ? ', тело скрыто: 2FA-отправитель' : ''}):\n${out.top.subject || '(без темы)'} — ${out.top.from}, ${(out.top.date || '').slice(0, 10)}\n${out.top.body}`
