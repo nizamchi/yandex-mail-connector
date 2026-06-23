@@ -269,7 +269,7 @@ interface ReadTopBlock {
   attachments: { filename: string; mimeType: string; size: number }[];
 }
 
-type ReadTopResult = { top?: ReadTopBlock; status: string; _audit?: Record<string, unknown> };
+type ReadTopResult = { top?: ReadTopBlock; status: string };
 
 // The three LIVE-IMAP functions read_top depends on, injectable so the decision
 // logic (ambiguity / freshness / fallback) is unit-testable without a real
@@ -287,9 +287,25 @@ const defaultReadTopPorts: ReadTopPorts = {
   getMailboxCursor: (f) => imap.getMailboxCursor(f),
 };
 
+// 2FA-redaction policy literals, single-sourced so the get_email and read_top
+// content-read paths cannot drift. The stub is ASCII-hyphen per CLAUDE.md (gate-
+// checked); the field list is what the audit marks redacted.
+const TWOFA_REDACTED_STUB = '[REDACTED - 2FA sender]';
+const TWOFA_REDACTED_FIELDS: string[] = ['body', 'subject_hash', 'body_length'];
+
+// parseDateMs: epoch ms for an envelope date, or -Infinity when unparseable so a
+// dateless record never wins the "newest" comparison.
+function parseDateMs(d: string): number {
+  const t = Date.parse(d);
+  return Number.isNaN(t) ? -Infinity : t;
+}
+
 // readTopBody: fetch ONE message body and render it through the SAME security
 // path as yandex_get_email (provenance.recordRead + 2FA redaction + untrusted
 // marker + wrapUntrusted). This is the only live IMAP fetch read_top performs.
+// The body read is audited as a yandex_get_email content read (an EMAIL_ACTION,
+// so message_id belongs on it) -- NOT on the search_fast envelope, which must
+// stay free of message_id per audit.ts's non-email-action convention.
 export async function readTopBody(folder: string, uid: number, indexFresh: boolean, okStatus: string, ports: ReadTopPorts = defaultReadTopPorts): Promise<ReadTopResult> {
   const email = await ports.getEmail(folder, uid);
   if (!email) return { status: 'not_found' };
@@ -303,12 +319,20 @@ export async function readTopBody(folder: string, uid: number, indexFresh: boole
     // Parity with get_email's 2FA branch: explicit denied audit; omit
     // body_length/subject_hash (side-channel on a known-length 2FA code).
     auditLog({
-      action: 'yandex_search_fast', status: 'denied', level: 'warn',
-      ts: new Date().toISOString(), reason: '2fa_sender_redacted', folder, uid,
-      message_id: messageId, from_domain: fromDomain, redacted: ['body', 'subject_hash', 'body_length'],
+      action: 'yandex_get_email', status: 'denied', level: 'warn',
+      ts: new Date().toISOString(), reason: 'read_top_2fa_sender_redacted', folder, uid,
+      message_id: messageId, from_domain: fromDomain, redacted: TWOFA_REDACTED_FIELDS,
+    });
+  } else {
+    // Success read record (EMAIL_ACTION): carries message_id, mirroring get_email.
+    auditLog({
+      action: 'yandex_get_email', status: 'success', level: 'info',
+      ts: new Date().toISOString(), reason: 'read_top', folder, uid,
+      message_id: messageId, subject_hash: subjectHash(email.subject),
+      body_length: (email.textBody ?? email.htmlBody ?? '').length, from_domain: fromDomain,
     });
   }
-  const body = redacted ? wrapUntrusted('[REDACTED - 2FA sender]') : renderUntrustedBody(email);
+  const body = redacted ? wrapUntrusted(TWOFA_REDACTED_STUB) : renderUntrustedBody(email);
   const top: ReadTopBlock = {
     folder, uid,
     from: capLen(email.from[0]?.name ? `${email.from[0].name} <${fromAddrRaw ?? ''}>` : (fromAddrRaw ?? ''), MAX_FROM_LEN),
@@ -323,22 +347,27 @@ export async function readTopBody(folder: string, uid: number, indexFresh: boole
     index_fresh: indexFresh,
     attachments: email.attachments.map(a => ({ filename: sanitizeForDisplay(a.filename), mimeType: a.contentType, size: a.size })),
   };
-  const _audit = redacted
-    ? { folder, uid, message_id: messageId, from_domain: fromDomain }
-    : { folder, uid, message_id: messageId, subject_hash: subjectHash(email.subject), body_length: (email.textBody ?? email.htmlBody ?? '').length, from_domain: fromDomain };
-  return { top, status: redacted ? 'redacted' : okStatus, _audit };
+  return { top, status: redacted ? 'redacted' : okStatus };
 }
 
-// resolveReadTop: pick the single unambiguous top hit for "read the latest from
-// X" and read its body in one shot. Returns only a status when it declines:
-//   ambiguous      -- top-2 index hits are different senders; agent disambiguates
+// How many index matches read_top reasons over to pick the newest + judge sender
+// ambiguity. Bounded; the live IMAP fetch below dominates the cost.
+const READ_TOP_CANDIDATES = 100;
+
+// resolveReadTop: answer "read the latest from X / about Y" in one shot. Picks
+// the NEWEST matching message by DATE (searchFastResult ranks by relevance score,
+// so rank-0 is NOT necessarily the latest). Declines with a status when it can't
+// safely auto-read:
+//   ambiguous      -- a from= name matched 2+ distinct senders (which person?)
 //   no_hits        -- nothing in the index and no live fallback target
-//   stale_fallback -- index empty/stale; answered from a live lookup instead
-// Quality guard: a cheap STATUS probe detects mail that arrived since the last
-// sync and re-resolves the true latest live before reading (anti-stale).
+//   stale_fallback -- index empty/stale (or uidValidity changed); answered (or
+//                     declined) via a live lookup instead
+// Anti-stale: a cheap STATUS probe (uidValidity / uidNext / exists vs the stored
+// cursor) catches new mail, expunge, AND server renumber; on drift it re-resolves
+// the true latest from the SAME sender live and verifies the address before use.
 export async function resolveReadTop(q: string, folder: string | undefined, filters: mailIndex.SearchFilters, ports: ReadTopPorts = defaultReadTopPorts): Promise<ReadTopResult> {
-  const top2 = mailIndex.searchFastResult(q, { folder, limit: 2, offset: 0, filters }).hits;
-  if (top2.length === 0) {
+  const cand = mailIndex.searchFastResult(q, { folder, limit: READ_TOP_CANDIDATES, offset: 0, filters }).hits;
+  if (cand.length === 0) {
     // Index has no match -> one live lookup if we can target a sender, so
     // read_top is never worse than the old find->search->read path.
     if (filters.from) {
@@ -349,23 +378,50 @@ export async function resolveReadTop(q: string, folder: string | undefined, filt
     }
     return { status: 'no_hits' };
   }
-  // Ambiguous when the top two hits are DIFFERENT senders (two people matching
-  // the same name) -- don't auto-read the wrong person; let the agent choose.
-  if (top2.length >= 2 && top2[0].record.fromEmail !== top2[1].record.fromEmail) {
-    return { status: 'ambiguous' };
+  // Ambiguity is a PERSON-recall concern: a from= name that matched 2+ DISTINCT
+  // senders -- we must not guess which person. A topic (text) query legitimately
+  // spans senders, so it is never gated. Empty fromEmail (name-only headers) is
+  // excluded from the distinct count rather than collapsing two unknowns into one.
+  if (filters.from) {
+    const senders = new Set<string>();
+    for (const h of cand) { if (h.record.fromEmail) senders.add(h.record.fromEmail); }
+    if (senders.size >= 2) return { status: 'ambiguous' };
   }
-  const rec = top2[0].record;
+  // "the latest" = the NEWEST match by date, NOT the highest relevance score.
+  let rec = cand[0].record;
+  let recMs = parseDateMs(rec.date);
+  for (const h of cand) {
+    const ms = parseDateMs(h.record.date);
+    if (ms > recMs) { rec = h.record; recMs = ms; }
+  }
   let targetUid = rec.uid;
   let indexFresh = true;
   try {
     const fmeta = mailIndex.getIndexStatus().folders.find(f => f.folder === rec.folder);
     const cursor = await ports.getMailboxCursor(rec.folder);
-    if (fmeta && cursor.uidNext > fmeta.uidNext) {
-      // Mail arrived since the last sync -> the index "latest" may be wrong.
+    // Drift = anything that makes the stored (uid, content) untrustworthy:
+    // server renumber (uidValidity), new mail (uidNext), or expunge (exists).
+    const drifted = !fmeta || cursor.uidValidity !== fmeta.uidValidity || cursor.uidNext !== fmeta.uidNext || cursor.exists !== fmeta.count;
+    if (drifted) {
       indexFresh = false;
-      // Re-resolve the true latest from this EXACT sender (not the fuzzy filter).
-      const live = await ports.searchEmails(rec.folder, { from: rec.fromEmail }, 1);
-      if (live.length > 0) targetUid = live[0].uid;
+      let reResolved = false;
+      // Re-resolve the true latest from this sender live. IMAP FROM is a SUBSTRING
+      // match, so verify the returned message is actually from rec.fromEmail before
+      // trusting it. Skip when the sender address is unknown (empty).
+      if (filters.from && rec.fromEmail) {
+        const live = await ports.searchEmails(rec.folder, { from: rec.fromEmail }, 1);
+        const hit = live[0];
+        if (hit && hit.from[0]?.address?.toLowerCase() === rec.fromEmail) {
+          targetUid = hit.uid;
+          reResolved = true;
+        }
+      }
+      // A uidValidity change invalidates the stored uid entirely (UID reuse under
+      // the new validity could read an UNRELATED message). If we could not
+      // re-resolve, refuse to read rather than risk the wrong message.
+      if (!reResolved && fmeta && cursor.uidValidity !== fmeta.uidValidity) {
+        return { status: 'stale_fallback' };
+      }
     }
   } catch {
     indexFresh = false; // probe failed -- flag freshness as unverified (honest)
@@ -462,7 +518,7 @@ const searchFastSchema = z.object({
   seen:   z.boolean().optional().describe('Фильтр: true=только прочитанные, false=только непрочитанные'),
   flagged:z.boolean().optional().describe('Фильтр: true=только со звёздочкой, false=только без'),
   has_attachments: z.boolean().optional().describe('Фильтр: true=только письма с вложениями, false=только без. Считает и встроенные именованные части (логотипы) — для поиска именно файлов по типу используй yandex_find_attachments с mime.'),
-  read_top: z.boolean().optional().describe('true = заодно ПРОЧИТАТЬ тело самого свежего (верхнего) письма в этом же вызове. Один живой дочит, только если верхний результат однозначен (иначе вернёт список без тела). Для «прочитай последнее письмо от X».'),
+  read_top: z.boolean().optional().describe('true = заодно ПРОЧИТАТЬ тело самого свежего ПО ДАТЕ совпавшего письма в этом же вызове (один живой дочит). Если по from совпало несколько РАЗНЫХ людей — вернёт список без тела, чтобы ты уточнил кого. Для «прочитай последнее письмо от X».'),
 }).strict();
 const getThreadSchema = z.object({
   query:  z.string().min(1).describe('Слова из темы письма, тред которого нужен'),
@@ -1177,7 +1233,7 @@ Args: folder (default "INBOX"), uid (integer UID письма).
             uid,
             message_id: email.messageId && email.messageId.length > 0 ? email.messageId : '<not-found-no-message-id>',
             from_domain: fromDomain,
-            redacted: ['body', 'subject_hash', 'body_length'],
+            redacted: TWOFA_REDACTED_FIELDS,
           });
           // Stub body string: exactly '[REDACTED - 2FA sender]' with ASCII
           // hyphen-minus (U+002D). NOT em-dash U+2014. CLAUDE.md ASCII rule;
@@ -1190,7 +1246,7 @@ Args: folder (default "INBOX"), uid (integer UID письма).
                 `От: ${sanitizeForDisplay(fromAddrRaw ?? '(unknown)')}\n` +
                 `Тема: ${sanitizeForDisplay(email.subject ?? '')}\n` +
                 `Дата: ${email.date ?? ''}\n` +
-                wrapUntrusted('[REDACTED - 2FA sender]'),
+                wrapUntrusted(TWOFA_REDACTED_STUB),
             }],
             _audit: {
               folder,
@@ -1542,43 +1598,45 @@ Output: { index_built, total (полное число совпадений), ret
         if (q.length === 0 && !hasFilter) {
           throw new Error('Укажите query или хотя бы один фильтр (from/since/before/seen/flagged/has_attachments).');
         }
-        if (!mailIndex.indexExists()) {
-          return {
-            content: [{ type: 'text', text: 'Локальный индекс не построен. Запусти `yandex-mail-mcp index build` в терминале, либо используй yandex_search_emails для живого поиска по IMAP.' }],
-            structuredContent: { index_built: false, total: 0, returned: 0, offset: off, truncated: false, hits: [] },
-          };
+        const indexBuilt = mailIndex.indexExists();
+        let total = 0;
+        let allRows: { uid: number; folder: string; from: string; subject: string; date: string; score: number; match_reasons: string[] }[] = [];
+        let rows: typeof allRows = [];
+        let truncated = false;
+        if (indexBuilt) {
+          const r = mailIndex.searchFastResult(q, { folder, limit, offset: off, filters });
+          total = r.total;
+          allRows = r.hits.map(h => ({
+            uid: h.record.uid,
+            folder: h.record.folder,
+            from: capLen(h.record.fromName ? `${h.record.fromName} <${h.record.fromEmail}>` : h.record.fromEmail, MAX_FROM_LEN),
+            subject: capLen(h.record.subject, MAX_SUBJECT_LEN),
+            date: h.record.date,
+            score: h.score,
+            match_reasons: h.matchReasons,
+          }));
+          const fit = fitRows(allRows, SEARCH_RESULT_BUDGET);
+          rows = fit.rows;
+          truncated = fit.truncated;
         }
-        const { hits, total } = mailIndex.searchFastResult(q, { folder, limit, offset: off, filters });
-        const allRows = hits.map(h => ({
-          uid: h.record.uid,
-          folder: h.record.folder,
-          from: capLen(h.record.fromName ? `${h.record.fromName} <${h.record.fromEmail}>` : h.record.fromEmail, MAX_FROM_LEN),
-          subject: capLen(h.record.subject, MAX_SUBJECT_LEN),
-          date: h.record.date,
-          score: h.score,
-          match_reasons: h.matchReasons,
-        }));
-        const { rows, truncated } = fitRows(allRows, SEARCH_RESULT_BUDGET);
         const label = q.length > 0 ? `"${q}"` : 'заданным фильтрам';
         const out: {
           index_built: boolean; query: string; total: number; returned: number;
           offset: number; truncated: boolean; hits: typeof allRows;
           top?: ReadTopBlock; read_top_status?: string;
-        } = { index_built: true, query: q, total, returned: rows.length, offset: off, truncated, hits: rows };
+        } = { index_built: indexBuilt, query: q, total, returned: rows.length, offset: off, truncated, hits: rows };
 
         // read_top: collapse "read the latest from X" into THIS call -- one live
-        // body fetch of the single unambiguous top hit (or a graceful status).
-        let readTopAudit: Record<string, unknown> | undefined;
+        // body fetch of the newest matching message (or a graceful status). Runs
+        // even when the index is NOT built (resolveReadTop's from-targeted live
+        // fallback) so the documented one-call recall still works. The body read
+        // self-audits as a yandex_get_email content read, so no _audit is attached
+        // to the search_fast envelope.
         if (read_top) {
           const rt = await resolveReadTop(q, folder, filters);
           out.read_top_status = rt.status;
           if (rt.top) out.top = rt.top;
-          readTopAudit = rt._audit;
         }
-        const wrapRet = (text: string) =>
-          readTopAudit
-            ? { content: [{ type: 'text' as const, text }], structuredContent: out, _audit: readTopAudit }
-            : { content: [{ type: 'text' as const, text }], structuredContent: out };
         const topText = out.top
           ? `\n\nВерхнее письмо (прочитано вживую${out.top.index_fresh === false ? ', индекс мог устареть' : ''}${out.top.redacted ? ', тело скрыто: 2FA-отправитель' : ''}):\n${out.top.subject || '(без темы)'} — ${out.top.from}, ${(out.top.date || '').slice(0, 10)}\n${out.top.body}`
           : (read_top
@@ -1586,9 +1644,13 @@ Output: { index_built, total (полное число совпадений), ret
                   ? '\n\nread_top: совпали несколько разных отправителей — уточни кого именно или сузь from=; тело не прочитано.'
                   : `\n\nread_top: тело не прочитано (${out.read_top_status ?? 'нет данных'}).`)
               : '');
+        const ret = (text: string) => ({ content: [{ type: 'text' as const, text }], structuredContent: out });
 
+        if (!indexBuilt) {
+          return ret('Локальный индекс не построен. Запусти `yandex-mail-mcp index build` в терминале, либо используй yandex_search_emails для живого поиска по IMAP.' + topText);
+        }
         if (rows.length === 0) {
-          return wrapRet(`По ${label} в индексе ничего не найдено (всего совпадений: ${total}).${topText}`);
+          return ret(`По ${label} в индексе ничего не найдено (всего совпадений: ${total}).${topText}`);
         }
         const lines = rows.map((r, i) =>
           `${off + i + 1}. [${r.folder}#${r.uid}] ${sanitizeForDisplay(r.subject) || '(без темы)'} — ${sanitizeForDisplay(r.from)}, ${r.date.slice(0, 10)} (релевантность ${r.score})`,
@@ -1600,7 +1662,7 @@ Output: { index_built, total (полное число совпадений), ret
         const more = truncated
           ? '\n\n…страница обрезана по размеру результата; сузь запрос или уменьши limit.'
           : (total > shownEnd ? `\n\n…показаны ${off + 1}–${shownEnd} из ${total}. Следующая страница: offset=${shownEnd}.` : '');
-        return wrapRet(`Найдено ${total} (локальный индекс):\n\n${lines.join('\n')}${more}${topText}`);
+        return ret(`Найдено ${total} (локальный индекс):\n\n${lines.join('\n')}${more}${topText}`);
       } catch (e) { return errorResult(e); }
     },
   },

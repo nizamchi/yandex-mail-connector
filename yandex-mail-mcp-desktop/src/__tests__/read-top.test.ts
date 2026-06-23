@@ -161,18 +161,71 @@ test('RT-ok: single sender + fresh index -> reads top, status ok, index_fresh tr
   assert.match(rt.top!.body, /the latest message/);
 }));
 
-test('RT-ambiguous: top-2 different senders -> ambiguous, NO body fetch', withTempStateDir(async () => {
+test('RT-ambiguous: from= matched 2 distinct senders -> ambiguous, NO body fetch', withTempStateDir(async () => {
   const src = new FakeSource();
   src.setFolder('INBOX', [
-    hdr({ uid: 5, messageId: '<k1@ex>', from: [{ address: 'alice@example.com', name: 'Alice' }], subject: 'kate meeting', date: '2025-06-01T00:00:00.000Z' }),
-    hdr({ uid: 6, messageId: '<k2@ex>', from: [{ address: 'kate@other.com', name: 'Kate' }], subject: 'kate lunch', date: '2025-06-09T00:00:00.000Z' }),
+    hdr({ uid: 5, messageId: '<k1@ex>', from: [{ address: 'kate@a-corp.com', name: 'Kate A' }], subject: 'note a', date: '2025-06-01T00:00:00.000Z' }),
+    hdr({ uid: 6, messageId: '<k2@ex>', from: [{ address: 'kate@b-corp.com', name: 'Kate B' }], subject: 'note b', date: '2025-06-09T00:00:00.000Z' }),
   ], 100);
   await buildIndex(['INBOX'], src);
   _resetForTests();
 
   const ports = mkPorts({ getEmail: async () => { throw new Error('read_top must NOT fetch a body when ambiguous'); } });
-  const rt = await resolveReadTop('kate', undefined, {}, ports);
+  const rt = await resolveReadTop('', undefined, { from: 'kate@' }, ports);
   assert.equal(rt.status, 'ambiguous');
+  assert.equal(rt.top, undefined);
+}));
+
+test('RT-ambiguous-3rd: a distinct sender beyond the top-2 still flags ambiguous', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    hdr({ uid: 5, from: [{ address: 'kate@a-corp.com', name: 'Kate A' }], subject: 'a1', date: '2025-06-08T00:00:00.000Z' }),
+    hdr({ uid: 6, from: [{ address: 'kate@a-corp.com', name: 'Kate A' }], subject: 'a2', date: '2025-06-09T00:00:00.000Z' }),
+    hdr({ uid: 7, from: [{ address: 'kate@b-corp.com', name: 'Kate B' }], subject: 'b1', date: '2025-01-01T00:00:00.000Z' }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // top-2 by score/recency are both Kate A; the older Kate B at rank 3 must still
+  // be detected as a distinct sender (the old top-2-only gate would have missed it).
+  const ports = mkPorts({ getEmail: async () => { throw new Error('must not read when >1 distinct sender matched'); } });
+  const rt = await resolveReadTop('', undefined, { from: 'kate@' }, ports);
+  assert.equal(rt.status, 'ambiguous');
+}));
+
+test('RT-newest-by-date: reads the NEWEST match, not the highest-scored', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [
+    // exact subject 'report' -> higher relevance score, but OLDER
+    hdr({ uid: 5, messageId: '<r1@ex>', from: [{ address: 'alice@example.com', name: 'Alice' }], subject: 'report', date: '2025-01-01T00:00:00.000Z' }),
+    // reply -> lower score, but NEWER
+    hdr({ uid: 6, messageId: '<r2@ex>', from: [{ address: 'alice@example.com', name: 'Alice' }], subject: 'Re: report update', date: '2025-06-01T00:00:00.000Z' }),
+  ], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const ports = mkPorts({
+    getMailboxCursor: async () => ({ uidValidity: 100, uidNext: 7, exists: 2 }), // fresh
+    getEmail: async (folder, uid) => fakeEmail({ uid, textBody: `body of ${uid}` }),
+  });
+  const rt = await resolveReadTop('report', undefined, {}, ports);
+  assert.equal(rt.status, 'ok');
+  assert.ok(rt.top);
+  assert.equal(rt.top!.uid, 6, 'newest-by-date wins over the higher relevance score');
+}));
+
+test('RT-uidvalidity: server renumber with no sender target -> stale_fallback, refuses to read', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 5, from: [{ address: 'alice@example.com', name: 'Alice' }], subject: 'x', date: '2025-06-01T00:00:00.000Z' })], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  const ports = mkPorts({
+    getMailboxCursor: async () => ({ uidValidity: 999, uidNext: 3, exists: 1 }), // uidValidity CHANGED -> stored uid invalid
+    getEmail: async () => { throw new Error('must NOT read a stale uid under a changed uidValidity'); },
+  });
+  const rt = await resolveReadTop('x', undefined, {}, ports); // text query -> cannot re-resolve by sender
+  assert.equal(rt.status, 'stale_fallback');
   assert.equal(rt.top, undefined);
 }));
 
