@@ -16,7 +16,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --minify --platform=node --target=node18 --outfile=dist/yandex-mail-mcp.js --format=cjs --banner:js=\"#!/usr/bin/env node\" --external:node-notifier && esbuild src/cli-trust.ts --bundle --minify --platform=node --target=node18 --outfile=dist/cli-trust.js --format=cjs --banner:js=\"#!/usr/bin/env node\"",
+    "build": "esbuild src/index.ts --bundle --minify --platform=node --target=node18 --outfile=dist/yandex-mail-mcp.js --format=cjs --banner:js=\"#!/usr/bin/env node\" --external:node-notifier && esbuild src/cli-trust.ts --bundle --minify --platform=node --target=node18 --outfile=dist/cli-trust.js --format=cjs --banner:js=\"#!/usr/bin/env node\" && node scripts/write-dist-cjs-marker.cjs",
     "start": "node dist/yandex-mail-mcp.js",
     "typecheck": "node --max-old-space-size=3072 node_modules/typescript/bin/tsc --noEmit -p tsconfig.typecheck.json",
     "check:canonical-mirror": "node scripts/check-canonical-mirror.js",
