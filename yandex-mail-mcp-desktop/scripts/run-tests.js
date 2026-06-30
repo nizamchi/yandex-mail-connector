@@ -49,6 +49,7 @@ const TESTS = [
   'stats.test.ts',
   'mail-index.test.ts',
   'index-auto.test.ts',
+  'stemmer.test.ts',
   'unanswered.test.ts',
   'attachment-parser.test.ts',
   'get-attachment.test.ts',

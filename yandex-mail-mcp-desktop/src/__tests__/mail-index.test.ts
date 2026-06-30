@@ -313,6 +313,29 @@ test('T13: searchFast with no match returns empty', withTempStateDir(async () =>
   assert.equal(searchFast('zzzznomatch').length, 0);
 }));
 
+test('T-morph-ru: inflected RU query matches base subject (выписку -> выписка)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 1, subject: 'Банковская выписка за июнь' })], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  // The whole point: an accusative query form finds the nominative subject
+  // because both reduce to the same stem ("выписк"). Before stemming this was 0.
+  assert.equal(searchFast('выписку').length, 1, 'выписку must find subject "выписка"');
+  assert.equal(searchFast('выписки').length, 1, 'выписки must find subject "выписка"');
+  assert.equal(searchFast('выписка').length, 1);
+}));
+
+test('T-morph-en: plural EN query matches singular subject (invoices -> invoice)', withTempStateDir(async () => {
+  const src = new FakeSource();
+  src.setFolder('INBOX', [hdr({ uid: 1, subject: 'Your invoice is attached' })], 100);
+  await buildIndex(['INBOX'], src);
+  _resetForTests();
+
+  assert.equal(searchFast('invoices').length, 1, 'invoices must find subject "invoice"');
+  assert.equal(searchFast('reporting').length, 0, 'unrelated stem must not match');
+}));
+
 test('T14: getThread groups Re/Fwd variants by normalized subject', withTempStateDir(async () => {
   const src = new FakeSource();
   src.setFolder('INBOX', [

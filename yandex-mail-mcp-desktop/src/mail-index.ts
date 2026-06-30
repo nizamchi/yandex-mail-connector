@@ -30,6 +30,7 @@ import { getStateDir } from './state-dir.js';
 import type { EmailHeader } from './imap.js';
 import type { ParsedAttachment } from './attachment-parser.js';
 import { sanitizeForDisplay } from './sanitize.js';
+import { stem } from './stemmer.js';
 
 // ── Public types ──────────────────────────────────────────────────────
 
@@ -812,11 +813,18 @@ function invalidateCache(): void {
   attachmentCache = null;
 }
 
+// tokenize: split on non-letter/number, drop sub-MIN_TOKEN_LEN parts, then STEM
+// each token (RU + EN light stemmer). Used for BOTH the inverted index (build)
+// and the query, so stemming is symmetric -- "выписку" and "выписка" reduce to
+// the same stem and match. Tokens are derived at cache-build time from the stored
+// raw envelope text, so this needs no schema bump or reindex: the next in-memory
+// cache build picks it up. The raw-substring pass in searchFastResult still runs
+// on the unstemmed text, preserving exact/partial matches alongside stem matches.
 function tokenize(text: string): string[] {
   if (!text) return [];
   const out: string[] = [];
   for (const part of text.toLowerCase().split(TOKEN_SPLIT_RE)) {
-    if (part.length >= MIN_TOKEN_LEN) out.push(part);
+    if (part.length >= MIN_TOKEN_LEN) out.push(stem(part));
   }
   return out;
 }
