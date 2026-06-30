@@ -2,8 +2,8 @@
 
 MCP-сервер для Яндекс.Почты с защитой опасных операций на стороне сервера.
 
-[![Версия](https://img.shields.io/badge/версия-2.11.0-blue)](CHANGELOG.md)
-[![Тесты](https://img.shields.io/badge/тесты-567_/_0_упавших-success)](#)
+[![Версия](https://img.shields.io/badge/версия-2.12.0-blue)](CHANGELOG.md)
+[![Тесты](https://img.shields.io/badge/тесты-600_/_0_упавших-success)](#)
 [![Уязвимости](https://img.shields.io/badge/npm_audit-0-success)](#)
 [![Лицензия](https://img.shields.io/badge/лицензия-PolyForm_NC_1.0.0-orange)](LICENSE)
 
@@ -103,7 +103,7 @@ npm install --omit=dev --ignore-scripts
 **Вариант B — `npx` без клонирования (с v2.2.1+):**
 
 ```bash
-npx -y github:nizamchi/yandex-mail-connector#v2.11.0 --check
+npx -y github:nizamchi/yandex-mail-connector#v2.12.0 --check
 ```
 
 Бандл закэшируется в `~/.npm/_npx/`. Удобно для быстрого health-check или

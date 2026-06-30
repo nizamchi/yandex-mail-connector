@@ -162,7 +162,7 @@ const INFO_PROMPT_TEXT = [
 ].join(' ');
 
 const server = new McpServer(
-  { name: 'yandex-mail-mcp', version: '2.11.0' },
+  { name: 'yandex-mail-mcp', version: '2.12.0' },
   { instructions: SERVER_INSTRUCTIONS },
 );
 

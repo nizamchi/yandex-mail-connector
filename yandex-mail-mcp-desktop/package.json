@@ -1,6 +1,6 @@
 {
   "name": "yandex-mail-mcp-desktop",
-  "version": "2.11.0",
+  "version": "2.12.0",
   "description": "MCP server for Yandex Mail — Claude Desktop (stdio)",
   "main": "dist/index.js",
   "bin": {
@@ -38,6 +38,7 @@
   },
   "overrides": {
     "hono": "4.12.26",
-    "nodemailer": "$nodemailer"
+    "nodemailer": "$nodemailer",
+    "linkify-it": "^5.0.1"
   }
 }

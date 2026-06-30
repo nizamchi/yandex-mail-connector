@@ -1,6 +1,6 @@
 {
   "name": "yandex-mail-mcp",
-  "version": "2.11.0",
+  "version": "2.12.0",
   "description": "MCP server for Yandex Mail (IMAP+SMTP) — secure agentic access, read-only by default, HMAC-confirmed sends, TOFU allowlist, 11 content detectors. Single-file bundle.",
   "bin": {
     "yandex-mail-mcp": "yandex-mail-mcp-desktop/dist/yandex-mail-mcp.js",
