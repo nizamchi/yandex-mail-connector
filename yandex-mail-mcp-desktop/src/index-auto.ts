@@ -24,6 +24,14 @@
 // never inline before it. The refresh path is incremental (UIDs >= uidNext) and
 // far cheaper. A periodic re-check (setInterval, unref'd) keeps long-lived server
 // sessions fresh; a running-guard prevents overlapping syncs.
+//
+// Cross-process note: build/update read-modify-write the whole JSONL with no
+// cross-process lock (mail-index.ts assumes a single writer). The `running` guard
+// only serialises THIS process; running the auto-lifecycle AND a separate
+// `yandex-mail-mcp index build/update` CLI/cron at the same instant can clobber
+// one write. It is self-healing (the next sync's reconcile, count != cursor.exists,
+// rebuilds) and redundant (auto-lifecycle removes the need for a cron), so we
+// accept it rather than add a lockfile.
 
 import * as mailIndex from './mail-index.js';
 import { auditLog } from './audit.js';
@@ -40,12 +48,15 @@ const DEFAULT_MAX_AGE_MINUTES = 60;
 // parseAutoConfig: the two opt-in knobs. `enabled` defaults to FALSE (MISSION
 // opt-in). YANDEX_INDEX_AUTO accepts on/true/1/yes (case-insensitive); anything
 // else (off/false/0/unset) stays disabled. YANDEX_INDEX_MAX_AGE_MINUTES sets the
-// staleness threshold AND the periodic re-check interval; invalid/<=0 -> 60.
+// staleness threshold AND the periodic re-check interval; invalid / <1 -> 60.
 export function parseAutoConfig(env: NodeJS.ProcessEnv = process.env): AutoConfig {
   const raw = (env.YANDEX_INDEX_AUTO ?? '').trim().toLowerCase();
   const enabled = raw === 'on' || raw === 'true' || raw === '1' || raw === 'yes';
   const ageRaw = Number(env.YANDEX_INDEX_MAX_AGE_MINUTES);
-  const maxAgeMinutes = Number.isFinite(ageRaw) && ageRaw > 0 ? ageRaw : DEFAULT_MAX_AGE_MINUTES;
+  // Floor at 1 minute: a sub-minute value would desync the banner, the staleness
+  // threshold, and the (1-min-minimum) timer -- and a <1 min auto-refresh would
+  // hammer IMAP for no benefit. Invalid / <1 -> default.
+  const maxAgeMinutes = Number.isFinite(ageRaw) && ageRaw >= 1 ? ageRaw : DEFAULT_MAX_AGE_MINUTES;
   return { enabled, maxAgeMinutes };
 }
 
@@ -136,8 +147,15 @@ export async function runIndexAutoLifecycle(deps: AutoDeps = defaultDeps()): Pro
     return { action, folders, added: r.added, errors: r.errors };
   }
 
-  // refresh: incremental update of the folders already in the index.
-  const folders = status.folders.map(f => f.folder);
+  // refresh: update the canonical set (INBOX + Sent) UNION the folders already in
+  // the index. updateIndex full-builds any folder not yet stored, so a Sent that
+  // was missed on first build (e.g. getSpecialFolders failed then) self-heals on a
+  // later tick once it resolves -- otherwise the index would stay INBOX-only
+  // forever and yandex_unanswered would be silently degraded. resolveBuildFolders
+  // never throws (it has an internal INBOX fallback).
+  const canonical = await deps.resolveBuildFolders();
+  const existing = status.folders.map(f => f.folder);
+  const folders = Array.from(new Set([...existing, ...canonical]));
   const r = await deps.update(folders);
   return { action, folders, added: r.added, errors: r.errors };
 }
@@ -198,12 +216,8 @@ export function startIndexAutoLifecycle(): void {
     `[yandex-mail] index auto-lifecycle: ON (build-if-empty + refresh older than ${cfg.maxAgeMinutes} min, background).\n`,
   );
   void tick();
-  const timer = setInterval(() => { void tick(); }, Math.max(1, cfg.maxAgeMinutes) * 60_000);
+  // cfg.maxAgeMinutes is floored at 1 by parseAutoConfig, so the interval is
+  // always >= 1 minute.
+  const timer = setInterval(() => { void tick(); }, cfg.maxAgeMinutes * 60_000);
   if (typeof timer.unref === 'function') timer.unref();
-}
-
-// Test seam: reset the module-level guards (NOT for production callers).
-export function _resetForTests(): void {
-  running = false;
-  started = false;
 }

@@ -48,6 +48,7 @@ const TESTS = [
   'policy-doc-drift.test.ts',
   'stats.test.ts',
   'mail-index.test.ts',
+  'index-auto.test.ts',
   'unanswered.test.ts',
   'attachment-parser.test.ts',
   'get-attachment.test.ts',

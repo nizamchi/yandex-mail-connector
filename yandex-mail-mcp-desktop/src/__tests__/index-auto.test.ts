@@ -28,8 +28,10 @@ test('parseAutoConfig: off/false/0/no/unset stay disabled', () => {
   }
 });
 
-test('parseAutoConfig: custom age; invalid/<=0 falls back to 60', () => {
+test('parseAutoConfig: custom age >=1; invalid/<1 falls back to 60 (1-minute floor)', () => {
   assert.equal(parseAutoConfig({ YANDEX_INDEX_MAX_AGE_MINUTES: '15' }).maxAgeMinutes, 15);
+  assert.equal(parseAutoConfig({ YANDEX_INDEX_MAX_AGE_MINUTES: '1' }).maxAgeMinutes, 1);
+  assert.equal(parseAutoConfig({ YANDEX_INDEX_MAX_AGE_MINUTES: '0.5' }).maxAgeMinutes, 60);
   assert.equal(parseAutoConfig({ YANDEX_INDEX_MAX_AGE_MINUTES: '0' }).maxAgeMinutes, 60);
   assert.equal(parseAutoConfig({ YANDEX_INDEX_MAX_AGE_MINUTES: '-5' }).maxAgeMinutes, 60);
   assert.equal(parseAutoConfig({ YANDEX_INDEX_MAX_AGE_MINUTES: 'abc' }).maxAgeMinutes, 60);
@@ -37,7 +39,11 @@ test('parseAutoConfig: custom age; invalid/<=0 falls back to 60', () => {
 
 // ── decideAutoAction (pure decision matrix) ───────────────────────────
 
-const NOW = 100 * 60000; // 100 minutes in ms
+// Realistic epoch ms (~Nov 2023). Must stay well above any `lastSyncMs` we
+// subtract below, because oldestSync() treats a non-positive lastSyncMs as
+// "never synced" (null) -- a toy NOW like 100*60000 would push timestamps
+// negative and silently change the decision.
+const NOW = 1_700_000_000_000;
 
 test('decideAutoAction: disabled → skip', () => {
   assert.equal(decideAutoAction({ enabled: false, indexExists: false, oldestSyncMs: null, nowMs: NOW, maxAgeMinutes: 60 }), 'skip');
@@ -107,7 +113,7 @@ test('runIndexAutoLifecycle: ON + empty index → build INBOX+Sent', async () =>
   assert.equal(r.added, 42);
 });
 
-test('runIndexAutoLifecycle: ON + stale index → refresh indexed folders only', async () => {
+test('runIndexAutoLifecycle: ON + stale index → refresh (indexed ∪ canonical)', async () => {
   let updatedFolders: string[] | null = null;
   const deps: AutoDeps = {
     getStatus: () => fakeStatus(true, [folder('INBOX', NOW - 120 * 60000), folder('Sent', NOW - 90 * 60000)]),
@@ -121,6 +127,24 @@ test('runIndexAutoLifecycle: ON + stale index → refresh indexed folders only',
   assert.equal(r.action, 'refresh');
   assert.deepEqual(updatedFolders, ['INBOX', 'Sent']);
   assert.equal(r.added, 3);
+});
+
+test('runIndexAutoLifecycle: refresh self-heals a Sent missed on first build (canonical union)', async () => {
+  let updatedFolders: string[] | null = null;
+  const deps: AutoDeps = {
+    // Index has only INBOX (Sent was missed on first build, e.g. getSpecialFolders
+    // failed then) and it is stale. The refresh must re-add Sent, not stay
+    // INBOX-only forever.
+    getStatus: () => fakeStatus(true, [folder('INBOX', NOW - 200 * 60000)]),
+    build: async () => { throw new Error('build must not run when index exists'); },
+    update: async (f) => { updatedFolders = f; return { folders: [], added: 5, errors: [] }; },
+    resolveBuildFolders: async () => ['INBOX', 'Sent'],
+    now: () => NOW,
+    env: { YANDEX_INDEX_AUTO: 'on', YANDEX_INDEX_MAX_AGE_MINUTES: '60' },
+  };
+  const r = await runIndexAutoLifecycle(deps);
+  assert.equal(r.action, 'refresh');
+  assert.deepEqual(updatedFolders, ['INBOX', 'Sent']); // Sent added back via union
 });
 
 test('runIndexAutoLifecycle: ON + fresh index → skip', async () => {
