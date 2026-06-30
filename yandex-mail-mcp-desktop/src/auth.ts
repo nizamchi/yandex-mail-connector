@@ -9,9 +9,11 @@
 
 export type AuthLevel = 0 | 1 | 2 | 3;
 
-// Capability stub for L2-L7. In Layer 1 it stays empty — capabilities will be
-// activated later (e.g. 'index' when the search index ships, 'sampling' when
-// MCP sampling negotiation is wired). Hook 3 forward-compat.
+// Capability flags surfaced via yandex_health_check (agent introspection) and,
+// forward-compat, usable for tool gating. 'index' = fast local search index
+// (Layer 2). 'manifest' = attachment catalog (Layer 3). 'auto' = L3 auto-confirm
+// mode. 'sampling' = MCP sampling (not yet wired -- it is client-negotiated at
+// runtime, not known at this startup-time call). See detectCapabilities below.
 export type Capability = 'index' | 'manifest' | 'sampling' | 'auto';
 
 const LEVEL_MAP: ReadonlyMap<string, AuthLevel> = new Map<string, AuthLevel>([
@@ -46,14 +48,20 @@ export function isInvalidAuthLevel(env: NodeJS.ProcessEnv = process.env): boolea
   return !LEVEL_MAP.has(normalized);
 }
 
-// Layer 1 stub — returns empty Set regardless of level.
-// WHY: Capabilities-based gating is a Hook 3 forward-compat surface. In v2 (Layer 1)
-// no tool requires a capability; in L2+ tools like "index_search" will list
-// `requires.capabilities: ['index']` and registerTools will skip them when the
-// capability is absent. Keeping this stub now means index.ts and registerTools
-// don't need to change shape when Layer 2 lands.
-export function detectCapabilities(_level: AuthLevel): Set<Capability> {
-  return new Set<Capability>();
+// Report the capabilities this build actually has, for agent introspection via
+// yandex_health_check. 'index' (Layer 2 local search) and 'manifest' (Layer 3
+// attachment catalog) are compiled-in features available at every auth level, so
+// they are always present. 'auto' reflects the L3 auto-confirm mode. 'sampling'
+// is omitted until MCP sampling negotiation is wired (it is client-negotiated at
+// runtime, not known here).
+//
+// Populating this set is purely informational today: registerTools only SKIPS a
+// tool that REQUIRES a capability it lacks, and no tool currently sets
+// `requires.capabilities` -- so a non-empty set cannot change which tools register.
+export function detectCapabilities(level: AuthLevel): Set<Capability> {
+  const caps = new Set<Capability>(['index', 'manifest']);
+  if (level >= 3) caps.add('auto');
+  return caps;
 }
 
 export function describeAuthLevel(level: AuthLevel): string {

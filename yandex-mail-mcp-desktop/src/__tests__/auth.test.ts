@@ -61,11 +61,19 @@ test('getAuthLevel: empty string → 0', () => {
   assert.equal(getAuthLevel({ YANDEX_AUTH_LEVEL: '   ' }), 0);
 });
 
-test('detectCapabilities: every level returns empty Set', () => {
+test('detectCapabilities: index + manifest present at every level (shipped features)', () => {
   for (const lvl of [0, 1, 2, 3] as const) {
     const caps = detectCapabilities(lvl);
-    assert.equal(caps.size, 0, `level ${lvl} must have empty capabilities in Layer 1`);
+    assert.ok(caps.has('index'), `level ${lvl} must expose 'index'`);
+    assert.ok(caps.has('manifest'), `level ${lvl} must expose 'manifest'`);
+    assert.ok(!caps.has('sampling'), `level ${lvl} must not claim 'sampling' (not wired)`);
   }
+});
+
+test('detectCapabilities: auto only at L3', () => {
+  assert.ok(!detectCapabilities(0).has('auto'), 'L0 must not have auto');
+  assert.ok(!detectCapabilities(2).has('auto'), 'L2 must not have auto');
+  assert.ok(detectCapabilities(3).has('auto'), 'L3 must have auto');
 });
 
 test('describeAuthLevel: contains expected substrings', () => {

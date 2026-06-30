@@ -9,9 +9,10 @@
 //   gates discovery. registerTools() is now a pure iterator and never needs
 //   to change as long as the contract (authLevel, capabilities) stays stable.
 //
-//   Layer 1 fact: ctx.capabilities is always an empty Set (see auth.ts:detectCapabilities).
-//   So any tool listing required capabilities will be skipped -- by design -- until
-//   Layer 2 wires real capability detection. No L1 tool requires a capability.
+//   ctx.capabilities (see auth.ts:detectCapabilities) now reports compiled-in
+//   features ('index', 'manifest', plus 'auto' at L3). It is informational today:
+//   no tool sets requires.capabilities, so the gate below is dormant and a
+//   non-empty set cannot change which tools register.
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -2328,9 +2329,9 @@ export function registerTools(server: McpServer, ctx: ToolCtx): void {
   for (const def of TOOLS) {
     if (ctx.authLevel < def.requires.authLevel) continue;
     // Capability gate -- when a tool lists required capabilities, every one of
-    // them must be in ctx.capabilities. In Layer 1 ctx.capabilities is always
-    // empty, so any tool that requires capabilities will be skipped. No L1
-    // tool sets `requires.capabilities`, so this branch is dormant for now.
+    // them must be in ctx.capabilities (now populated by detectCapabilities). No
+    // tool currently sets `requires.capabilities`, so this branch is dormant; it
+    // exists so a future capability-gated tool needs no registration change.
     if (def.requires.capabilities && def.requires.capabilities.length > 0) {
       const have = ctx.capabilities;
       const missing = def.requires.capabilities.some(c => !have.has(c));
