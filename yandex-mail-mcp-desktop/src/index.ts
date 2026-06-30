@@ -9,6 +9,7 @@ import { auditLog } from './audit.js';
 import { resolveProtectedFolders } from './guards.js';
 import { runHealthCheck } from './check-config.js';
 import { runIndexCli } from './cli-index.js';
+import { startIndexAutoLifecycle } from './index-auto.js';
 
 // `--check` mode (v2.1.4): run a non-authenticating health check (token shape,
 // state dir, allowlist signature, policy JSON, IMAP/SMTP TLS reachability) and
@@ -280,6 +281,11 @@ async function main(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Index auto-lifecycle (opt-in via YANDEX_INDEX_AUTO). Started AFTER connect
+  // and deliberately NOT awaited -- a first build streams thousands of envelopes
+  // and must never delay tool availability. No-op when the opt-in is off.
+  startIndexAutoLifecycle();
 }
 
 main().catch(err => {
